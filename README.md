@@ -1,21 +1,22 @@
 ## TimeSync
 
-TimeSync: Time Synchronization Math library in C++
+TimeSync: Time Synchronization library in C++
 
 ### Motivation:
 
-Time synchronization is an important core component of an rUDP library,
-enabling multiple advantages over reliable UDP libraries without:
+This library provides a single-header implementation of network time synchronization, suitable for synchronizing clocks between two mobile phones (iOS or Android), Linux, Windows, or Mac computers using UDP/IP sockets.  It provides a new method for time synchronization that provides several advantages over prior implementations:
 
-(1) This specific (new) time synchronization works better over cellular
-networks than PTP/NTP.
+(1) This new time synchronization works better over cellular networks than
+PTP/NTP and is more accurate in general due to its novel N:M probing approach
+(see Algorithm section below).
 
 (2) The API provides time synchronization as a feature for applications,
-enabling millisecond-accurate dead reckoning for video games, and
-16-microsecond-accurate timing for scientific applications with 2-3 bytes.
+enabling millisecond-accurate dead reckoning for multiplayer games with just
+16-bit (2 byte) timestamps, and 16-microsecond-precise timing for scientific applications
+with 23-bit (3 byte) timestamps.  This is in contrast with typical timestamps that are
+between 4 and 8 bytes.
 
-(3) Peer2Peer NAT hole-punch can be optimized because it can use time
-synchronization to initiate probes simultaneously on both peers.
+(3) The API provides network trip time for every UDP datagram that arrives.
 
 (4) Delay-based Congestion Control systems should use One Way Delay (OWD)
 on each packet as a signal, which allows it to e.g. avoid causing latency
@@ -23,6 +24,9 @@ in realtime games while delivering a file transfer in the background.
 All existing Delay-based CC algorithms use differential OWD rather than
 proper time synchronization.  By adding time synchronization, CC becomes
 robust to changes in the base OWD as the end-points remain synced.
+
+(5) Peer2Peer NAT hole-punch can be optimized because it can use time
+synchronization to initiate probes simultaneously on both peers.
 
 ### Usage:
 
@@ -38,11 +42,13 @@ https://github.com/catid/mau/blob/master/thirdparty/IncludeAsio.h
 
 (3) Include TimeSync.cpp into your project and ``#include "TimeSync.h"``.  Create a `TimeSynchronizer` object in your netcode on both the client/server code.
 
-(4) Just before sending each UDP datagram, get the current time in microseconds `nowUsec` and call ``TimeSynchronizer::LocalTimeToDatagramTS24(nowUsec)`` to get the 24-bit value to attach to each outgoing UDP datagram.
+(4) Just before sending each UDP datagram, get the current time in microseconds `nowUsec` and call ``TimeSynchronizer::LocalTimeToDatagramTS24(nowUsec)`` to get the 24-bit (3 byte) value to attach to each outgoing UDP datagram.
 
-(5) Periodically, each peer must call ``TimeSynchronizer::GetMinDeltaTS24()`` and send the 24-bit value to the remote peer.  I recommend sending this value once every 2 seconds using your reliable transport's "unordered reliable" mode if it supports that, because it is fine if they arrive out of order.  Ideally, sending the value once every 500 milliseconds for the first 20 seconds or so.  When receiving a ``MinDeltaTS24`` value, it should be passed to ``TimeSynchronizer::OnPeerMinDeltaTS24()``.  After this call, ``IsSynchronized()`` will start to return `true`.
+(5) Periodically, each peer must call ``TimeSynchronizer::GetMinDeltaTS24()`` and send the 24-bit (3 byte) value to the remote peer.  I recommend sending this value once every 2 seconds using your reliable transport's "unordered reliable" mode if it supports that, because it is fine if they arrive out of order.  Ideally, sending the value once every 500 milliseconds for the first 20 seconds or so.  When receiving a ``MinDeltaTS24`` value, it should be passed to ``TimeSynchronizer::OnPeerMinDeltaTS24()``.  After this call, ``IsSynchronized()`` will start to return `true`.
 
-(6) When a UDP datagram arrives, get the current time in microseconds and call ``TimeSynchronizer::OnAuthenticatedDatagramTimestamp(Counter24 remoteSendTS24, uint64_t localRecvUsec)`` with the 24-bit timestamp attached the datagram.
+(6) When a UDP datagram arrives, get the current time in microseconds and call ``TimeSynchronizer::OnAuthenticatedDatagramTimestamp(Counter24 remoteSendTS24, uint64_t localRecvUsec)`` with the 24-bit (3 byte) timestamp attached the datagram.
+
+With each datagram received, the timestamp accuracy improves.
 
 The function will return the OWD of each datagram, or 0 if ``IsSynchronized()`` is returning false.
 
@@ -50,7 +56,7 @@ The ``TimeSynchronizer::GetMinimumOneWayDelayUsec()`` will return the speed of l
 
 To attach a timestamp for game physics or camera frames or audio or whatever the application is doing, use the ``ToRemoteTime23(uint64_t localUsec)`` and ``FromLocalTime23(uint64_t localUsec, Counter23 timestamp23)`` methods.
 
-Call `ToRemoteTime23` with the local timestamp to send, which produces a 23-bit timestamp that can be sent in a UDP or TCP message.  The receiver of the message must get a current microsecond timer and can then call `FromLocalTime23(localUsec, timestamp23)` to decompress the 23-bit timestamp back into a 64-bit local timestamp in microseconds.  The LSB precision of 23-bit TS23 is 8 microseconds.  There is also a 16-bit TS16 version with 0.5 millisecond precision.
+Call `ToRemoteTime23` with the local timestamp to send, which produces a 23-bit (3 byte) timestamp that can be sent in a UDP or TCP message.  The receiver of the message must get a current microsecond timer and can then call `FromLocalTime23(localUsec, timestamp23)` to decompress the 23-bit (3 byte) timestamp back into a 64-bit local timestamp in microseconds.  The LSB precision of 23-bit (3 byte) TS23 is 8 microseconds.  There is also a 16-bit (2 byte) TS16 version with 0.5 millisecond precision.
 
 ### Background:
 
