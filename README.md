@@ -12,8 +12,8 @@ PTP/NTP and is more accurate in general due to its novel N:M probing approach
 
 (2) The API provides time synchronization as a feature for applications,
 enabling millisecond-accurate dead reckoning for multiplayer games with just
-16-bit timestamps, and 16-microsecond-precise timing for scientific applications
-with 23-bit timestamps.  This is in contrast with typical timestamps that are
+16-bit (2 byte) timestamps, and 16-microsecond-precise timing for scientific applications
+with 23-bit (3 byte) timestamps.  This is in contrast with typical timestamps that are
 between 4 and 8 bytes.
 
 (3) The API provides network trip time for every UDP datagram that arrives.
@@ -42,11 +42,11 @@ https://github.com/catid/mau/blob/master/thirdparty/IncludeAsio.h
 
 (3) Include TimeSync.cpp into your project and ``#include "TimeSync.h"``.  Create a `TimeSynchronizer` object in your netcode on both the client/server code.
 
-(4) Just before sending each UDP datagram, get the current time in microseconds `nowUsec` and call ``TimeSynchronizer::LocalTimeToDatagramTS24(nowUsec)`` to get the 24-bit value to attach to each outgoing UDP datagram.
+(4) Just before sending each UDP datagram, get the current time in microseconds `nowUsec` and call ``TimeSynchronizer::LocalTimeToDatagramTS24(nowUsec)`` to get the 24-bit (3 byte) value to attach to each outgoing UDP datagram.
 
-(5) Periodically, each peer must call ``TimeSynchronizer::GetMinDeltaTS24()`` and send the 24-bit value to the remote peer.  I recommend sending this value once every 2 seconds using your reliable transport's "unordered reliable" mode if it supports that, because it is fine if they arrive out of order.  Ideally, sending the value once every 500 milliseconds for the first 20 seconds or so.  When receiving a ``MinDeltaTS24`` value, it should be passed to ``TimeSynchronizer::OnPeerMinDeltaTS24()``.  After this call, ``IsSynchronized()`` will start to return `true`.
+(5) Periodically, each peer must call ``TimeSynchronizer::GetMinDeltaTS24()`` and send the 24-bit (3 byte) value to the remote peer.  I recommend sending this value once every 2 seconds using your reliable transport's "unordered reliable" mode if it supports that, because it is fine if they arrive out of order.  Ideally, sending the value once every 500 milliseconds for the first 20 seconds or so.  When receiving a ``MinDeltaTS24`` value, it should be passed to ``TimeSynchronizer::OnPeerMinDeltaTS24()``.  After this call, ``IsSynchronized()`` will start to return `true`.
 
-(6) When a UDP datagram arrives, get the current time in microseconds and call ``TimeSynchronizer::OnAuthenticatedDatagramTimestamp(Counter24 remoteSendTS24, uint64_t localRecvUsec)`` with the 24-bit timestamp attached the datagram.
+(6) When a UDP datagram arrives, get the current time in microseconds and call ``TimeSynchronizer::OnAuthenticatedDatagramTimestamp(Counter24 remoteSendTS24, uint64_t localRecvUsec)`` with the 24-bit (3 byte) timestamp attached the datagram.
 
 With each datagram received, the timestamp accuracy improves.
 
@@ -56,7 +56,7 @@ The ``TimeSynchronizer::GetMinimumOneWayDelayUsec()`` will return the speed of l
 
 To attach a timestamp for game physics or camera frames or audio or whatever the application is doing, use the ``ToRemoteTime23(uint64_t localUsec)`` and ``FromLocalTime23(uint64_t localUsec, Counter23 timestamp23)`` methods.
 
-Call `ToRemoteTime23` with the local timestamp to send, which produces a 23-bit timestamp that can be sent in a UDP or TCP message.  The receiver of the message must get a current microsecond timer and can then call `FromLocalTime23(localUsec, timestamp23)` to decompress the 23-bit timestamp back into a 64-bit local timestamp in microseconds.  The LSB precision of 23-bit TS23 is 8 microseconds.  There is also a 16-bit TS16 version with 0.5 millisecond precision.
+Call `ToRemoteTime23` with the local timestamp to send, which produces a 23-bit (3 byte) timestamp that can be sent in a UDP or TCP message.  The receiver of the message must get a current microsecond timer and can then call `FromLocalTime23(localUsec, timestamp23)` to decompress the 23-bit (3 byte) timestamp back into a 64-bit local timestamp in microseconds.  The LSB precision of 23-bit (3 byte) TS23 is 8 microseconds.  There is also a 16-bit (2 byte) TS16 version with 0.5 millisecond precision.
 
 ### Background:
 
