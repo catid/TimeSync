@@ -129,8 +129,6 @@ unsigned TimeSynchronizer::OnAuthenticatedDatagramTimestamp(
         // While the OWD is an estimate, the relative delay between that
         // smallest packet pair and the current datagram is actually precise:
         const Counter24 minDeltaTS24 = GetMinDeltaTS24();
-        const Counter24 localTS24 = (uint32_t)(localRecvUsec >> kTime23LostBits);
-        const Counter24 deltaTS24 = localTS24 - remoteSendTS24;
         if (deltaTS24 > minDeltaTS24)
         {
             const Counter24 relativeTS24 = deltaTS24 - minDeltaTS24;
