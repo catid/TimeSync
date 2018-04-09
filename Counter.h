@@ -29,7 +29,7 @@
 
 #pragma once
 
-/** \page Counter Counter Math Module
+/** \page Counter Math
 
     Represents an unsigned counter that can roll over from its maximum value
     back to zero.  A common example is a 32-bit timestamp from GetTickCount()

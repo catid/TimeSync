@@ -332,7 +332,7 @@ public:
         uint64_t localUsec,
         Counter16 timestamp16)
     {
-        return Counter64::ExpandFromTruncated(
+        return Counter64::ExpandFromTruncatedWithBias(
             localUsec >> kTime16LostBits,
             timestamp16,
             kTime16Bias).ToUnsigned() << kTime16LostBits;
@@ -355,7 +355,7 @@ public:
         uint64_t localUsec,
         Counter23 timestamp23)
     {
-        return Counter64::ExpandFromTruncated(
+        return Counter64::ExpandFromTruncatedWithBias(
             localUsec >> kTime23LostBits,
             timestamp23,
             kTime23Bias).ToUnsigned() << kTime23LostBits;
