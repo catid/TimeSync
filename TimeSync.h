@@ -1,6 +1,6 @@
 /** \file
     \brief TimeSync: Time Synchronization
-    \copyright Copyright (c) 2017 Christopher A. Taylor.  All rights reserved.
+    \copyright Copyright (c) 2017-2018 Christopher A. Taylor.  All rights reserved.
 
     Redistribution and use in source and binary forms, with or without
     modification, are permitted provided that the following conditions are met:
@@ -168,11 +168,17 @@ static const unsigned kTime23LostBits = 3;
 /// Largest 23-bit counter difference value considered positive
 static const unsigned kTime23Bias = 0x200000;
 
+/// Error bound for 23-bit timestamps <= 8*2-1 = 15 microseconds
+static const unsigned kTime23ErrorBound = (1 << kTime23LostBits) * 2 - 1;
+
 /// Number of bits removed from the low end of the microsecond timestamp
 static const unsigned kTime16LostBits = 9;
 
 /// Largest 16-bit counter difference value considered positive
 static const unsigned kTime16Bias = 0x4000;
+
+/// Error bound for 16-bit timestamps <= 512*2-1 = 1.023 milliseconds
+static const unsigned kTime16ErrorBound = (1 << kTime16LostBits) * 2 - 1;
 
 /// Window size for WindowedMinTS24Deltas.
 /// Since clocks drift over time, eventually old measurements must be ignored.
@@ -195,6 +201,8 @@ typedef Counter<uint32_t, 23> Counter23;
 class WindowedMinTS24
 {
 public:
+    WindowedMinTS24() {}
+
     struct Sample
     {
         /// Sample value
@@ -318,8 +326,9 @@ public:
     /// Returns 16-bit remote time field to send in a packet
     inline uint16_t ToRemoteTime16(uint64_t localUsec)
     {
-        if (!Synchronized)
+        if (!Synchronized) {
             return 0;
+        }
 
         const uint16_t localTS16 = (uint16_t)(localUsec >> kTime16LostBits);
         const uint16_t deltaTS16 = (uint16_t)(RemoteTimeDeltaUsec >> kTime16LostBits);
@@ -341,8 +350,9 @@ public:
     /// Returns 23-bit remote time field to send in a packet
     inline uint32_t ToRemoteTime23(uint64_t localUsec)
     {
-        if (!Synchronized)
+        if (!Synchronized) {
             return 0;
+        }
 
         const Counter23 localTS23 = (uint32_t)(localUsec >> kTime23LostBits);
         const Counter23 deltaTS23 = RemoteTimeDeltaUsec >> kTime23LostBits;

@@ -1,6 +1,6 @@
 /** \file
     \brief TimeSync: Time Synchronization
-    \copyright Copyright (c) 2017 Christopher A. Taylor.  All rights reserved.
+    \copyright Copyright (c) 2017-2018 Christopher A. Taylor.  All rights reserved.
 
     Redistribution and use in source and binary forms, with or without
     modification, are permitted provided that the following conditions are met:
