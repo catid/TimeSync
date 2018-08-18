@@ -88,18 +88,301 @@ public:
 
 
 //------------------------------------------------------------------------------
+// Tools
+
+static bool is_near(
+    unsigned x, // Input value x
+    unsigned y, // Input value y
+    unsigned limit, // Max difference
+    unsigned& deltaOut) // Output parameter: Delta between them
+{
+    deltaOut = (x > y) ? (x - y) : (y - x);
+    return deltaOut <= limit;
+}
+
+
+//------------------------------------------------------------------------------
 // Test: Simple usage example
+
+// Bulk data packet in stream
+struct TestDataPacket
+{
+    // Header including timestamp
+    Counter24 Timestamp;
+
+    // Some amount of simulated data
+    int data[100];
+};
+
+// Periodic sync packet, which may also contain other data
+struct TestSyncPacket
+{
+    // Header including timestamp
+    Counter24 Timestamp;
+
+    // Value from GetMinDeltaTS24()
+    Counter24 MinDeltaTS24;
+
+    // Some amount of simulated data
+    int data[100];
+};
+
+// Shared code between each peer
+class TestPeer
+{
+protected:
+    // Each peer has a TimeSync object
+    TimeSynchronizer TimeSync;
+
+    // Pointer to the global clock to simulate two peers with different time domains
+    uint64_t* GlobalClockPtr = nullptr;
+
+    // Clock delta from global clock
+    uint64_t ClockDelta = 0;
+
+    // Smoothed value of OWD in microseconds
+    unsigned SmoothedOWDUsec = 0;
+
+    void UpdateOWDEstimate(unsigned owdUsec)
+    {
+        // Smooth in OWD using EWMA
+        if (SmoothedOWDUsec == 0) {
+            SmoothedOWDUsec = owdUsec;
+        }
+        else {
+            SmoothedOWDUsec = (SmoothedOWDUsec * 7 + owdUsec) / 8;
+        }
+    }
+
+    void IncorporateTimestamp(Counter24 timestamp)
+    {
+        // Time of receipt
+        const uint64_t localRecvUsec = GetUsec();
+
+        // Process timestamp
+        const unsigned owdUsec = TimeSync.OnAuthenticatedDatagramTimestamp(
+            timestamp,
+            localRecvUsec);
+
+        UpdateOWDEstimate(owdUsec);
+    }
+
+public:
+    void Initialize(uint64_t* globalClockPtr, uint64_t clockDelta)
+    {
+        GlobalClockPtr = globalClockPtr;
+        ClockDelta = clockDelta;
+    }
+
+    uint64_t GetUsec() const
+    {
+        return *GlobalClockPtr + ClockDelta;
+    }
+
+    unsigned GetOWDEstimate() const
+    {
+        return SmoothedOWDUsec;
+    }
+
+    // Get the smallest OWD seen
+    unsigned GetMinimumOneWayDelay() const
+    {
+        return TimeSync.GetMinimumOneWayDelayUsec();
+    }
+
+    TestDataPacket GetData()
+    {
+        const uint64_t localUsec = GetUsec();
+
+        TestDataPacket data;
+
+        // Attach 3 byte timestamp
+        data.Timestamp = TimeSync.LocalTimeToDatagramTS24(localUsec);
+
+        return data;
+    }
+
+    TestSyncPacket GetSync()
+    {
+        const uint64_t localUsec = GetUsec();
+
+        TestSyncPacket data;
+
+        // Attach 3 byte timestamp (all packets have this even the sync ones)
+        data.Timestamp = TimeSync.LocalTimeToDatagramTS24(localUsec);
+
+        // Get 3 byte sync field "MinDeltaTS24"
+        data.MinDeltaTS24 = TimeSync.GetMinDeltaTS24();
+
+        return data;
+    }
+
+    void OnData(const TestDataPacket& data)
+    {
+        IncorporateTimestamp(data.Timestamp);
+    }
+
+    void OnSync(const TestSyncPacket& data)
+    {
+        IncorporateTimestamp(data.Timestamp);
+
+        // Update time synchronization
+        TimeSync.OnPeerMinDeltaTS24(data.MinDeltaTS24);
+    }
+
+    Counter23 GetRemoteTimestamp()
+    {
+        const uint64_t localUsec = GetUsec();
+
+        return TimeSync.ToRemoteTime23(localUsec);
+    }
+
+    uint64_t ConvertToLocal(Counter23 timestamp23)
+    {
+        const uint64_t localUsec = GetUsec();
+
+        return TimeSync.FromLocalTime23(localUsec, timestamp23);
+    }
+};
+
+bool test_simple(uint64_t clock_delta_a, uint64_t clock_delta_b, unsigned owdUsec)
+{
+    // Simulate sending UDP/IP packets back and forth between two hosts A, B.
+    // Each packet contains both data and a header containing a 3 byte timestamp.
+
+    PCGRandom prng;
+    prng.Seed(clock_delta_a);
+
+    TestPeer a, b;
+
+    uint64_t global_clock = 0;
+
+    a.Initialize(&global_clock, clock_delta_a);
+    b.Initialize(&global_clock, clock_delta_b);
+
+    static const unsigned kRounds = 100;
+
+    for (unsigned i = 0; i < kRounds; ++i)
+    {
+        // Simulate packets from A -> B:
+
+        // Simulate sending sync data at some lower rate
+        if (i % 10 == 9)
+        {
+            TestSyncPacket sync = a.GetSync();
+
+            // Send data with up to 1.1x OWD
+            global_clock += owdUsec + prng.Next() % (owdUsec / 10);
+
+            b.OnSync(sync);
+        }
+        else
+        {
+            TestDataPacket data = a.GetData();
+
+            // Send data with up to 1.1x OWD
+            global_clock += owdUsec + prng.Next() % (owdUsec / 10);
+
+            b.OnData(data);
+        }
+
+        // Simulate packets from B -> A:
+
+        // Simulate sending sync data at some lower rate
+        if (i % 10 == 9)
+        {
+            TestSyncPacket sync = b.GetSync();
+
+            // Send data with up to 1.1x OWD
+            global_clock += owdUsec + prng.Next() % (owdUsec / 10);
+
+            a.OnSync(sync);
+        }
+        else
+        {
+            TestDataPacket data = b.GetData();
+
+            // Send data with up to 1.1x OWD
+            global_clock += owdUsec + prng.Next() % (owdUsec / 10);
+
+            a.OnData(data);
+        }
+    }
+
+    const unsigned owdEst_a = a.GetOWDEstimate();
+    const unsigned owdEst_b = b.GetOWDEstimate();
+
+    const unsigned err_a = owdEst_a - owdUsec;
+    const unsigned err_b = owdEst_b - owdUsec;
+
+    // This is checking that the smoothed OWD estimate for each direction
+    // is within the expected 10% variance:
+
+    const unsigned error_bound = owdUsec / 10;
+    if (err_a > error_bound ||
+        err_b > error_bound)
+    {
+        cout << "OWD estimate out of range" << endl;
+        TIMESYNC_DEBUG_BREAK();
+        return false;
+    }
+
+    // This is checking that timestamps can be shared between peers:
+
+    uint64_t a0 = a.GetUsec();
+    uint64_t b0 = b.GetUsec();
+
+    Counter23 timestamp_from_a = a.GetRemoteTimestamp();
+    Counter23 timestamp_from_b = b.GetRemoteTimestamp();
+
+    // Send data with up to 1.1x OWD
+    global_clock += owdUsec + prng.Next() % (owdUsec / 10);
+
+    uint64_t timestamp_at_a = a.ConvertToLocal(timestamp_from_b);
+    uint64_t timestamp_at_b = b.ConvertToLocal(timestamp_from_a);
+
+    unsigned delta0 = 0xffffffff, delta1 = 0xffffffff;
+
+    // Error is bounded by the OWD estimate
+    const unsigned min_owd_a = a.GetMinimumOneWayDelay();
+    const unsigned min_owd_b = b.GetMinimumOneWayDelay();
+    const unsigned error_bound_b = kTime23ErrorBound * 2 + (min_owd_a - owdUsec);
+    const unsigned error_bound_a = kTime23ErrorBound * 2 + (min_owd_b - owdUsec);
+
+    if (!is_near(timestamp_at_a, a0, error_bound_a, delta0) ||
+        !is_near(timestamp_at_b, b0, error_bound_b, delta1))
+    {
+        cout << "Time sync does not work" << endl;
+        TIMESYNC_DEBUG_BREAK();
+        return false;
+    }
+
+    return true;
+}
 
 bool TestSimpleUsage()
 {
     cout << "TestSimpleUsage...";
 
-    TimeSynchronizer sync_a, sync_b;
+    static const unsigned kTrials = 10000;
 
-    // Simulate sending UDP/IP packets back and forth between two hosts A, B.
-    // Each packet contains both data and a header containing a 3 byte timestamp.
+    PCGRandom prng;
+    prng.Seed(1000);
 
-    // TODO
+    for (unsigned i = 0; i < kTrials; ++i)
+    {
+        const uint64_t clock_delta_a = prng.Next();
+        const uint64_t clock_delta_b = prng.Next();
+
+        const unsigned owdUsec = (prng.Next() % 200000) + 2000; // 2..202 ms
+
+        if (!test_simple(clock_delta_a, clock_delta_b, owdUsec))
+        {
+            cout << "Failed for i = " << i << endl;
+            TIMESYNC_DEBUG_BREAK();
+            return false;
+        }
+    }
 
     cout << "Success!" << endl;
 
@@ -108,17 +391,7 @@ bool TestSimpleUsage()
 
 
 //------------------------------------------------------------------------------
-// Test: Simple two-round protocol
-
-static bool is_near(
-    unsigned x, // Input value x
-    unsigned y, // Input value y
-    unsigned limit, // Max difference
-    unsigned& deltaOut) // Output parameter: Delta between them
-{
-    deltaOut = (x > y) ? x - y : y - x;
-    return deltaOut <= limit;
-}
+// Test: Simple two-round protocol with lots of checks
 
 static bool test_two_rounds(const uint64_t clock_delta, unsigned owdUsec)
 {
