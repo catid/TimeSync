@@ -1,6 +1,6 @@
 /** \file
     \brief TimeSync: Time Synchronization
-    \copyright Copyright (c) 2017-2018 Christopher A. Taylor.  All rights reserved.
+    \copyright Copyright (c) 2017-2019 Christopher A. Taylor.  All rights reserved.
 
     Redistribution and use in source and binary forms, with or without
     modification, are permitted provided that the following conditions are met:
@@ -163,9 +163,18 @@ void TimeSynchronizer::Recalculate()
     // ClockDelta(R-L) ~= (ClockDelta(R-L)_j - ClockDelta(L-R)_i) / 2
     const Counter23 clockDelta_TS23 = (minSendDeltaTS24 - minRecvDeltaTS24).ToUnsigned() >> 1;
 
-    // Convert to Usec
-    MinimumOneWayDelayUsec = minOWD_TS23.ToUnsigned() << kTime23LostBits;
+    // Calculate the time delta in microseconds
     RemoteTimeDeltaUsec = clockDelta_TS23.ToUnsigned() << kTime23LostBits;
+
+    // Calculate the minimum OWD, which may go negative and blow up..
+    uint32_t min_owd_usec = minOWD_TS23.ToUnsigned() << kTime23LostBits;
+
+    // If the implied subtraction went negative, correct to zero:
+    static const uint32_t kSignRolloverThreshold = (1 << 22) << kTime23LostBits;
+    if (min_owd_usec >= kSignRolloverThreshold) {
+        min_owd_usec = 0;
+    }
+    MinimumOneWayDelayUsec = min_owd_usec;
 
     Synchronized = true;
 }
