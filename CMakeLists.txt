@@ -9,7 +9,7 @@ set(TIMESYNC_LIB_SRCFILES
         TimeSync.cpp
         TimeSync.h)
 
-add_library(timesync ${TIMESYNC_LIB_SRCFILES})
+add_library(timesync SHARED ${TIMESYNC_LIB_SRCFILES})
 
 add_executable(tests tests/tests.cpp)
 target_link_libraries(tests timesync)
