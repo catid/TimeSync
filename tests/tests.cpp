@@ -27,7 +27,7 @@
     POSSIBILITY OF SUCH DAMAGE.
 */
 
-#include "../TimeSync.h"
+#include <TimeSync/TimeSync.h>
 
 #include <iostream>
 using namespace std;
