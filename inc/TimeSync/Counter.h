@@ -303,10 +303,10 @@ public:
         ValueType smallerMSB = smaller.Value & SmallerT::kMSB;
         SignedType smallerSigned = smaller.Value - (smallerMSB << 1);
 
-        SmallerT::ValueType smallRecent = static_cast<SmallerT::ValueType>(recent.Value & SmallerT::kMask);
+        auto smallRecent = static_cast<typename SmallerT::ValueType>(recent.Value & SmallerT::kMask);
 
         // Signed gap = partial - prev
-        SmallerT::ValueType gap = static_cast<SmallerT::ValueType>(smallerSigned - smallRecent) & SmallerT::kMask;
+        auto gap = static_cast<typename SmallerT::ValueType>(smallerSigned - smallRecent) & SmallerT::kMask;
 
         ValueType gapMSB = gap & SmallerT::kMSB;
         SignedType gapSigned = gap - (gapMSB << 1);
@@ -319,7 +319,6 @@ public:
     // the field size.  Otherwise the extra sign handling above is not elided
     // by the compiler's optimizer:
 
-    template<>
     static COUNTER_FORCE_INLINE ThisType ExpandFromTruncated(
         const ThisType recent,
         const Counter<uint32_t, 32> smaller)
@@ -330,7 +329,6 @@ public:
         return recent + gap;
     }
 
-    template<>
     static COUNTER_FORCE_INLINE ThisType ExpandFromTruncated(
         const ThisType recent,
         const Counter<uint16_t, 16> smaller)
@@ -341,7 +339,6 @@ public:
         return recent + gap;
     }
 
-    template<>
     static COUNTER_FORCE_INLINE ThisType ExpandFromTruncated(
         const ThisType recent,
         const Counter<uint8_t, 8> smaller)
