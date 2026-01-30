@@ -34,3 +34,12 @@ Flag experiments that breach error thresholds or fail to synchronize:
 ```bash
 bench/.venv/bin/python bench/analyze_breaks.py benchmarks/run_YYYYMMDD_HHMMSS/summary.csv benchmarks/breaks_report.txt
 ```
+
+## Monte Carlo heatmaps
+
+Run Monte Carlo sampling and generate metric-pair heatmaps:
+
+```bash
+./bench/run_montecarlo.sh
+bench/.venv/bin/python bench/report_montecarlo.py benchmarks/run_mc_YYYYMMDD_HHMMSS/montecarlo.csv benchmarks/montecarlo_report.pdf
+```

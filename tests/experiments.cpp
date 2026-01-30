@@ -67,6 +67,15 @@ static uint32_t RandRange(PCGRandom& rng, uint32_t minv, uint32_t maxv)
     return minv + (rng.Next() % (maxv - minv + 1));
 }
 
+static double RandRangeDouble(PCGRandom& rng, double minv, double maxv)
+{
+    if (maxv <= minv) {
+        return minv;
+    }
+    const double t = rng.NextDouble01();
+    return minv + (maxv - minv) * t;
+}
+
 //------------------------------------------------------------------------------
 // Stats
 
@@ -1103,6 +1112,73 @@ static std::vector<ExperimentConfig> BuildExperiments()
     return exps;
 }
 
+static std::vector<ExperimentConfig> BuildMonteCarlo(uint64_t seed, unsigned count)
+{
+    std::vector<ExperimentConfig> exps;
+    exps.reserve(count);
+
+    PCGRandom rng;
+    rng.Seed(seed, 0xA5A5A5A5ULL);
+
+    static const double kRateOptions[] = {10.0, 30.0, 60.0, 120.0, 240.0};
+    static const double kSyncOptions[] = {0.5, 2.0, 5.0, 10.0};
+
+    for (unsigned i = 0; i < count; ++i) {
+        ExperimentConfig cfg = BaseConfig("mc_0000");
+
+        // Base latencies (ms)
+        const double base_ab_ms = RandRangeDouble(rng, 2.0, 200.0);
+        const double base_ba_ms = RandRangeDouble(rng, 2.0, 200.0);
+        cfg.delay_ab.base_delay_us = (uint32_t)(base_ab_ms * 1000.0);
+        cfg.delay_ba.base_delay_us = (uint32_t)(base_ba_ms * 1000.0);
+
+        // Jitter (ms)
+        const double jitter_ab_ms = RandRangeDouble(rng, 0.0, 30.0);
+        const double jitter_ba_ms = RandRangeDouble(rng, 0.0, 30.0);
+        cfg.delay_ab.jitter_us = (uint32_t)(jitter_ab_ms * 1000.0);
+        cfg.delay_ba.jitter_us = (uint32_t)(jitter_ba_ms * 1000.0);
+
+        // Loss rate
+        const double loss = RandRangeDouble(rng, 0.0, 0.1);
+        cfg.loss_ab.loss_rate = loss;
+        cfg.loss_ba.loss_rate = loss;
+
+        // Drift (ppm)
+        const double drift = RandRangeDouble(rng, 0.0, 2000.0);
+        cfg.drift_ppm_a = drift;
+        cfg.drift_ppm_b = -drift;
+
+        // Send rate and sync interval
+        cfg.send_rate_hz = kRateOptions[rng.Next() % (sizeof(kRateOptions) / sizeof(kRateOptions[0]))];
+        cfg.sync_interval_us = (uint64_t)(kSyncOptions[rng.Next() % (sizeof(kSyncOptions) / sizeof(kSyncOptions[0]))] * 1000000.0);
+
+        // Spikes
+        cfg.delay_ab.spike_prob = RandRangeDouble(rng, 0.0, 0.05);
+        cfg.delay_ba.spike_prob = cfg.delay_ab.spike_prob;
+        const double spike_ms = RandRangeDouble(rng, 0.0, 120.0);
+        cfg.delay_ab.spike_delay_us = (uint32_t)(spike_ms * 1000.0);
+        cfg.delay_ba.spike_delay_us = cfg.delay_ab.spike_delay_us;
+
+        // Bimodal
+        cfg.delay_ab.bimodal_prob = RandRangeDouble(rng, 0.0, 0.3);
+        cfg.delay_ba.bimodal_prob = cfg.delay_ab.bimodal_prob;
+        const double bimodal_ms = RandRangeDouble(rng, 0.0, 120.0);
+        cfg.delay_ab.bimodal_delay_us = (uint32_t)(bimodal_ms * 1000.0);
+        cfg.delay_ba.bimodal_delay_us = cfg.delay_ab.bimodal_delay_us;
+
+        // Duration (shorter to allow many samples)
+        cfg.duration_us = 30 * 1000 * 1000ULL;
+
+        char name[32];
+        std::snprintf(name, sizeof(name), "mc_%04u", i + 1);
+        cfg.name = name;
+
+        exps.push_back(cfg);
+    }
+
+    return exps;
+}
+
 //------------------------------------------------------------------------------
 // CLI helpers
 
@@ -1114,6 +1190,7 @@ struct CliOptions
     string match;
     uint64_t seed = 0xC0FFEEULL;
     unsigned threads = 1;
+    unsigned monte_carlo = 0;
 };
 
 static bool ShouldRun(const ExperimentConfig& cfg, const CliOptions& opt)
@@ -1158,8 +1235,11 @@ static CliOptions ParseArgs(int argc, char** argv)
                 opt.threads = 1;
             }
         }
+        else if (std::strcmp(arg, "--montecarlo") == 0 && i + 1 < argc) {
+            opt.monte_carlo = (unsigned)std::strtoul(argv[++i], nullptr, 10);
+        }
         else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
-            std::cout << "Usage: experiments [--list] [--csv path] [--only name] [--match substring] [--seed n] [--threads n]\n";
+            std::cout << "Usage: experiments [--list] [--csv path] [--only name] [--match substring] [--seed n] [--threads n] [--montecarlo n]\n";
             std::exit(0);
         }
     }
@@ -1307,7 +1387,9 @@ int main(int argc, char** argv)
 {
     CliOptions opt = ParseArgs(argc, argv);
 
-    const std::vector<ExperimentConfig> experiments = BuildExperiments();
+    const std::vector<ExperimentConfig> experiments = (opt.monte_carlo > 0)
+        ? BuildMonteCarlo(opt.seed, opt.monte_carlo)
+        : BuildExperiments();
 
     if (opt.list_only) {
         for (size_t i = 0; i < experiments.size(); ++i) {
