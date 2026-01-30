@@ -613,6 +613,17 @@ static std::vector<ExperimentConfig> BuildExperiments()
 {
     std::vector<ExperimentConfig> exps;
 
+    auto add_with_reverse = [&](const ExperimentConfig& cfg, const char* suffix) {
+        exps.push_back(cfg);
+        if (cfg.drift_ppm_a != 0.0 || cfg.drift_ppm_b != 0.0) {
+            ExperimentConfig rev = cfg;
+            rev.drift_ppm_a = -cfg.drift_ppm_a;
+            rev.drift_ppm_b = -cfg.drift_ppm_b;
+            rev.name = cfg.name + suffix;
+            exps.push_back(rev);
+        }
+    };
+
     // Baseline + jitter sweep (7)
     {
         ExperimentConfig cfg = BaseConfig("baseline_20ms_j0p5");
@@ -790,7 +801,7 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 10.0;
         cfg.drift_ppm_b = -10.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
     {
         ExperimentConfig cfg = BaseConfig("drift_50ppm");
@@ -798,7 +809,7 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 50.0;
         cfg.drift_ppm_b = -50.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
     {
         ExperimentConfig cfg = BaseConfig("drift_100ppm");
@@ -806,7 +817,7 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 100.0;
         cfg.drift_ppm_b = -100.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
     {
         ExperimentConfig cfg = BaseConfig("drift_200ppm");
@@ -814,17 +825,17 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 200.0;
         cfg.drift_ppm_b = -200.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
 
-    // Drift stress (12)
+    // Drift stress (12 + reverse)
     {
         ExperimentConfig cfg = BaseConfig("drift_300ppm");
         cfg.delay_ab.jitter_us = 5000;
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 300.0;
         cfg.drift_ppm_b = -300.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
     {
         ExperimentConfig cfg = BaseConfig("drift_500ppm");
@@ -833,7 +844,7 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 500.0;
         cfg.drift_ppm_b = -500.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
     {
         ExperimentConfig cfg = BaseConfig("drift_1000ppm");
@@ -842,7 +853,7 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 1000.0;
         cfg.drift_ppm_b = -1000.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
     {
         ExperimentConfig cfg = BaseConfig("drift_2000ppm");
@@ -851,7 +862,7 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 2000.0;
         cfg.drift_ppm_b = -2000.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
     {
         ExperimentConfig cfg = BaseConfig("drift_1000ppm_sync5s");
@@ -861,7 +872,7 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 1000.0;
         cfg.drift_ppm_b = -1000.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
     {
         ExperimentConfig cfg = BaseConfig("drift_2000ppm_sync10s");
@@ -871,7 +882,7 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 2000.0;
         cfg.drift_ppm_b = -2000.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
     {
         ExperimentConfig cfg = BaseConfig("drift_1000ppm_rate10hz");
@@ -881,7 +892,7 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 1000.0;
         cfg.drift_ppm_b = -1000.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
     {
         ExperimentConfig cfg = BaseConfig("drift_1000ppm_rate240hz");
@@ -891,7 +902,7 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 1000.0;
         cfg.drift_ppm_b = -1000.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
     {
         ExperimentConfig cfg = BaseConfig("drift_1000ppm_asym_20_80");
@@ -902,7 +913,7 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 1000.0;
         cfg.drift_ppm_b = -1000.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
     {
         ExperimentConfig cfg = BaseConfig("drift_1000ppm_asym_80_20");
@@ -913,7 +924,7 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 1000.0;
         cfg.drift_ppm_b = -1000.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
     {
         ExperimentConfig cfg = BaseConfig("drift_1000ppm_loss5");
@@ -924,7 +935,7 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.loss_ba.loss_rate = 0.05;
         cfg.drift_ppm_a = 1000.0;
         cfg.drift_ppm_b = -1000.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
     {
         ExperimentConfig cfg = BaseConfig("drift_1000ppm_spikes");
@@ -937,7 +948,7 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.delay_ba.spike_delay_us = 100000;
         cfg.drift_ppm_a = 1000.0;
         cfg.drift_ppm_b = -1000.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
     {
         ExperimentConfig cfg = BaseConfig("drift_1000ppm_long300s");
@@ -946,7 +957,7 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 1000.0;
         cfg.drift_ppm_b = -1000.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
     {
         ExperimentConfig cfg = BaseConfig("drift_2000ppm_long300s");
@@ -955,7 +966,7 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 2000.0;
         cfg.drift_ppm_b = -2000.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
 
     // Packet rate + sync interval sweep (6)
@@ -1099,7 +1110,7 @@ static std::vector<ExperimentConfig> BuildExperiments()
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 50.0;
         cfg.drift_ppm_b = -50.0;
-        exps.push_back(cfg);
+        add_with_reverse(cfg, "_bfast");
     }
     {
         ExperimentConfig cfg = BaseConfig("big_offset_30s");
@@ -1145,8 +1156,9 @@ static std::vector<ExperimentConfig> BuildMonteCarlo(uint64_t seed, unsigned cou
 
         // Drift (ppm)
         const double drift = RandRangeDouble(rng, 0.0, 2000.0);
-        cfg.drift_ppm_a = drift;
-        cfg.drift_ppm_b = -drift;
+        const bool flip = (rng.Next() & 1) != 0;
+        cfg.drift_ppm_a = flip ? drift : -drift;
+        cfg.drift_ppm_b = -cfg.drift_ppm_a;
 
         // Send rate and sync interval
         cfg.send_rate_hz = kRateOptions[rng.Next() % (sizeof(kRateOptions) / sizeof(kRateOptions[0]))];
@@ -1204,8 +1216,9 @@ static std::vector<ExperimentConfig> BuildMonteCarloAxis(
         ExperimentConfig cfg = BaseConfig("mc_axis_0000");
 
         const double drift = RandRangeDouble(rng, drift_min, drift_max);
-        cfg.drift_ppm_a = drift;
-        cfg.drift_ppm_b = -drift;
+        const bool flip = (rng.Next() & 1) != 0;
+        cfg.drift_ppm_a = flip ? drift : -drift;
+        cfg.drift_ppm_b = -cfg.drift_ppm_a;
 
         // Baselines
         cfg.delay_ab.base_delay_us = (uint32_t)(base_latency_ms * 1000.0);
