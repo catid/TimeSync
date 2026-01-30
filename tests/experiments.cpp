@@ -266,6 +266,7 @@ struct ExperimentConfig
     double drift_ppm_b = 0.0;
     int64_t offset_a_us = 0;
     int64_t offset_b_us = 5 * 1000 * 1000LL;
+    uint64_t drift_window_us = 0;
 };
 
 struct Packet
@@ -349,6 +350,11 @@ static ExperimentMetrics RunExperiment(const ExperimentConfig& cfg, uint64_t see
 
     TimeSynchronizer sync_a;
     TimeSynchronizer sync_b;
+
+    if (cfg.drift_window_us > 0) {
+        sync_a.SetDriftWindowUsec(cfg.drift_window_us);
+        sync_b.SetDriftWindowUsec(cfg.drift_window_us);
+    }
 
     LossModel loss_ab = cfg.loss_ab;
     LossModel loss_ba = cfg.loss_ba;
@@ -856,12 +862,32 @@ static std::vector<ExperimentConfig> BuildExperiments()
         add_with_reverse(cfg, "_bfast");
     }
     {
+        ExperimentConfig cfg = BaseConfig("drift_1000ppm_window2s");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.drift_ppm_a = 1000.0;
+        cfg.drift_ppm_b = -1000.0;
+        cfg.drift_window_us = 2 * 1000 * 1000ULL;
+        add_with_reverse(cfg, "_bfast");
+    }
+    {
         ExperimentConfig cfg = BaseConfig("drift_2000ppm");
         cfg.duration_us = 60 * 1000 * 1000ULL;
         cfg.delay_ab.jitter_us = 5000;
         cfg.delay_ba.jitter_us = 5000;
         cfg.drift_ppm_a = 2000.0;
         cfg.drift_ppm_b = -2000.0;
+        add_with_reverse(cfg, "_bfast");
+    }
+    {
+        ExperimentConfig cfg = BaseConfig("drift_2000ppm_window2s");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.drift_ppm_a = 2000.0;
+        cfg.drift_ppm_b = -2000.0;
+        cfg.drift_window_us = 2 * 1000 * 1000ULL;
         add_with_reverse(cfg, "_bfast");
     }
     {

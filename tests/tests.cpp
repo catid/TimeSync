@@ -29,7 +29,11 @@
 
 #include <TimeSync/TimeSync.h>
 
+#include <algorithm>
+#include <cmath>
 #include <iostream>
+#include <queue>
+#include <vector>
 using namespace std;
 
 
@@ -657,6 +661,237 @@ static bool test_two_rounds(const uint64_t clock_delta, unsigned owdUsec)
     return true;
 }
 
+//------------------------------------------------------------------------------
+// Drift test helpers
+
+static uint64_t DriftLocalTimeUsec(uint64_t true_us, double drift_ppm, int64_t offset_us)
+{
+    const double scale = 1.0 + drift_ppm * 1e-6;
+    const double local = (double)offset_us + (double)true_us * scale;
+    if (local <= 0.0) {
+        return 0;
+    }
+    return (uint64_t)llround(local);
+}
+
+struct DriftStats
+{
+    std::vector<uint32_t> errors;
+
+    void Add(uint64_t err)
+    {
+        errors.push_back((uint32_t)err);
+    }
+
+    uint32_t P95()
+    {
+        if (errors.empty()) {
+            return 0;
+        }
+        std::sort(errors.begin(), errors.end());
+        const size_t idx = (size_t)ceil(0.95 * (double)(errors.size() - 1));
+        return errors[idx];
+    }
+};
+
+struct DriftPacket
+{
+    bool from_a = true;
+    bool is_sync = false;
+    bool has_ts23 = false;
+    Counter24 ts24 = 0;
+    Counter23 ts23 = 0;
+    Counter24 min_delta = 0;
+    uint64_t send_true_us = 0;
+};
+
+struct DriftArrival
+{
+    uint64_t deliver_true_us = 0;
+    DriftPacket packet;
+};
+
+struct DriftArrivalCompare
+{
+    bool operator()(const DriftArrival& a, const DriftArrival& b) const
+    {
+        return a.deliver_true_us > b.deliver_true_us;
+    }
+};
+
+static bool simulate_drift(
+    double drift_ppm,
+    bool a_fast,
+    uint64_t duration_us,
+    unsigned error_bound_us)
+{
+    TimeSynchronizer sync_a;
+    TimeSynchronizer sync_b;
+
+    const double drift_a = a_fast ? drift_ppm : -drift_ppm;
+    const double drift_b = -drift_a;
+    const int64_t offset_a = 0;
+    const int64_t offset_b = 5 * 1000 * 1000LL;
+
+    const uint64_t send_interval_us = 1000000 / 60;
+    const uint64_t sync_interval_us = 2 * 1000 * 1000ULL;
+    const uint64_t owd_us = 50000;
+    const uint64_t warmup_us = 1000 * 1000ULL;
+
+    uint64_t now_us = 0;
+    uint64_t next_data_ab = 0;
+    uint64_t next_data_ba = 0;
+    uint64_t next_sync_ab = sync_interval_us;
+    uint64_t next_sync_ba = sync_interval_us;
+
+    bool synced = false;
+    uint64_t sync_time_us = 0;
+    uint64_t metrics_start_us = 0;
+
+    DriftStats stats_ab;
+    DriftStats stats_ba;
+
+    std::priority_queue<DriftArrival, std::vector<DriftArrival>, DriftArrivalCompare> arrivals;
+
+    while (now_us <= duration_us) {
+        uint64_t next_arrival = arrivals.empty() ? UINT64_MAX : arrivals.top().deliver_true_us;
+        uint64_t next_time = next_arrival;
+        if (next_data_ab < next_time) next_time = next_data_ab;
+        if (next_data_ba < next_time) next_time = next_data_ba;
+        if (next_sync_ab < next_time) next_time = next_sync_ab;
+        if (next_sync_ba < next_time) next_time = next_sync_ba;
+
+        if (next_time == UINT64_MAX) {
+            break;
+        }
+        now_us = next_time;
+
+        // Deliver arrivals
+        while (!arrivals.empty() && arrivals.top().deliver_true_us == now_us) {
+            DriftArrival ev = arrivals.top();
+            arrivals.pop();
+
+            const bool to_b = ev.packet.from_a;
+            TimeSynchronizer& recv_sync = to_b ? sync_b : sync_a;
+            const double recv_drift = to_b ? drift_b : drift_a;
+            const int64_t recv_offset = to_b ? offset_b : offset_a;
+
+            const uint64_t local_recv = DriftLocalTimeUsec(now_us, recv_drift, recv_offset);
+            recv_sync.OnAuthenticatedDatagramTimestamp(ev.packet.ts24, local_recv);
+
+            if (ev.packet.is_sync) {
+                recv_sync.OnPeerMinDeltaTS24(ev.packet.min_delta);
+            }
+
+            if (!synced && sync_a.IsSynchronized() && sync_b.IsSynchronized()) {
+                synced = true;
+                sync_time_us = now_us;
+                metrics_start_us = sync_time_us + warmup_us;
+            }
+
+            if (synced && now_us >= metrics_start_us && ev.packet.has_ts23 && recv_sync.IsSynchronized()) {
+                const uint64_t true_local_at_send = DriftLocalTimeUsec(
+                    ev.packet.send_true_us,
+                    recv_drift,
+                    recv_offset);
+                const uint64_t est_local = recv_sync.FromLocalTime23(local_recv, ev.packet.ts23);
+                const uint64_t err = (est_local > true_local_at_send)
+                    ? (est_local - true_local_at_send)
+                    : (true_local_at_send - est_local);
+                if (to_b) {
+                    stats_ab.Add(err);
+                }
+                else {
+                    stats_ba.Add(err);
+                }
+            }
+        }
+
+        // Send data A->B
+        if (next_data_ab == now_us) {
+            const uint64_t local_send = DriftLocalTimeUsec(now_us, drift_a, offset_a);
+            DriftPacket pkt;
+            pkt.from_a = true;
+            pkt.send_true_us = now_us;
+            pkt.ts24 = sync_a.LocalTimeToDatagramTS24(local_send);
+            if (sync_a.IsSynchronized()) {
+                pkt.ts23 = sync_a.ToRemoteTime23(local_send);
+                pkt.has_ts23 = pkt.ts23 != 0;
+            }
+            DriftArrival ev;
+            ev.deliver_true_us = now_us + owd_us;
+            ev.packet = pkt;
+            arrivals.push(ev);
+            next_data_ab = now_us + send_interval_us;
+        }
+
+        // Send data B->A
+        if (next_data_ba == now_us) {
+            const uint64_t local_send = DriftLocalTimeUsec(now_us, drift_b, offset_b);
+            DriftPacket pkt;
+            pkt.from_a = false;
+            pkt.send_true_us = now_us;
+            pkt.ts24 = sync_b.LocalTimeToDatagramTS24(local_send);
+            if (sync_b.IsSynchronized()) {
+                pkt.ts23 = sync_b.ToRemoteTime23(local_send);
+                pkt.has_ts23 = pkt.ts23 != 0;
+            }
+            DriftArrival ev;
+            ev.deliver_true_us = now_us + owd_us;
+            ev.packet = pkt;
+            arrivals.push(ev);
+            next_data_ba = now_us + send_interval_us;
+        }
+
+        // Send sync A->B
+        if (next_sync_ab == now_us) {
+            const uint64_t local_send = DriftLocalTimeUsec(now_us, drift_a, offset_a);
+            DriftPacket pkt;
+            pkt.from_a = true;
+            pkt.is_sync = true;
+            pkt.send_true_us = now_us;
+            pkt.ts24 = sync_a.LocalTimeToDatagramTS24(local_send);
+            pkt.min_delta = sync_a.GetMinDeltaTS24();
+            DriftArrival ev;
+            ev.deliver_true_us = now_us + owd_us;
+            ev.packet = pkt;
+            arrivals.push(ev);
+            next_sync_ab = now_us + sync_interval_us;
+        }
+
+        // Send sync B->A
+        if (next_sync_ba == now_us) {
+            const uint64_t local_send = DriftLocalTimeUsec(now_us, drift_b, offset_b);
+            DriftPacket pkt;
+            pkt.from_a = false;
+            pkt.is_sync = true;
+            pkt.send_true_us = now_us;
+            pkt.ts24 = sync_b.LocalTimeToDatagramTS24(local_send);
+            pkt.min_delta = sync_b.GetMinDeltaTS24();
+            DriftArrival ev;
+            ev.deliver_true_us = now_us + owd_us;
+            ev.packet = pkt;
+            arrivals.push(ev);
+            next_sync_ba = now_us + sync_interval_us;
+        }
+    }
+
+    if (!synced || sync_time_us > 5 * 1000 * 1000ULL) {
+        return false;
+    }
+
+    const uint32_t p95_ab = stats_ab.P95();
+    const uint32_t p95_ba = stats_ba.P95();
+    if (p95_ab == 0 || p95_ba == 0) {
+        return false;
+    }
+    if (p95_ab > error_bound_us || p95_ba > error_bound_us) {
+        return false;
+    }
+
+    return true;
+}
+
 bool TestTwoRounds()
 {
     cout << "TestTwoRounds...";
@@ -689,6 +924,35 @@ bool TestTwoRounds()
 
     cout << "Success!" << endl;
 
+    return true;
+}
+
+//------------------------------------------------------------------------------
+// Test: Drift behavior
+
+bool TestDriftBehavior()
+{
+    cout << "TestDriftBehavior...";
+
+    // Moderate drift should stay within a few milliseconds
+    if (!simulate_drift(200.0, true, 10 * 1000 * 1000ULL, 5000) ||
+        !simulate_drift(200.0, false, 10 * 1000 * 1000ULL, 5000))
+    {
+        cout << "Drift test failed for 200ppm" << endl;
+        TIMESYNC_DEBUG_BREAK();
+        return false;
+    }
+
+    // Higher drift should stay within a larger bound
+    if (!simulate_drift(1000.0, true, 12 * 1000 * 1000ULL, 20000) ||
+        !simulate_drift(1000.0, false, 12 * 1000 * 1000ULL, 20000))
+    {
+        cout << "Drift test failed for 1000ppm" << endl;
+        TIMESYNC_DEBUG_BREAK();
+        return false;
+    }
+
+    cout << "Success!" << endl;
     return true;
 }
 
@@ -778,6 +1042,9 @@ int main()
         result = TIMESYNC_RET_FAIL;
     }
     if (!TestTwoRounds()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestDriftBehavior()) {
         result = TIMESYNC_RET_FAIL;
     }
     if (!TestWindowedMinTS24()) {

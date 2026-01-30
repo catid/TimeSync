@@ -51,3 +51,11 @@ Coarse sweep to find the boundary region, then dense sweep for heatmaps:
 ```bash
 ./bench/run_drift_heatmaps.sh
 ```
+
+## Scaling study
+
+Measure Monte Carlo runtime vs thread count:
+
+```bash
+SAMPLES=10000 THREADS_LIST="1 2 4 8 16 32" ./bench/scale_threads.sh
+```

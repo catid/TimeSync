@@ -110,7 +110,7 @@ unsigned TimeSynchronizer::OnAuthenticatedDatagramTimestamp(
     // OWD_i + ClockDelta(L-R)_i = Local Receive Time - Remote Send Time
     const Counter24 deltaTS24 = localTS24 - remoteSendTS24;
 
-    WindowedMinTS24Deltas.Update(deltaTS24, localRecvUsec, kDriftWindowUsec);
+    WindowedMinTS24Deltas.Update(deltaTS24, localRecvUsec, DriftWindowUsec.load());
 
     Recalculate();
 

@@ -327,6 +327,21 @@ public:
         return MinimumOneWayDelayUsec;
     }
 
+    /// Set the drift window used for minimum delta tracking
+    inline void SetDriftWindowUsec(uint64_t windowUsec)
+    {
+        if (windowUsec == 0) {
+            windowUsec = 1;
+        }
+        DriftWindowUsec = windowUsec;
+    }
+
+    /// Get the current drift window
+    inline uint64_t GetDriftWindowUsec() const
+    {
+        return DriftWindowUsec.load();
+    }
+
     /// Returns 16-bit remote time field to send in a packet
     inline uint16_t ToRemoteTime16(uint64_t localUsec)
     {
@@ -388,6 +403,9 @@ protected:
     /// Windowed minimum value for received packet timestamp deltas
     /// Keep track of the smallest (receipt - send) time delta seen so far
     WindowedMinTS24 WindowedMinTS24Deltas; ///< in Timestamp24 units
+
+    /// Drift window for WindowedMinTS24Deltas
+    std::atomic<uint64_t> DriftWindowUsec = ATOMIC_VAR_INIT(kDriftWindowUsec);
 
     /// Keep a copy of the last MinDeltaUsec from the flow control data from peer
     Counter24 LastFC_MinDeltaTS24 = 0;
