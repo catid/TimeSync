@@ -808,6 +808,147 @@ static std::vector<ExperimentConfig> BuildExperiments()
         exps.push_back(cfg);
     }
 
+    // Drift stress (12)
+    {
+        ExperimentConfig cfg = BaseConfig("drift_300ppm");
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.drift_ppm_a = 300.0;
+        cfg.drift_ppm_b = -300.0;
+        exps.push_back(cfg);
+    }
+    {
+        ExperimentConfig cfg = BaseConfig("drift_500ppm");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.drift_ppm_a = 500.0;
+        cfg.drift_ppm_b = -500.0;
+        exps.push_back(cfg);
+    }
+    {
+        ExperimentConfig cfg = BaseConfig("drift_1000ppm");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.drift_ppm_a = 1000.0;
+        cfg.drift_ppm_b = -1000.0;
+        exps.push_back(cfg);
+    }
+    {
+        ExperimentConfig cfg = BaseConfig("drift_2000ppm");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.drift_ppm_a = 2000.0;
+        cfg.drift_ppm_b = -2000.0;
+        exps.push_back(cfg);
+    }
+    {
+        ExperimentConfig cfg = BaseConfig("drift_1000ppm_sync5s");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.sync_interval_us = 5 * 1000 * 1000ULL;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.drift_ppm_a = 1000.0;
+        cfg.drift_ppm_b = -1000.0;
+        exps.push_back(cfg);
+    }
+    {
+        ExperimentConfig cfg = BaseConfig("drift_2000ppm_sync10s");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.sync_interval_us = 10 * 1000 * 1000ULL;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.drift_ppm_a = 2000.0;
+        cfg.drift_ppm_b = -2000.0;
+        exps.push_back(cfg);
+    }
+    {
+        ExperimentConfig cfg = BaseConfig("drift_1000ppm_rate10hz");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.send_rate_hz = 10.0;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.drift_ppm_a = 1000.0;
+        cfg.drift_ppm_b = -1000.0;
+        exps.push_back(cfg);
+    }
+    {
+        ExperimentConfig cfg = BaseConfig("drift_1000ppm_rate240hz");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.send_rate_hz = 240.0;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.drift_ppm_a = 1000.0;
+        cfg.drift_ppm_b = -1000.0;
+        exps.push_back(cfg);
+    }
+    {
+        ExperimentConfig cfg = BaseConfig("drift_1000ppm_asym_20_80");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 80000;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.drift_ppm_a = 1000.0;
+        cfg.drift_ppm_b = -1000.0;
+        exps.push_back(cfg);
+    }
+    {
+        ExperimentConfig cfg = BaseConfig("drift_1000ppm_asym_80_20");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 80000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.drift_ppm_a = 1000.0;
+        cfg.drift_ppm_b = -1000.0;
+        exps.push_back(cfg);
+    }
+    {
+        ExperimentConfig cfg = BaseConfig("drift_1000ppm_loss5");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.loss_ab.loss_rate = 0.05;
+        cfg.loss_ba.loss_rate = 0.05;
+        cfg.drift_ppm_a = 1000.0;
+        cfg.drift_ppm_b = -1000.0;
+        exps.push_back(cfg);
+    }
+    {
+        ExperimentConfig cfg = BaseConfig("drift_1000ppm_spikes");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.delay_ab.spike_prob = 0.05;
+        cfg.delay_ba.spike_prob = 0.05;
+        cfg.delay_ab.spike_delay_us = 100000;
+        cfg.delay_ba.spike_delay_us = 100000;
+        cfg.drift_ppm_a = 1000.0;
+        cfg.drift_ppm_b = -1000.0;
+        exps.push_back(cfg);
+    }
+    {
+        ExperimentConfig cfg = BaseConfig("drift_1000ppm_long300s");
+        cfg.duration_us = 300 * 1000 * 1000ULL;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.drift_ppm_a = 1000.0;
+        cfg.drift_ppm_b = -1000.0;
+        exps.push_back(cfg);
+    }
+    {
+        ExperimentConfig cfg = BaseConfig("drift_2000ppm_long300s");
+        cfg.duration_us = 300 * 1000 * 1000ULL;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.drift_ppm_a = 2000.0;
+        cfg.drift_ppm_b = -2000.0;
+        exps.push_back(cfg);
+    }
+
     // Packet rate + sync interval sweep (6)
     {
         ExperimentConfig cfg = BaseConfig("rate_10hz");

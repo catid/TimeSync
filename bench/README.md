@@ -26,3 +26,11 @@ Generate a summary PDF with plots:
 ```bash
 bench/.venv/bin/python bench/report_summary.py benchmarks/run_YYYYMMDD_HHMMSS benchmarks/report_summary.pdf
 ```
+
+## Break analysis
+
+Flag experiments that breach error thresholds or fail to synchronize:
+
+```bash
+bench/.venv/bin/python bench/analyze_breaks.py benchmarks/run_YYYYMMDD_HHMMSS/summary.csv benchmarks/breaks_report.txt
+```
