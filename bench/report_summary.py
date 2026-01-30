@@ -94,6 +94,13 @@ def main():
     max_time_p95 = float(np.max(time_p95_max))
     max_owd_p95 = float(np.max(owd_p95_max))
     median_sync = float(np.median(sync_time_max))
+    sync60 = [
+        max(to_float(r, "sync_time_a_s"), to_float(r, "sync_time_b_s"))
+        for r in rows
+        if abs(to_float(r, "send_rate_hz") - 60.0) < 1e-3
+    ]
+    median_sync60 = float(np.median(sync60)) if sync60 else None
+    max_sync60 = float(np.max(sync60)) if sync60 else None
 
     seed_path = os.path.join(run_dir, "seeds.txt")
     seeds = ""
@@ -149,7 +156,12 @@ def main():
         lines.append("- Time synchronization maintains low microsecond-scale errors across most scenarios.")
         lines.append("- Worst p95 time errors occur in high-latency or highly asymmetric conditions.")
         lines.append("- OWD error tails track jitter and asymmetry; spikes and cellular stress dominate worst cases.")
-        lines.append("- Sync time remains within a few seconds for the majority of scenarios at 60 Hz send rate.")
+        if sync60:
+            lines.append(
+                f"- 60 Hz send-rate runs: median sync time {median_sync60:.2f}s, worst {max_sync60:.2f}s."
+            )
+        else:
+            lines.append("- Sync time varies by scenario; see sync-time plot for distribution.")
 
         ax.text(0.0, 1.0, "\n".join(lines), va="top", fontsize=11)
         pdf.savefig(fig)

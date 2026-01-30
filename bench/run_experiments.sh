@@ -16,19 +16,40 @@ mkdir -p "${OUT_DIR}"
 SEEDS="${SEEDS:-1 2 3 4 5}"
 MATCH="${MATCH:-}"
 ONLY="${ONLY:-}"
+SUITE="${SUITE:-}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
+AUTO="${AUTO:-1}"
+TARGET_MINUTES="${TARGET_MINUTES:-}"
+CALIBRATE_SECONDS="${CALIBRATE_SECONDS:-}"
+ASSERT="${ASSERT:-}"
 JOBS="${JOBS:-$(nproc)}"
 THREADS="${THREADS:-}"
 SECONDS=0
 
 printf '%s\n' ${SEEDS} > "${OUT_DIR}/seeds.txt"
 
-export EXE OUT_DIR MATCH ONLY THREADS
+export EXE OUT_DIR MATCH ONLY THREADS SUITE AUTO TARGET_MINUTES CALIBRATE_SECONDS EXTRA_ARGS
 
 printf '%s\n' ${SEEDS} | xargs -I{} -P "${JOBS}" bash -c '
   seed="$1"
   csv="${OUT_DIR}/seed_${seed}.csv"
   log="${OUT_DIR}/seed_${seed}.log"
   args=(--seed "$seed" --csv "$csv")
+  if [[ "${AUTO}" == "1" ]]; then
+    args+=(--auto)
+  fi
+  if [[ -n "${TARGET_MINUTES}" ]]; then
+    args+=(--target-minutes "${TARGET_MINUTES}")
+  fi
+  if [[ -n "${CALIBRATE_SECONDS}" ]]; then
+    args+=(--calibrate-seconds "${CALIBRATE_SECONDS}")
+  fi
+  if [[ -n "${ASSERT}" ]]; then
+    args+=(--assert)
+  fi
+  if [[ -n "${SUITE}" ]]; then
+    args+=(--suite "${SUITE}")
+  fi
   if [[ -n "${THREADS}" ]]; then
     args+=(--threads "${THREADS}")
   fi
@@ -37,6 +58,10 @@ printf '%s\n' ${SEEDS} | xargs -I{} -P "${JOBS}" bash -c '
   fi
   if [[ -n "${MATCH}" ]]; then
     args+=(--match "${MATCH}")
+  fi
+  if [[ -n "${EXTRA_ARGS}" ]]; then
+    # shellcheck disable=SC2206
+    args+=(${EXTRA_ARGS})
   fi
   "${EXE}" "${args[@]}" > "${log}"
 ' _ {}

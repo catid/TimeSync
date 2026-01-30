@@ -927,6 +927,247 @@ bool TestTwoRounds()
     return true;
 }
 
+static uint64_t ClampUsecSigned(int64_t value)
+{
+    if (value <= 0) {
+        return 0;
+    }
+    return (uint64_t)value;
+}
+
+static void ExchangeMinDelta(TimeSynchronizer& a, TimeSynchronizer& b)
+{
+    a.OnPeerMinDeltaTS24(b.GetMinDeltaTS24());
+    b.OnPeerMinDeltaTS24(a.GetMinDeltaTS24());
+}
+
+static void SimulateSyncPair(
+    TimeSynchronizer& a,
+    TimeSynchronizer& b,
+    int64_t offset_a,
+    int64_t offset_b,
+    uint64_t delay_ab,
+    uint64_t delay_ba)
+{
+    uint64_t t = 0;
+    const uint64_t step = 10000;
+    for (int i = 0; i < 50; ++i) {
+        const uint64_t local_a_send = ClampUsecSigned((int64_t)t + offset_a);
+        const Counter24 ts_a = TimeSynchronizer::LocalTimeToDatagramTS24(local_a_send);
+        const uint64_t local_b_recv = ClampUsecSigned((int64_t)(t + delay_ab) + offset_b);
+        b.OnAuthenticatedDatagramTimestamp(ts_a, local_b_recv);
+
+        const uint64_t local_b_send = ClampUsecSigned((int64_t)t + offset_b);
+        const Counter24 ts_b = TimeSynchronizer::LocalTimeToDatagramTS24(local_b_send);
+        const uint64_t local_a_recv = ClampUsecSigned((int64_t)(t + delay_ba) + offset_a);
+        a.OnAuthenticatedDatagramTimestamp(ts_b, local_a_recv);
+
+        if ((i % 5) == 4) {
+            ExchangeMinDelta(a, b);
+        }
+        t += step;
+    }
+    ExchangeMinDelta(a, b);
+}
+
+bool TestTimestampWraps()
+{
+    cout << "TestTimestampWraps...";
+
+    const uint64_t tick = 1ULL << kTime23LostBits;
+    const uint64_t wrap = 1ULL << (24 + kTime23LostBits);
+    const uint64_t start = wrap - 10 * tick;
+
+    uint32_t prev = TimeSynchronizer::LocalTimeToDatagramTS24(start);
+    for (int i = 1; i <= 20; ++i) {
+        const uint64_t t = start + (uint64_t)i * tick;
+        const uint32_t cur = TimeSynchronizer::LocalTimeToDatagramTS24(t);
+        const uint32_t expected = (prev + 1) & 0x00ffffff;
+        if (cur != expected) {
+            cout << "Failed TS24 increment at i=" << i << " expected=" << expected << " got=" << cur << endl;
+            return false;
+        }
+        prev = cur;
+    }
+
+    const uint32_t before_wrap = TimeSynchronizer::LocalTimeToDatagramTS24(wrap - tick);
+    const uint32_t at_wrap = TimeSynchronizer::LocalTimeToDatagramTS24(wrap);
+    if (at_wrap != ((before_wrap + 1) & 0x00ffffff)) {
+        cout << "Failed TS24 wrap boundary check" << endl;
+        return false;
+    }
+
+    {
+        TimeSynchronizer a, b;
+        SimulateSyncPair(a, b, 0, 0, 20000, 20000);
+        const uint64_t send_true = wrap - 2 * tick;
+        const Counter24 ts = TimeSynchronizer::LocalTimeToDatagramTS24(send_true);
+        const uint64_t recv_local = send_true + 5000;
+        const unsigned owd = b.OnAuthenticatedDatagramTimestamp(ts, recv_local);
+        if (!b.IsSynchronized() || owd == 0 || owd > 500000) {
+            cout << "Failed TS24 wrap OWD sanity check" << endl;
+            return false;
+        }
+    }
+
+    {
+        TimeSynchronizer a, b;
+        const uint64_t half_range = 1ULL << (23 + kTime23LostBits);
+        SimulateSyncPair(a, b, 0, (int64_t)half_range - 1000, 20000, 20000);
+        const uint64_t send_true = 1000000;
+        const Counter24 ts = TimeSynchronizer::LocalTimeToDatagramTS24(send_true);
+        const uint64_t recv_local = send_true + 20000 + half_range - 1000;
+        const unsigned owd = b.OnAuthenticatedDatagramTimestamp(ts, recv_local);
+        if (!b.IsSynchronized() || owd > half_range) {
+            cout << "Failed TS24 half-range ambiguity sanity check" << endl;
+            return false;
+        }
+    }
+
+    cout << "Success!" << endl;
+    return true;
+}
+
+bool TestTimeEncoding()
+{
+    cout << "TestTimeEncoding...";
+
+    TimeSynchronizer a, b;
+    const int64_t offset_a = 0;
+    const int64_t offset_b = 5 * 1000 * 1000LL;
+    SimulateSyncPair(a, b, offset_a, offset_b, 20000, 20000);
+
+    if (!a.IsSynchronized() || !b.IsSynchronized()) {
+        cout << "Failed to synchronize before timestamp tests" << endl;
+        return false;
+    }
+
+    unsigned delta = 0;
+
+    {
+        const uint64_t true_time = 10 * 1000 * 1000ULL;
+        const uint64_t local_a = ClampUsecSigned((int64_t)true_time + offset_a);
+        const uint64_t local_b = ClampUsecSigned((int64_t)true_time + offset_b);
+
+        const Counter23 ts23 = a.ToRemoteTime23(local_a);
+        const uint64_t decoded23 = b.FromLocalTime23(local_b, ts23);
+        if (!is_near((unsigned)decoded23, (unsigned)local_b, kTime23ErrorBound + 16, delta)) {
+            cout << "Failed TS23 encode/decode accuracy" << endl;
+            return false;
+        }
+
+        const Counter16 ts16 = a.ToRemoteTime16(local_a);
+        const uint64_t decoded16 = b.FromLocalTime16(local_b, ts16);
+        if (!is_near((unsigned)decoded16, (unsigned)local_b, kTime16ErrorBound + 512, delta)) {
+            cout << "Failed TS16 encode/decode accuracy" << endl;
+            return false;
+        }
+    }
+
+    {
+        const uint64_t half_range = 1ULL << (23 + kTime23LostBits);
+        const uint64_t now_true = 120 * 1000 * 1000ULL;
+        const uint64_t local_b_now = ClampUsecSigned((int64_t)now_true + offset_b);
+        const uint64_t local_b_evt = local_b_now - (half_range - 5 * 1000000ULL);
+        const int64_t local_a_evt_signed = (int64_t)local_b_evt - (offset_b - offset_a);
+        const uint64_t local_a_evt = ClampUsecSigned(local_a_evt_signed);
+        const Counter23 ts23 = a.ToRemoteTime23(local_a_evt);
+        const uint64_t decoded23 = b.FromLocalTime23(local_b_now, ts23);
+        const uint64_t range = 1ULL << (23 + kTime23LostBits);
+        uint64_t diff = (decoded23 > local_b_evt) ? (decoded23 - local_b_evt) : (local_b_evt - decoded23);
+        if (diff > range / 2) {
+            diff = range - diff;
+        }
+        if (diff > (uint64_t)(kTime23ErrorBound + 32)) {
+            cout << "Failed TS23 boundary decode diff=" << diff
+                 << " decoded=" << decoded23
+                 << " expected=" << local_b_evt
+                 << " range=" << range << endl;
+            return false;
+        }
+    }
+
+    {
+        const uint64_t half_range = 1ULL << (23 + kTime23LostBits);
+        const uint64_t max_time = half_range * 3;
+        for (uint64_t t = 0; t <= max_time; t += 1000000ULL) {
+            const uint64_t local_a = ClampUsecSigned((int64_t)t + offset_a);
+            const uint64_t local_b = ClampUsecSigned((int64_t)t + offset_b);
+            const Counter23 ts23 = a.ToRemoteTime23(local_a);
+            const uint64_t decoded23 = b.FromLocalTime23(local_b, ts23);
+            if (!is_near((unsigned)decoded23, (unsigned)local_b, kTime23ErrorBound + 32, delta)) {
+                cout << "Failed TS23 long-run wrap at t=" << t << endl;
+                return false;
+            }
+
+            const Counter16 ts16 = a.ToRemoteTime16(local_a);
+            const uint64_t decoded16 = b.FromLocalTime16(local_b, ts16);
+            if (!is_near((unsigned)decoded16, (unsigned)local_b, kTime16ErrorBound + 1024, delta)) {
+                cout << "Failed TS16 long-run wrap at t=" << t << endl;
+                return false;
+            }
+        }
+    }
+
+    {
+        const uint64_t true_time = 20 * 1000 * 1000ULL;
+        const uint64_t local_a = ClampUsecSigned((int64_t)true_time + offset_a);
+        const uint64_t local_b = ClampUsecSigned((int64_t)true_time + offset_b);
+        const Counter23 ts23 = a.ToRemoteTime23(local_a);
+        const Counter16 ts16 = a.ToRemoteTime16(local_a);
+        const uint64_t decoded23 = b.FromLocalTime23(local_b, ts23);
+        const uint64_t decoded16 = b.FromLocalTime16(local_b, ts16);
+        if (!is_near((unsigned)decoded23, (unsigned)local_b, kTime23ErrorBound + 16, delta)) {
+            cout << "Failed mixed TS23 decode" << endl;
+            return false;
+        }
+        if (!is_near((unsigned)decoded16, (unsigned)local_b, kTime16ErrorBound + 512, delta)) {
+            cout << "Failed mixed TS16 decode" << endl;
+            return false;
+        }
+    }
+
+    cout << "Success!" << endl;
+    return true;
+}
+
+bool TestDecodeReorder()
+{
+    cout << "TestDecodeReorder...";
+
+    TimeSynchronizer a, b;
+    const int64_t offset_a = 0;
+    const int64_t offset_b = 5 * 1000 * 1000LL;
+    SimulateSyncPair(a, b, offset_a, offset_b, 20000, 20000);
+
+    const uint64_t base_true = 50 * 1000 * 1000ULL;
+    const uint64_t event1_true = base_true;
+    const uint64_t event2_true = base_true + 1000000ULL;
+    const Counter23 ts1 = a.ToRemoteTime23(ClampUsecSigned((int64_t)event1_true + offset_a));
+    const Counter23 ts2 = a.ToRemoteTime23(ClampUsecSigned((int64_t)event2_true + offset_a));
+
+    unsigned delta = 0;
+
+    const uint64_t decode2_time = base_true + 1500000ULL;
+    const uint64_t local_b_decode2 = ClampUsecSigned((int64_t)decode2_time + offset_b);
+    const uint64_t decoded2 = b.FromLocalTime23(local_b_decode2, ts2);
+    if (!is_near((unsigned)decoded2, (unsigned)(event2_true + offset_b), kTime23ErrorBound + 32, delta)) {
+        cout << "Failed TS23 reorder decode (event2)" << endl;
+        return false;
+    }
+
+    const uint64_t decode1_time = base_true + 2500000ULL;
+    const uint64_t local_b_decode1 = ClampUsecSigned((int64_t)decode1_time + offset_b);
+    const uint64_t decoded1 = b.FromLocalTime23(local_b_decode1, ts1);
+    if (!is_near((unsigned)decoded1, (unsigned)(event1_true + offset_b), kTime23ErrorBound + 64, delta)) {
+        cout << "Failed TS23 reorder decode (event1)" << endl;
+        return false;
+    }
+
+    cout << "Success!" << endl;
+    return true;
+}
+
 //------------------------------------------------------------------------------
 // Test: Drift behavior
 
@@ -1042,6 +1283,15 @@ int main()
         result = TIMESYNC_RET_FAIL;
     }
     if (!TestTwoRounds()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestTimestampWraps()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestTimeEncoding()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestDecodeReorder()) {
         result = TIMESYNC_RET_FAIL;
     }
     if (!TestDriftBehavior()) {
