@@ -30,3 +30,6 @@ target_link_libraries(tests timesync)
 
 add_executable(experiments tests/experiments.cpp)
 target_link_libraries(experiments timesync)
+
+add_executable(peer_bench tests/peer_bench.cpp)
+target_link_libraries(peer_bench timesync)
