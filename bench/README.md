@@ -18,3 +18,11 @@ Environment options:
 
 Outputs are written under `benchmarks/run_YYYYMMDD_HHMMSS/` with one CSV per seed
 and a `summary.csv` averaged across seeds.
+
+## Report PDF
+
+Generate a summary PDF with plots:
+
+```bash
+bench/.venv/bin/python bench/report_summary.py benchmarks/run_YYYYMMDD_HHMMSS benchmarks/report_summary.pdf
+```
