@@ -153,3 +153,28 @@ calculate the network trip time for every packet that arrives:
 Let DD = Distance from the current packet timestamp difference and minimal.
 DD = (Packet Receive - Packet Send) - Min(Packet Receive - Packet Send)
 Packet trip time = (Minimal one-way delay) + DD.
+
+### Simulation Experiments
+
+The repository includes a standalone simulation runner that executes 40
+parameterized experiments and exports metrics to CSV for analysis.
+
+Build and run:
+
+```bash
+cmake -S . -B build
+cmake --build build -j
+./build/experiments --list
+./build/experiments --csv experiments.csv
+```
+
+Filter experiments:
+
+```bash
+./build/experiments --only baseline_20ms_j5
+./build/experiments --match asym_
+```
+
+The CSV includes per-direction time reconstruction error and OWD estimation
+error (mean, p95, p99, max), synchronization time, packet counts, and the
+experiment parameters used to reproduce results.

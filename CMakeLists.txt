@@ -27,3 +27,6 @@ install(TARGETS timesync
 include_directories(inc)
 add_executable(tests tests/tests.cpp)
 target_link_libraries(tests timesync)
+
+add_executable(experiments tests/experiments.cpp)
+target_link_libraries(experiments timesync)
