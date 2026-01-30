@@ -43,3 +43,11 @@ Run Monte Carlo sampling and generate metric-pair heatmaps:
 ./bench/run_montecarlo.sh
 bench/.venv/bin/python bench/report_montecarlo.py benchmarks/run_mc_YYYYMMDD_HHMMSS/montecarlo.csv benchmarks/montecarlo_report.pdf
 ```
+
+## Drift vs other metrics heatmaps
+
+Coarse sweep to find the boundary region, then dense sweep for heatmaps:
+
+```bash
+./bench/run_drift_heatmaps.sh
+```

@@ -1179,6 +1179,88 @@ static std::vector<ExperimentConfig> BuildMonteCarlo(uint64_t seed, unsigned cou
     return exps;
 }
 
+static std::vector<ExperimentConfig> BuildMonteCarloAxis(
+    uint64_t seed,
+    unsigned count,
+    const string& axis,
+    double drift_min,
+    double drift_max,
+    double axis_min,
+    double axis_max)
+{
+    std::vector<ExperimentConfig> exps;
+    exps.reserve(count);
+
+    PCGRandom rng;
+    rng.Seed(seed, 0x5A5A5A5AULL);
+
+    const double base_latency_ms = 50.0;
+    const double jitter_baseline_ms = 5.0;
+    const double loss_baseline = 0.0;
+    const double sync_baseline_s = 2.0;
+    const double rate_baseline_hz = 60.0;
+
+    for (unsigned i = 0; i < count; ++i) {
+        ExperimentConfig cfg = BaseConfig("mc_axis_0000");
+
+        const double drift = RandRangeDouble(rng, drift_min, drift_max);
+        cfg.drift_ppm_a = drift;
+        cfg.drift_ppm_b = -drift;
+
+        // Baselines
+        cfg.delay_ab.base_delay_us = (uint32_t)(base_latency_ms * 1000.0);
+        cfg.delay_ba.base_delay_us = (uint32_t)(base_latency_ms * 1000.0);
+        cfg.delay_ab.jitter_us = (uint32_t)(jitter_baseline_ms * 1000.0);
+        cfg.delay_ba.jitter_us = (uint32_t)(jitter_baseline_ms * 1000.0);
+        cfg.loss_ab.loss_rate = loss_baseline;
+        cfg.loss_ba.loss_rate = loss_baseline;
+        cfg.sync_interval_us = (uint64_t)(sync_baseline_s * 1000000.0);
+        cfg.send_rate_hz = rate_baseline_hz;
+
+        const double axis_value = RandRangeDouble(rng, axis_min, axis_max);
+
+        if (axis == "jitter_ms") {
+            cfg.delay_ab.jitter_us = (uint32_t)(axis_value * 1000.0);
+            cfg.delay_ba.jitter_us = (uint32_t)(axis_value * 1000.0);
+        }
+        else if (axis == "loss") {
+            cfg.loss_ab.loss_rate = axis_value;
+            cfg.loss_ba.loss_rate = axis_value;
+        }
+        else if (axis == "asymmetry_ms") {
+            const double half = axis_value * 0.5;
+            double ab = base_latency_ms - half;
+            double ba = base_latency_ms + half;
+            if (ab < 2.0) {
+                ab = 2.0;
+                ba = 2.0 + axis_value;
+            }
+            cfg.delay_ab.base_delay_us = (uint32_t)(ab * 1000.0);
+            cfg.delay_ba.base_delay_us = (uint32_t)(ba * 1000.0);
+        }
+        else if (axis == "sync_s") {
+            cfg.sync_interval_us = (uint64_t)(axis_value * 1000000.0);
+        }
+        else if (axis == "rate_hz") {
+            cfg.send_rate_hz = axis_value;
+        }
+        else if (axis == "latency_ms") {
+            cfg.delay_ab.base_delay_us = (uint32_t)(axis_value * 1000.0);
+            cfg.delay_ba.base_delay_us = (uint32_t)(axis_value * 1000.0);
+        }
+
+        cfg.duration_us = 30 * 1000 * 1000ULL;
+
+        char name[48];
+        std::snprintf(name, sizeof(name), "mc_%s_%04u", axis.c_str(), i + 1);
+        cfg.name = name;
+
+        exps.push_back(cfg);
+    }
+
+    return exps;
+}
+
 //------------------------------------------------------------------------------
 // CLI helpers
 
@@ -1191,6 +1273,15 @@ struct CliOptions
     uint64_t seed = 0xC0FFEEULL;
     unsigned threads = 1;
     unsigned monte_carlo = 0;
+    string mc_axis;
+    double mc_drift_min = 0.0;
+    double mc_drift_max = 2000.0;
+    double mc_axis_min = 0.0;
+    double mc_axis_max = 0.0;
+    bool mc_axis_min_set = false;
+    bool mc_axis_max_set = false;
+    bool mc_drift_min_set = false;
+    bool mc_drift_max_set = false;
 };
 
 static bool ShouldRun(const ExperimentConfig& cfg, const CliOptions& opt)
@@ -1238,8 +1329,27 @@ static CliOptions ParseArgs(int argc, char** argv)
         else if (std::strcmp(arg, "--montecarlo") == 0 && i + 1 < argc) {
             opt.monte_carlo = (unsigned)std::strtoul(argv[++i], nullptr, 10);
         }
+        else if (std::strcmp(arg, "--mc-axis") == 0 && i + 1 < argc) {
+            opt.mc_axis = argv[++i];
+        }
+        else if (std::strcmp(arg, "--mc-drift-min") == 0 && i + 1 < argc) {
+            opt.mc_drift_min = std::strtod(argv[++i], nullptr);
+            opt.mc_drift_min_set = true;
+        }
+        else if (std::strcmp(arg, "--mc-drift-max") == 0 && i + 1 < argc) {
+            opt.mc_drift_max = std::strtod(argv[++i], nullptr);
+            opt.mc_drift_max_set = true;
+        }
+        else if (std::strcmp(arg, "--mc-axis-min") == 0 && i + 1 < argc) {
+            opt.mc_axis_min = std::strtod(argv[++i], nullptr);
+            opt.mc_axis_min_set = true;
+        }
+        else if (std::strcmp(arg, "--mc-axis-max") == 0 && i + 1 < argc) {
+            opt.mc_axis_max = std::strtod(argv[++i], nullptr);
+            opt.mc_axis_max_set = true;
+        }
         else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
-            std::cout << "Usage: experiments [--list] [--csv path] [--only name] [--match substring] [--seed n] [--threads n] [--montecarlo n]\n";
+            std::cout << "Usage: experiments [--list] [--csv path] [--only name] [--match substring] [--seed n] [--threads n] [--montecarlo n] [--mc-axis name] [--mc-drift-min v] [--mc-drift-max v] [--mc-axis-min v] [--mc-axis-max v]\n";
             std::exit(0);
         }
     }
@@ -1387,9 +1497,47 @@ int main(int argc, char** argv)
 {
     CliOptions opt = ParseArgs(argc, argv);
 
-    const std::vector<ExperimentConfig> experiments = (opt.monte_carlo > 0)
-        ? BuildMonteCarlo(opt.seed, opt.monte_carlo)
-        : BuildExperiments();
+    std::vector<ExperimentConfig> experiments;
+    if (opt.monte_carlo > 0) {
+        if (!opt.mc_axis.empty()) {
+            double axis_min = opt.mc_axis_min_set ? opt.mc_axis_min : 0.0;
+            double axis_max = opt.mc_axis_max_set ? opt.mc_axis_max : 0.0;
+
+            if (!opt.mc_axis_min_set || !opt.mc_axis_max_set) {
+                if (opt.mc_axis == "jitter_ms") {
+                    axis_min = 0.0; axis_max = 30.0;
+                } else if (opt.mc_axis == "loss") {
+                    axis_min = 0.0; axis_max = 0.1;
+                } else if (opt.mc_axis == "asymmetry_ms") {
+                    axis_min = 0.0; axis_max = 150.0;
+                } else if (opt.mc_axis == "sync_s") {
+                    axis_min = 0.5; axis_max = 10.0;
+                } else if (opt.mc_axis == "rate_hz") {
+                    axis_min = 10.0; axis_max = 240.0;
+                } else if (opt.mc_axis == "latency_ms") {
+                    axis_min = 2.0; axis_max = 200.0;
+                }
+            }
+
+            const double drift_min = opt.mc_drift_min_set ? opt.mc_drift_min : 0.0;
+            const double drift_max = opt.mc_drift_max_set ? opt.mc_drift_max : 2000.0;
+
+            experiments = BuildMonteCarloAxis(
+                opt.seed,
+                opt.monte_carlo,
+                opt.mc_axis,
+                drift_min,
+                drift_max,
+                axis_min,
+                axis_max);
+        }
+        else {
+            experiments = BuildMonteCarlo(opt.seed, opt.monte_carlo);
+        }
+    }
+    else {
+        experiments = BuildExperiments();
+    }
 
     if (opt.list_only) {
         for (size_t i = 0; i < experiments.size(); ++i) {
