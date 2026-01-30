@@ -54,7 +54,7 @@ def metric_arrays(rows):
     }
 
 
-def heatmap(ax, x, y, xlabel, ylabel, title, bins=40, xlim=None, ylim=None, thresh_lines=None):
+def heatmap(ax, x, y, xlabel, ylabel, title, bins=50, xlim=None, ylim=None, thresh_lines=None):
     ax.hist2d(x, y, bins=bins, cmap="viridis")
     if xlim:
         ax.set_xlim(xlim)
@@ -89,6 +89,17 @@ def main():
         return 1
 
     metrics = metric_arrays(rows)
+    time_p95 = metrics["time_p95"]
+    time_p99 = metrics["time_p99"]
+    owd_p95 = metrics["owd_p95"]
+    owd_p99 = metrics["owd_p99"]
+    sync = metrics["sync"]
+
+    zoom_time_p95 = float(np.percentile(time_p95, 95))
+    zoom_time_p99 = float(np.percentile(time_p99, 95))
+    zoom_owd_p95 = float(np.percentile(owd_p95, 95))
+    zoom_owd_p99 = float(np.percentile(owd_p99, 95))
+    zoom_sync = float(np.percentile(sync, 95))
 
     good_mask = (
         (metrics["time_p95"] <= THRESH_TIME_P95_US)
@@ -144,11 +155,32 @@ def main():
         fig, ax = plt.subplots(figsize=(8.5, 6.5))
         heatmap(
             ax,
-            metrics["time_p95"],
-            metrics["owd_p95"],
+            time_p95,
+            owd_p95,
             "Time error p95 (us)",
             "OWD error p95 (us)",
             "Time p95 vs OWD p95",
+            thresh_lines=[
+                ("x", THRESH_TIME_P95_US, "#D62728"),
+                ("x", THRESH_TIME_P95_OK_US, "#F58518"),
+                ("y", THRESH_OWD_P95_US, "#D62728"),
+                ("y", THRESH_OWD_P95_OK_US, "#F58518"),
+            ],
+        )
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # time_p95 vs owd_p95 (zoomed)
+        fig, ax = plt.subplots(figsize=(8.5, 6.5))
+        heatmap(
+            ax,
+            time_p95,
+            owd_p95,
+            "Time error p95 (us)",
+            "OWD error p95 (us)",
+            "Time p95 vs OWD p95 (zoomed to p95)",
+            xlim=(0.0, zoom_time_p95),
+            ylim=(0.0, zoom_owd_p95),
             thresh_lines=[
                 ("x", THRESH_TIME_P95_US, "#D62728"),
                 ("x", THRESH_TIME_P95_OK_US, "#F58518"),
@@ -163,11 +195,31 @@ def main():
         fig, ax = plt.subplots(figsize=(8.5, 6.5))
         heatmap(
             ax,
-            metrics["time_p95"],
-            metrics["sync"],
+            time_p95,
+            sync,
             "Time error p95 (us)",
             "Sync time (s)",
             "Time p95 vs Sync time",
+            thresh_lines=[
+                ("x", THRESH_TIME_P95_US, "#D62728"),
+                ("x", THRESH_TIME_P95_OK_US, "#F58518"),
+                ("y", THRESH_SYNC_S, "#D62728"),
+            ],
+        )
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # time_p95 vs sync (zoomed)
+        fig, ax = plt.subplots(figsize=(8.5, 6.5))
+        heatmap(
+            ax,
+            time_p95,
+            sync,
+            "Time error p95 (us)",
+            "Sync time (s)",
+            "Time p95 vs Sync time (zoomed to p95)",
+            xlim=(0.0, zoom_time_p95),
+            ylim=(0.0, zoom_sync),
             thresh_lines=[
                 ("x", THRESH_TIME_P95_US, "#D62728"),
                 ("x", THRESH_TIME_P95_OK_US, "#F58518"),
@@ -181,11 +233,31 @@ def main():
         fig, ax = plt.subplots(figsize=(8.5, 6.5))
         heatmap(
             ax,
-            metrics["owd_p95"],
-            metrics["sync"],
+            owd_p95,
+            sync,
             "OWD error p95 (us)",
             "Sync time (s)",
             "OWD p95 vs Sync time",
+            thresh_lines=[
+                ("x", THRESH_OWD_P95_US, "#D62728"),
+                ("x", THRESH_OWD_P95_OK_US, "#F58518"),
+                ("y", THRESH_SYNC_S, "#D62728"),
+            ],
+        )
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # owd_p95 vs sync (zoomed)
+        fig, ax = plt.subplots(figsize=(8.5, 6.5))
+        heatmap(
+            ax,
+            owd_p95,
+            sync,
+            "OWD error p95 (us)",
+            "Sync time (s)",
+            "OWD p95 vs Sync time (zoomed to p95)",
+            xlim=(0.0, zoom_owd_p95),
+            ylim=(0.0, zoom_sync),
             thresh_lines=[
                 ("x", THRESH_OWD_P95_US, "#D62728"),
                 ("x", THRESH_OWD_P95_OK_US, "#F58518"),
@@ -199,11 +271,32 @@ def main():
         fig, ax = plt.subplots(figsize=(8.5, 6.5))
         heatmap(
             ax,
-            metrics["time_p99"],
-            metrics["owd_p99"],
+            time_p99,
+            owd_p99,
             "Time error p99 (us)",
             "OWD error p99 (us)",
             "Time p99 vs OWD p99",
+            thresh_lines=[
+                ("x", THRESH_TIME_P99_US, "#D62728"),
+                ("x", THRESH_TIME_P99_OK_US, "#F58518"),
+                ("y", THRESH_TIME_P99_US, "#D62728"),
+                ("y", THRESH_TIME_P99_OK_US, "#F58518"),
+            ],
+        )
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # time_p99 vs owd_p99 (zoomed)
+        fig, ax = plt.subplots(figsize=(8.5, 6.5))
+        heatmap(
+            ax,
+            time_p99,
+            owd_p99,
+            "Time error p99 (us)",
+            "OWD error p99 (us)",
+            "Time p99 vs OWD p99 (zoomed to p95)",
+            xlim=(0.0, zoom_time_p99),
+            ylim=(0.0, zoom_owd_p99),
             thresh_lines=[
                 ("x", THRESH_TIME_P99_US, "#D62728"),
                 ("x", THRESH_TIME_P99_OK_US, "#F58518"),
