@@ -666,6 +666,13 @@ bool TestTwoRounds()
     PCGRandom prng;
     prng.Seed(1000);
 
+    if (!test_two_rounds(0, 0))
+    {
+        cout << "Failed for zero-delay zero-delta case" << endl;
+        TIMESYNC_DEBUG_BREAK();
+        return false;
+    }
+
     for (unsigned i = 0; i < kTrials; ++i)
     {
         const uint64_t clock_delta = prng.Next();

@@ -237,7 +237,7 @@ public:
     /// Are there any samples?
     inline bool IsValid() const
     {
-        return Samples[0].Value != 0; ///< ish
+        return HasSample;
     }
 
     /// Get smallest sample
@@ -250,6 +250,7 @@ public:
     inline void Reset(const Sample sample = Sample())
     {
         Samples[0] = Samples[1] = Samples[2] = sample;
+        HasSample = true;
     }
 
     /// Update minimum with new value
@@ -257,6 +258,9 @@ public:
         Counter24 value,
         uint64_t timestamp,
         const uint64_t windowLengthTime);
+
+private:
+    bool HasSample = false;
 };
 
 

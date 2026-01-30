@@ -254,3 +254,7 @@ paket-files/
 *.txt
 *.lib
 *.exe
+
+# Bench outputs
+benchmarks/run_*/
+benchmarks/*.csv

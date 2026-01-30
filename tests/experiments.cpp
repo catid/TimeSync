@@ -1,13 +1,16 @@
 #include <TimeSync/TimeSync.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <queue>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using std::string;
@@ -114,6 +117,11 @@ struct SampleStats
 
     uint32_t Min() const { return samples.empty() ? 0 : min; }
     uint32_t Max() const { return samples.empty() ? 0 : max; }
+
+    void Reserve(size_t n)
+    {
+        samples.reserve(n);
+    }
 
 private:
     void EnsureSorted() const
@@ -325,8 +333,11 @@ static void MaybeSetSyncTime(TimeSynchronizer& sync, uint64_t now_us, bool& flag
     }
 }
 
-static ExperimentMetrics RunExperiment(const ExperimentConfig& cfg, PCGRandom& rng)
+static ExperimentMetrics RunExperiment(const ExperimentConfig& cfg, uint64_t seed)
 {
+    PCGRandom rng;
+    rng.Seed(seed, 0x12345678ULL);
+
     TimeSynchronizer sync_a;
     TimeSynchronizer sync_b;
 
@@ -343,6 +354,12 @@ static ExperimentMetrics RunExperiment(const ExperimentConfig& cfg, PCGRandom& r
     std::priority_queue<ArrivalEvent, std::vector<ArrivalEvent>, ArrivalCompare> arrivals;
 
     ExperimentMetrics metrics;
+    const double expected_packets = (double)cfg.duration_us * cfg.send_rate_hz / 1000000.0;
+    const size_t reserve_count = (size_t)std::ceil(expected_packets);
+    metrics.ab.time_error_us.Reserve(reserve_count);
+    metrics.ab.owd_error_us.Reserve(reserve_count);
+    metrics.ba.time_error_us.Reserve(reserve_count);
+    metrics.ba.owd_error_us.Reserve(reserve_count);
 
     while (now_us <= cfg.duration_us) {
         uint64_t next_arrival = arrivals.empty() ? UINT64_MAX : arrivals.top().deliver_true_us;
@@ -955,6 +972,7 @@ struct CliOptions
     std::vector<string> only;
     string match;
     uint64_t seed = 0xC0FFEEULL;
+    unsigned threads = 1;
 };
 
 static bool ShouldRun(const ExperimentConfig& cfg, const CliOptions& opt)
@@ -993,8 +1011,14 @@ static CliOptions ParseArgs(int argc, char** argv)
         else if (std::strcmp(arg, "--seed") == 0 && i + 1 < argc) {
             opt.seed = (uint64_t)std::strtoull(argv[++i], nullptr, 10);
         }
+        else if (std::strcmp(arg, "--threads") == 0 && i + 1 < argc) {
+            opt.threads = (unsigned)std::strtoul(argv[++i], nullptr, 10);
+            if (opt.threads == 0) {
+                opt.threads = 1;
+            }
+        }
         else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
-            std::cout << "Usage: experiments [--list] [--csv path] [--only name] [--match substring] [--seed n]\n";
+            std::cout << "Usage: experiments [--list] [--csv path] [--only name] [--match substring] [--seed n] [--threads n]\n";
             std::exit(0);
         }
     }
@@ -1128,6 +1152,16 @@ static void PrintSummary(const ExperimentConfig& cfg, const ExperimentMetrics& m
               << "\n";
 }
 
+static uint64_t Hash64(const string& s)
+{
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < s.size(); ++i) {
+        h ^= (uint64_t)(unsigned char)s[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
 int main(int argc, char** argv)
 {
     CliOptions opt = ParseArgs(argc, argv);
@@ -1147,25 +1181,56 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    WriteCsvHeader(csv);
-
-    PCGRandom rng;
-    rng.Seed(opt.seed, 0x12345678ULL);
-
-    size_t ran = 0;
+    std::vector<size_t> run_ids;
+    run_ids.reserve(experiments.size());
     for (size_t i = 0; i < experiments.size(); ++i) {
-        const ExperimentConfig& cfg = experiments[i];
-        if (!ShouldRun(cfg, opt)) {
-            continue;
+        if (ShouldRun(experiments[i], opt)) {
+            run_ids.push_back(i);
         }
-
-        ExperimentMetrics metrics = RunExperiment(cfg, rng);
-        WriteCsvRow(csv, cfg, metrics);
-        PrintSummary(cfg, metrics);
-        ++ran;
     }
 
-    std::cout << "Ran " << ran << " experiments. CSV: " << opt.csv_path << "\n";
+    const size_t run_count = run_ids.size();
+    if (run_count == 0) {
+        std::cerr << "No experiments selected.\n";
+        return 1;
+    }
+
+    if (opt.threads > run_count) {
+        opt.threads = (unsigned)run_count;
+    }
+
+    std::vector<ExperimentMetrics> results(run_count);
+    std::atomic<size_t> next_index(0);
+
+    auto worker = [&]() {
+        for (;;) {
+            const size_t idx = next_index.fetch_add(1);
+            if (idx >= run_count) {
+                break;
+            }
+            const ExperimentConfig& cfg = experiments[run_ids[idx]];
+            const uint64_t seed = opt.seed ^ Hash64(cfg.name);
+            results[idx] = RunExperiment(cfg, seed);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(opt.threads);
+    for (unsigned i = 0; i < opt.threads; ++i) {
+        threads.emplace_back(worker);
+    }
+    for (size_t i = 0; i < threads.size(); ++i) {
+        threads[i].join();
+    }
+
+    WriteCsvHeader(csv);
+    for (size_t i = 0; i < run_count; ++i) {
+        const ExperimentConfig& cfg = experiments[run_ids[i]];
+        WriteCsvRow(csv, cfg, results[i]);
+        PrintSummary(cfg, results[i]);
+    }
+
+    std::cout << "Ran " << run_count << " experiments. CSV: " << opt.csv_path << "\n";
 
     return 0;
 }

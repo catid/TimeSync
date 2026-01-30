@@ -166,6 +166,7 @@ cmake -S . -B build
 cmake --build build -j
 ./build/experiments --list
 ./build/experiments --csv experiments.csv
+./build/experiments --csv experiments.csv --threads 4
 ```
 
 Filter experiments:
