@@ -379,6 +379,22 @@ public:
         return (localTS23 + deltaTS23).ToUnsigned();
     }
 
+    /// Estimate remote time in microseconds using current sync state.
+    /// Returns false if not synchronized.
+    inline bool GetRemoteTimeUsec(uint64_t localUsec, uint64_t& remoteUsec)
+    {
+        if (!Synchronized) {
+            return false;
+        }
+
+        const Counter23 remoteTS23 = ToRemoteTime23(localUsec);
+        remoteUsec = Counter64::ExpandFromTruncatedWithBias(
+            localUsec >> kTime23LostBits,
+            remoteTS23,
+            kTime23Bias).ToUnsigned() << kTime23LostBits;
+        return true;
+    }
+
     /// Returns local time given remote time from packet
     inline uint64_t FromLocalTime23(
         uint64_t localUsec,

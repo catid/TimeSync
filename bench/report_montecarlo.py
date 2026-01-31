@@ -26,6 +26,13 @@ def get_float(row, key, default=0.0):
         return default
 
 
+def time_metric(row, suffix):
+    poll_key = f"poll_time_err_{suffix}"
+    if poll_key in row and row.get(poll_key, "") != "":
+        return get_float(row, poll_key)
+    return get_float(row, f"time_err_{suffix}")
+
+
 def load_rows(path):
     with open(path, "r", newline="") as f:
         return list(csv.DictReader(f))
@@ -39,8 +46,8 @@ def metric_arrays(rows):
     sync = []
 
     for row in rows:
-        time_p95.append(max(get_float(row, "time_err_p95_ab_us"), get_float(row, "time_err_p95_ba_us")))
-        time_p99.append(max(get_float(row, "time_err_p99_ab_us"), get_float(row, "time_err_p99_ba_us")))
+        time_p95.append(max(time_metric(row, "p95_ab_us"), time_metric(row, "p95_ba_us")))
+        time_p99.append(max(time_metric(row, "p99_ab_us"), time_metric(row, "p99_ba_us")))
         owd_p95.append(max(get_float(row, "owd_err_p95_ab_us"), get_float(row, "owd_err_p95_ba_us")))
         owd_p99.append(max(get_float(row, "owd_err_p99_ab_us"), get_float(row, "owd_err_p99_ba_us")))
         sync.append(max(get_float(row, "sync_time_a_s"), get_float(row, "sync_time_b_s")))

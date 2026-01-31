@@ -33,6 +33,13 @@ def to_float(row, key, default=0.0):
         return default
 
 
+def time_metric(row, suffix):
+    poll_key = f"poll_time_err_{suffix}"
+    if poll_key in row and row.get(poll_key, "") != "":
+        return to_float(row, poll_key)
+    return to_float(row, f"time_err_{suffix}")
+
+
 def main():
     if len(sys.argv) >= 2:
         run_dir = sys.argv[1]
@@ -58,11 +65,11 @@ def main():
     names = [r["name"] for r in rows]
 
     time_p95_max = np.array([
-        max(to_float(r, "time_err_p95_ab_us"), to_float(r, "time_err_p95_ba_us"))
+        max(time_metric(r, "p95_ab_us"), time_metric(r, "p95_ba_us"))
         for r in rows
     ])
     time_p99_max = np.array([
-        max(to_float(r, "time_err_p99_ab_us"), to_float(r, "time_err_p99_ba_us"))
+        max(time_metric(r, "p99_ab_us"), time_metric(r, "p99_ba_us"))
         for r in rows
     ])
     owd_p95_max = np.array([
@@ -136,13 +143,13 @@ def main():
         lines += [
             "",
             "Key metrics (p95, max across AB/BA):",
-            f"- Median time error p95: {median_time_p95:.2f} us",
-            f"- Worst time error p95: {max_time_p95:.2f} us",
+            f"- Median poll time error p95: {median_time_p95:.2f} us",
+            f"- Worst poll time error p95: {max_time_p95:.2f} us",
             f"- Median OWD error p95: {median_owd_p95:.2f} us",
             f"- Worst OWD error p95: {max_owd_p95:.2f} us",
             f"- Median sync time (max of A/B): {median_sync:.2f} s",
             "",
-            "Worst time-error p95 experiments:",
+            "Worst poll time-error p95 experiments:",
         ]
         for name, val in worst_time:
             lines.append(f"  - {name}: {val:.2f} us")
@@ -182,7 +189,7 @@ def main():
             pdf.savefig(fig)
             plt.close(fig)
 
-        bar_top(time_p95_max, "Top 15 experiments by time error p95 (max of AB/BA)", "Time error p95 (us)")
+        bar_top(time_p95_max, "Top 15 experiments by poll time error p95 (max of AB/BA)", "Poll time error p95 (us)")
         bar_top(owd_p95_max, "Top 15 experiments by OWD error p95 (max of AB/BA)", "OWD error p95 (us)")
 
         # Sync time plot (all)

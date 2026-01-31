@@ -22,6 +22,8 @@ AUTO="${AUTO:-1}"
 TARGET_MINUTES="${TARGET_MINUTES:-}"
 CALIBRATE_SECONDS="${CALIBRATE_SECONDS:-}"
 ASSERT="${ASSERT:-}"
+BATCH="${BATCH:-0}"
+POLL_RATE_HZ="${POLL_RATE_HZ:-}"
 JOBS="${JOBS:-$(nproc)}"
 THREADS="${THREADS:-}"
 SECONDS=0
@@ -38,6 +40,9 @@ printf '%s\n' ${SEEDS} | xargs -I{} -P "${JOBS}" bash -c '
   if [[ "${AUTO}" == "1" ]]; then
     args+=(--auto)
   fi
+  if [[ "${BATCH}" == "1" ]]; then
+    args+=(--batch)
+  fi
   if [[ -n "${TARGET_MINUTES}" ]]; then
     args+=(--target-minutes "${TARGET_MINUTES}")
   fi
@@ -52,6 +57,9 @@ printf '%s\n' ${SEEDS} | xargs -I{} -P "${JOBS}" bash -c '
   fi
   if [[ -n "${THREADS}" ]]; then
     args+=(--threads "${THREADS}")
+  fi
+  if [[ -n "${POLL_RATE_HZ}" ]]; then
+    args+=(--poll-rate-hz "${POLL_RATE_HZ}")
   fi
   if [[ -n "${ONLY}" ]]; then
     args+=(--only "${ONLY}")

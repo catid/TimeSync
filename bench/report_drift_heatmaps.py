@@ -26,6 +26,13 @@ def get_float(row, key, default=0.0):
         return default
 
 
+def time_metric(row, suffix):
+    poll_key = f"poll_time_err_{suffix}"
+    if poll_key in row and row.get(poll_key, "") != "":
+        return get_float(row, poll_key)
+    return get_float(row, f"time_err_{suffix}")
+
+
 def axis_value(row, axis):
     if axis == "jitter_ms":
         return (get_float(row, "jitter_ab_ms") + get_float(row, "jitter_ba_ms")) * 0.5
@@ -43,8 +50,8 @@ def axis_value(row, axis):
 
 
 def classify(row):
-    time_p95 = max(get_float(row, "time_err_p95_ab_us"), get_float(row, "time_err_p95_ba_us"))
-    time_p99 = max(get_float(row, "time_err_p99_ab_us"), get_float(row, "time_err_p99_ba_us"))
+    time_p95 = max(time_metric(row, "p95_ab_us"), time_metric(row, "p95_ba_us"))
+    time_p99 = max(time_metric(row, "p99_ab_us"), time_metric(row, "p99_ba_us"))
     owd_p95 = max(get_float(row, "owd_err_p95_ab_us"), get_float(row, "owd_err_p95_ba_us"))
     sync = max(get_float(row, "sync_time_a_s"), get_float(row, "sync_time_b_s"))
 

@@ -79,6 +79,17 @@ def metric_values(rows, key):
     return [to_float(r, key) for r in rows]
 
 
+def time_metric_value(row, suffix):
+    poll_key = f"poll_time_err_{suffix}"
+    if poll_key in row and row.get(poll_key, "") != "":
+        return to_float(row, poll_key)
+    return to_float(row, f"offset_{suffix}")
+
+
+def time_metric_values(rows, suffix):
+    return [time_metric_value(r, suffix) for r in rows]
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: report_peer_bench.py <peer_bench.csv> [out_pdf]")
@@ -110,7 +121,7 @@ def main():
             f"Methods: {len(methods)}",
             f"Rows: {len(rows)}",
             "",
-            "Metrics included: offset/OWD error, skew error, convergence time, overhead, teleop RMS/max.",
+            "Metrics included: poll time/OWD error, skew error, convergence time, overhead, teleop RMS/max.",
         ]
         ax.text(0.0, 1.0, "\n".join(lines), va="top", fontsize=11)
         pdf.savefig(fig)
@@ -127,13 +138,13 @@ def main():
                     continue
                 label = f"{key[1]}|{key[2]}|{key[3]}"
                 labels.append(label)
-                offset_vals.append(np.median(metric_values(items, "offset_p95_ab_us")))
+                offset_vals.append(np.median(time_metric_values(items, "p95_ab_us")))
                 owd_vals.append(np.median(metric_values(items, "owd_p95_ab_us")))
             if not labels:
                 continue
             x = np.arange(len(labels))
             axes[0].bar(x, offset_vals, color="#4C78A8")
-            axes[0].set_title(f"{scenario}: offset p95 (AB)")
+            axes[0].set_title(f"{scenario}: poll time p95 (AB)")
             axes[0].set_ylabel("us")
             axes[1].bar(x, owd_vals, color="#F58518")
             axes[1].set_title(f"{scenario}: OWD p95 (AB)")
@@ -185,15 +196,15 @@ def main():
         fig = plt.figure(figsize=(11, 8.5))
         ax = fig.add_axes([0.05, 0.05, 0.9, 0.9])
         ax.axis("off")
-        lines = ["Bootstrap 95% CI for offset/OWD p95 (median across seeds)", ""]
+        lines = ["Bootstrap 95% CI for poll-time/OWD p95 (median across seeds)", ""]
         for key, items in grouped.items():
-            offset_vals = metric_values(items, "offset_p95_ab_us")
+            offset_vals = time_metric_values(items, "p95_ab_us")
             owd_vals = metric_values(items, "owd_p95_ab_us")
             ci_offset = bootstrap_ci(offset_vals, func=np.median)
             ci_owd = bootstrap_ci(owd_vals, func=np.median)
             label = f"{key[0]} | {key[1]}|{key[2]}|{key[3]}"
             lines.append(f"{label}")
-            lines.append(f"  offset p95 median CI: [{ci_offset[0]:.2f}, {ci_offset[1]:.2f}] us")
+            lines.append(f"  poll time p95 median CI: [{ci_offset[0]:.2f}, {ci_offset[1]:.2f}] us")
             lines.append(f"  owd   p95 median CI: [{ci_owd[0]:.2f}, {ci_owd[1]:.2f}] us")
         ax.text(0.0, 1.0, "\n".join(lines), va="top", fontsize=9)
         pdf.savefig(fig)

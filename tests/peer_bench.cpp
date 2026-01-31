@@ -820,6 +820,7 @@ struct ScenarioConfig
     uint64_t duration_us = 30 * 1000 * 1000ULL;
     double send_rate_hz = 60.0;
     double probe_rate_hz = 10.0;
+    double poll_rate_hz = 10.0;
     uint64_t mindelta_interval_us = 1000000;
     uint64_t metrics_warmup_us = 1000 * 1000ULL;
 
@@ -900,6 +901,7 @@ struct DirectionMetrics
     uint64_t deadline_tn = 0;
 
     SampleStats offset_err_us;
+    SampleStats poll_time_err_us;
     SampleStats skew_err_ppm;
     SampleStats owd_err_us;
 
@@ -1019,6 +1021,17 @@ static double AbsDouble(double v)
     return (v < 0.0) ? -v : v;
 }
 
+static uint64_t ClampMetricsWarmup(uint64_t warmup_us, uint64_t duration_us)
+{
+    if (duration_us == 0) {
+        return warmup_us;
+    }
+    if (warmup_us <= (duration_us / 2)) {
+        return warmup_us;
+    }
+    return duration_us / 10;
+}
+
 //------------------------------------------------------------------------------
 // Core simulation (standard scenarios)
 
@@ -1076,6 +1089,26 @@ static double EstimateOverheadBps(const MethodConfig& method, const ScenarioConf
     return total;
 }
 
+static bool EstimateRemoteTimeUsec(const MethodConfig& method, NodeState& node, uint64_t local_now_us, uint64_t& remote_est_us)
+{
+    if (method.kind == MethodKind::TimeSync) {
+        return node.timesync.GetRemoteTimeUsec(local_now_us, remote_est_us);
+    }
+    if (method.kind == MethodKind::Piggyback || method.kind == MethodKind::Cristian ||
+        method.kind == MethodKind::Ntp || method.kind == MethodKind::Ptp) {
+        if (!node.estimator.Ready()) {
+            return false;
+        }
+        const double est = (double)local_now_us + node.estimator.offset_est;
+        if (est <= 0.0) {
+            return false;
+        }
+        remote_est_us = (uint64_t)std::llround(est);
+        return true;
+    }
+    return false;
+}
+
 static void AddOffsetError(DirectionMetrics& dm, double err_us, uint64_t now_us)
 {
     dm.offset_err_us.Add(AbsDouble(err_us));
@@ -1092,6 +1125,11 @@ static void AddOffsetError(DirectionMetrics& dm, double err_us, uint64_t now_us)
 static void AddSkewError(DirectionMetrics& dm, double err_ppm)
 {
     dm.skew_err_ppm.Add(AbsDouble(err_ppm));
+}
+
+static void AddPollTimeError(DirectionMetrics& dm, double err_us)
+{
+    dm.poll_time_err_us.Add(AbsDouble(err_us));
 }
 
 static void AddOwdError(DirectionMetrics& dm, double err_us)
@@ -1207,16 +1245,29 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
     const uint64_t data_interval_us = (scenario.send_rate_hz > 0.0)
         ? (uint64_t)std::llround(1000000.0 / scenario.send_rate_hz)
         : 0;
-    const uint64_t probe_interval_us = (method.probe_rate_hz > 0.0)
+    const bool uses_probes = (method.kind == MethodKind::Cristian ||
+        method.kind == MethodKind::Ntp ||
+        method.kind == MethodKind::Ptp);
+    const uint64_t probe_interval_us = (uses_probes && method.probe_rate_hz > 0.0)
         ? (uint64_t)std::llround(1000000.0 / method.probe_rate_hz)
+        : 0;
+    const uint64_t poll_interval_us = (scenario.poll_rate_hz > 0.0)
+        ? (uint64_t)std::llround(1000000.0 / scenario.poll_rate_hz)
         : 0;
 
     uint64_t next_data_ab = data_interval_us ? 0 : UINT64_MAX;
     uint64_t next_data_ba = data_interval_us ? 0 : UINT64_MAX;
     uint64_t next_probe_ab = probe_interval_us ? 0 : UINT64_MAX;
     uint64_t next_probe_ba = probe_interval_us ? 0 : UINT64_MAX;
-    uint64_t next_mindelta_ab = method.mindelta_interval_us ? method.mindelta_interval_us : UINT64_MAX;
-    uint64_t next_mindelta_ba = method.mindelta_interval_us ? method.mindelta_interval_us : UINT64_MAX;
+    uint64_t next_poll_ab = poll_interval_us ? 0 : UINT64_MAX;
+    uint64_t next_poll_ba = poll_interval_us ? 0 : UINT64_MAX;
+    const bool uses_mindelta = (method.kind == MethodKind::TimeSync || method.kind == MethodKind::Piggyback);
+    uint64_t next_mindelta_ab = (uses_mindelta && method.mindelta_interval_us)
+        ? 0
+        : UINT64_MAX;
+    uint64_t next_mindelta_ba = (uses_mindelta && method.mindelta_interval_us)
+        ? 0
+        : UINT64_MAX;
 
     uint64_t now_us = 0;
     uint64_t data_seq_ab = 0;
@@ -1226,7 +1277,7 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
 
     std::priority_queue<ArrivalEvent, std::vector<ArrivalEvent>, ArrivalCompare> arrivals;
 
-    uint64_t metrics_start_us = scenario.metrics_warmup_us;
+    uint64_t metrics_start_us = ClampMetricsWarmup(scenario.metrics_warmup_us, scenario.duration_us);
 
     const double deadline_us = 50000.0; // 50ms default
 
@@ -1237,6 +1288,8 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
         if (next_data_ba < next_time) next_time = next_data_ba;
         if (next_probe_ab < next_time) next_time = next_probe_ab;
         if (next_probe_ba < next_time) next_time = next_probe_ba;
+        if (next_poll_ab < next_time) next_time = next_poll_ab;
+        if (next_poll_ba < next_time) next_time = next_poll_ba;
         if (next_mindelta_ab < next_time) next_time = next_mindelta_ab;
         if (next_mindelta_ba < next_time) next_time = next_mindelta_ba;
 
@@ -1349,7 +1402,9 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
                 if (method.kind == MethodKind::Cristian) {
                     offset_sample = (double)t2 - ((double)t1 + (double)t4) * 0.5;
                 } else {
-                    offset_sample = ((double)(t2 - t1) + (double)(t3 - t4)) * 0.5;
+                    const int64_t dt1 = (int64_t)t2 - (int64_t)t1;
+                    const int64_t dt2 = (int64_t)t3 - (int64_t)t4;
+                    offset_sample = ((double)dt1 + (double)dt2) * 0.5;
                 }
                 recv_node.estimator.AddSample(now_us, offset_sample);
                 MaybeSetSyncTime(recv_node.estimator.Ready(), now_us, recv_node.synced, recv_node.sync_time_us);
@@ -1364,6 +1419,30 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
                     recv_node.peer_env_valid = true;
                 }
             }
+        }
+
+        if (next_poll_ab == now_us) {
+            const uint64_t local_now = ComputeLocalTimeUsec(now_us, node_a.clock, rng, false);
+            uint64_t remote_est = 0;
+            if (EstimateRemoteTimeUsec(method, node_a, local_now, remote_est)) {
+                if (now_us >= metrics_start_us) {
+                    const uint64_t true_remote = ComputeLocalTimeUsec(now_us, node_b.clock, rng, false);
+                    AddPollTimeError(metrics.ab, (double)remote_est - (double)true_remote);
+                }
+            }
+            next_poll_ab = poll_interval_us ? (now_us + poll_interval_us) : UINT64_MAX;
+        }
+
+        if (next_poll_ba == now_us) {
+            const uint64_t local_now = ComputeLocalTimeUsec(now_us, node_b.clock, rng, false);
+            uint64_t remote_est = 0;
+            if (EstimateRemoteTimeUsec(method, node_b, local_now, remote_est)) {
+                if (now_us >= metrics_start_us) {
+                    const uint64_t true_remote = ComputeLocalTimeUsec(now_us, node_a.clock, rng, false);
+                    AddPollTimeError(metrics.ba, (double)remote_est - (double)true_remote);
+                }
+            }
+            next_poll_ba = poll_interval_us ? (now_us + poll_interval_us) : UINT64_MAX;
         }
 
         // Inject late packet
@@ -1617,14 +1696,26 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
     const uint64_t control_interval_us = (scenario.send_rate_hz > 0.0)
         ? (uint64_t)std::llround(1000000.0 / scenario.send_rate_hz)
         : 20000;
+    const uint64_t poll_interval_us = (scenario.poll_rate_hz > 0.0)
+        ? (uint64_t)std::llround(1000000.0 / scenario.poll_rate_hz)
+        : 0;
 
     uint64_t now_us = 0;
     uint64_t next_control = 0;
     uint64_t next_telemetry = 0;
-    uint64_t next_mindelta_ab = method.mindelta_interval_us ? method.mindelta_interval_us : UINT64_MAX;
-    uint64_t next_mindelta_ba = method.mindelta_interval_us ? method.mindelta_interval_us : UINT64_MAX;
+    uint64_t next_poll_ab = poll_interval_us ? 0 : UINT64_MAX;
+    uint64_t next_poll_ba = poll_interval_us ? 0 : UINT64_MAX;
+    const bool uses_mindelta = (method.kind == MethodKind::TimeSync || method.kind == MethodKind::Piggyback);
+    uint64_t next_mindelta_ab = (uses_mindelta && method.mindelta_interval_us)
+        ? 0
+        : UINT64_MAX;
+    uint64_t next_mindelta_ba = (uses_mindelta && method.mindelta_interval_us)
+        ? 0
+        : UINT64_MAX;
 
     std::priority_queue<ArrivalEvent, std::vector<ArrivalEvent>, ArrivalCompare> arrivals;
+
+    const uint64_t metrics_start_us = ClampMetricsWarmup(scenario.metrics_warmup_us, scenario.duration_us);
 
     TeleopState plant;
     TeleopState plant_meas;
@@ -1641,6 +1732,8 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
         uint64_t next_time = next_arrival;
         if (next_control < next_time) next_time = next_control;
         if (next_telemetry < next_time) next_time = next_telemetry;
+        if (next_poll_ab < next_time) next_time = next_poll_ab;
+        if (next_poll_ba < next_time) next_time = next_poll_ba;
         if (next_mindelta_ab < next_time) next_time = next_mindelta_ab;
         if (next_mindelta_ba < next_time) next_time = next_mindelta_ba;
 
@@ -1704,6 +1797,30 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
                     recv_node.peer_env_valid = true;
                 }
             }
+        }
+
+        if (next_poll_ab == now_us) {
+            const uint64_t local_now = ComputeLocalTimeUsec(now_us, node_a.clock, rng, false);
+            uint64_t remote_est = 0;
+            if (EstimateRemoteTimeUsec(method, node_a, local_now, remote_est)) {
+                if (now_us >= metrics_start_us) {
+                    const uint64_t true_remote = ComputeLocalTimeUsec(now_us, node_b.clock, rng, false);
+                    AddPollTimeError(metrics.ab, (double)remote_est - (double)true_remote);
+                }
+            }
+            next_poll_ab = poll_interval_us ? (now_us + poll_interval_us) : UINT64_MAX;
+        }
+
+        if (next_poll_ba == now_us) {
+            const uint64_t local_now = ComputeLocalTimeUsec(now_us, node_b.clock, rng, false);
+            uint64_t remote_est = 0;
+            if (EstimateRemoteTimeUsec(method, node_b, local_now, remote_est)) {
+                if (now_us >= metrics_start_us) {
+                    const uint64_t true_remote = ComputeLocalTimeUsec(now_us, node_a.clock, rng, false);
+                    AddPollTimeError(metrics.ba, (double)remote_est - (double)true_remote);
+                }
+            }
+            next_poll_ba = poll_interval_us ? (now_us + poll_interval_us) : UINT64_MAX;
         }
 
         if (next_control == now_us) {
@@ -2070,6 +2187,8 @@ static void WriteCsvHeader(std::ofstream& out)
     out << "scenario,train,method,estimator,discipline,seed,"
         << "offset_p50_ab_us,offset_p95_ab_us,offset_p99_ab_us,"
         << "offset_p50_ba_us,offset_p95_ba_us,offset_p99_ba_us,"
+        << "poll_time_err_p50_ab_us,poll_time_err_p95_ab_us,poll_time_err_p99_ab_us,"
+        << "poll_time_err_p50_ba_us,poll_time_err_p95_ba_us,poll_time_err_p99_ba_us,"
         << "skew_p95_ab_ppm,skew_p95_ba_ppm,"
         << "owd_p50_ab_us,owd_p95_ab_us,owd_p99_ab_us,"
         << "owd_p50_ba_us,owd_p95_ba_us,owd_p99_ba_us,"
@@ -2092,6 +2211,12 @@ static void WriteCsvRow(std::ofstream& out, const ScenarioConfig& scenario, cons
         << m.ba.offset_err_us.Percentile(0.50) << ","
         << m.ba.offset_err_us.Percentile(0.95) << ","
         << m.ba.offset_err_us.Percentile(0.99) << ","
+        << m.ab.poll_time_err_us.Percentile(0.50) << ","
+        << m.ab.poll_time_err_us.Percentile(0.95) << ","
+        << m.ab.poll_time_err_us.Percentile(0.99) << ","
+        << m.ba.poll_time_err_us.Percentile(0.50) << ","
+        << m.ba.poll_time_err_us.Percentile(0.95) << ","
+        << m.ba.poll_time_err_us.Percentile(0.99) << ","
         << m.ab.skew_err_ppm.Percentile(0.95) << ","
         << m.ba.skew_err_ppm.Percentile(0.95) << ","
         << m.ab.owd_err_us.Percentile(0.50) << ","
@@ -2127,6 +2252,8 @@ struct CliOptions
     string scenario_filter;
     string method_filter;
     double duration_override_s = 0.0;
+    double poll_rate_hz = 0.0;
+    bool poll_rate_hz_set = false;
 };
 
 static CliOptions ParseArgs(int argc, char** argv)
@@ -2160,6 +2287,13 @@ static CliOptions ParseArgs(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--duration") && i + 1 < argc) {
             opt.duration_override_s = std::atof(argv[++i]);
         }
+        else if (!std::strcmp(argv[i], "--poll-rate-hz") && i + 1 < argc) {
+            opt.poll_rate_hz = std::atof(argv[++i]);
+            opt.poll_rate_hz_set = true;
+        }
+    }
+    if (opt.poll_rate_hz_set && opt.poll_rate_hz < 0.0) {
+        opt.poll_rate_hz = 0.0;
     }
     return opt;
 }
@@ -2186,6 +2320,9 @@ static std::vector<RunItem> BuildRunItems(const CliOptions& opt)
         }
         if (opt.duration_override_s > 0.0) {
             scenarios[i].duration_us = (uint64_t)(opt.duration_override_s * 1000000.0);
+        }
+        if (opt.poll_rate_hz_set) {
+            scenarios[i].poll_rate_hz = opt.poll_rate_hz;
         }
         for (size_t m = 0; m < methods.size(); ++m) {
             const string method_name = MethodName(methods[m].kind);

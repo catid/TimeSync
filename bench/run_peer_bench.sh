@@ -12,6 +12,7 @@ HOLDOUT_ONLY="${HOLDOUT_ONLY:-0}"
 DURATION="${DURATION:-0}"
 SCENARIO_FILTER="${SCENARIO_FILTER:-}"
 METHOD_FILTER="${METHOD_FILTER:-}"
+POLL_RATE_HZ="${POLL_RATE_HZ:-}"
 
 mkdir -p "${OUT_DIR}"
 
@@ -37,6 +38,9 @@ if [[ -n "${METHOD_FILTER}" ]]; then
 fi
 if [[ "${DURATION}" != "0" ]]; then
   CMD+=(--duration "${DURATION}")
+fi
+if [[ -n "${POLL_RATE_HZ}" ]]; then
+  CMD+=(--poll-rate-hz "${POLL_RATE_HZ}")
 fi
 
 "${CMD[@]}"

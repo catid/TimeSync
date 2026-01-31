@@ -474,6 +474,7 @@ struct ExperimentConfig
     string name;
     uint64_t duration_us = 30 * 1000 * 1000ULL;
     double send_rate_hz = 60.0;
+    double poll_rate_hz = 10.0;
     uint64_t sync_interval_us = 2 * 1000 * 1000ULL;
     uint64_t sync_interval_ab_us = 0;
     uint64_t sync_interval_ba_us = 0;
@@ -562,6 +563,7 @@ struct DirectionMetrics
     uint64_t sync_sent = 0;
 
     SampleStats time_error_us;
+    SampleStats poll_time_error_us;
     SampleStats owd_error_us;
 
     uint32_t min_true_owd_us = UINT32_MAX;
@@ -675,6 +677,17 @@ static void MaybeSetSyncTime(TimeSynchronizer& sync, uint64_t now_us, bool& flag
     }
 }
 
+static uint64_t ClampMetricsWarmup(uint64_t warmup_us, uint64_t duration_us)
+{
+    if (duration_us == 0) {
+        return warmup_us;
+    }
+    if (warmup_us <= (duration_us / 2)) {
+        return warmup_us;
+    }
+    return duration_us / 10;
+}
+
 static ExperimentMetrics RunExperiment(
     const ExperimentConfig& cfg,
     uint64_t seed,
@@ -729,6 +742,9 @@ static ExperimentMetrics RunExperiment(
     const uint64_t data_interval_us = (cfg.send_rate_hz > 0.0)
         ? (uint64_t)std::llround(1000000.0 / cfg.send_rate_hz)
         : 0;
+    const uint64_t poll_interval_us = (cfg.poll_rate_hz > 0.0)
+        ? (uint64_t)std::llround(1000000.0 / cfg.poll_rate_hz)
+        : 0;
     const uint64_t sync_interval_ab = (cfg.sync_interval_ab_us > 0)
         ? cfg.sync_interval_ab_us
         : cfg.sync_interval_us;
@@ -738,6 +754,8 @@ static ExperimentMetrics RunExperiment(
 
     uint64_t next_data_ab = (data_interval_us > 0) ? 0 : UINT64_MAX;
     uint64_t next_data_ba = (data_interval_us > 0) ? 0 : UINT64_MAX;
+    uint64_t next_poll_ab = (poll_interval_us > 0) ? 0 : UINT64_MAX;
+    uint64_t next_poll_ba = (poll_interval_us > 0) ? 0 : UINT64_MAX;
     uint64_t next_sync_ab = (sync_interval_ab > 0) ? sync_interval_ab : UINT64_MAX;
     uint64_t next_sync_ba = (sync_interval_ba > 0) ? sync_interval_ba : UINT64_MAX;
 
@@ -768,6 +786,8 @@ static ExperimentMetrics RunExperiment(
         uint64_t next_time = next_arrival;
         if (next_data_ab < next_time) next_time = next_data_ab;
         if (next_data_ba < next_time) next_time = next_data_ba;
+        if (next_poll_ab < next_time) next_time = next_poll_ab;
+        if (next_poll_ba < next_time) next_time = next_poll_ba;
         if (next_sync_ab < next_time) next_time = next_sync_ab;
         if (next_sync_ba < next_time) next_time = next_sync_ba;
 
@@ -823,7 +843,8 @@ static ExperimentMetrics RunExperiment(
                 const uint64_t sync_max = (metrics.sync_time_a_us > metrics.sync_time_b_us)
                     ? metrics.sync_time_a_us
                     : metrics.sync_time_b_us;
-                metrics.metrics_start_us = sync_max + cfg.metrics_warmup_us;
+                const uint64_t warmup_us = ClampMetricsWarmup(cfg.metrics_warmup_us, cfg.duration_us);
+                metrics.metrics_start_us = sync_max + warmup_us;
                 metrics.metrics_start_set = true;
             }
 
@@ -847,6 +868,32 @@ static ExperimentMetrics RunExperiment(
                     dir.time_error_us.Add((uint32_t)err);
                 }
             }
+        }
+
+        if (next_poll_ab == now_us) {
+            const uint64_t local_now = ComputeLocalTimeUsec(now_us, clock_a, rng, false);
+            uint64_t remote_est = 0;
+            if (sync_a.GetRemoteTimeUsec(local_now, remote_est)) {
+                if (metrics.metrics_start_set && now_us >= metrics.metrics_start_us) {
+                    const uint64_t true_remote = ComputeLocalTimeUsec(now_us, clock_b, rng, false);
+                    const double err = (double)remote_est - (double)true_remote;
+                    metrics.ab.poll_time_error_us.Add((uint32_t)std::llround(std::fabs(err)));
+                }
+            }
+            next_poll_ab = (poll_interval_us > 0) ? (now_us + poll_interval_us) : UINT64_MAX;
+        }
+
+        if (next_poll_ba == now_us) {
+            const uint64_t local_now = ComputeLocalTimeUsec(now_us, clock_b, rng, false);
+            uint64_t remote_est = 0;
+            if (sync_b.GetRemoteTimeUsec(local_now, remote_est)) {
+                if (metrics.metrics_start_set && now_us >= metrics.metrics_start_us) {
+                    const uint64_t true_remote = ComputeLocalTimeUsec(now_us, clock_a, rng, false);
+                    const double err = (double)remote_est - (double)true_remote;
+                    metrics.ba.poll_time_error_us.Add((uint32_t)std::llround(std::fabs(err)));
+                }
+            }
+            next_poll_ba = (poll_interval_us > 0) ? (now_us + poll_interval_us) : UINT64_MAX;
         }
 
         if (cfg.inject_late_ab && !late_ab_injected && now_us >= cfg.inject_late_at_us) {
@@ -3160,6 +3207,9 @@ struct CliOptions
     bool mc_axis_max_set = false;
     bool mc_drift_min_set = false;
     bool mc_drift_max_set = false;
+    double poll_rate_hz = 0.0;
+    bool poll_rate_hz_set = false;
+    bool batch_mode = false;
 };
 
 static bool ShouldRun(const ExperimentConfig& cfg, const CliOptions& opt)
@@ -3204,6 +3254,10 @@ static CliOptions ParseArgs(int argc, char** argv)
         else if (std::strcmp(arg, "--threads") == 0 && i + 1 < argc) {
             opt.threads = (unsigned)std::strtoul(argv[++i], nullptr, 10);
         }
+        else if (std::strcmp(arg, "--poll-rate-hz") == 0 && i + 1 < argc) {
+            opt.poll_rate_hz = std::strtod(argv[++i], nullptr);
+            opt.poll_rate_hz_set = true;
+        }
         else if (std::strcmp(arg, "--montecarlo") == 0 && i + 1 < argc) {
             opt.monte_carlo = (unsigned)std::strtoul(argv[++i], nullptr, 10);
         }
@@ -3218,6 +3272,9 @@ static CliOptions ParseArgs(int argc, char** argv)
         }
         else if (std::strcmp(arg, "--auto") == 0) {
             opt.auto_run = true;
+        }
+        else if (std::strcmp(arg, "--batch") == 0 || std::strcmp(arg, "--no-wallclock") == 0) {
+            opt.batch_mode = true;
         }
         else if (std::strcmp(arg, "--target-minutes") == 0 && i + 1 < argc) {
             opt.target_seconds = std::strtod(argv[++i], nullptr) * 60.0;
@@ -3257,7 +3314,7 @@ static CliOptions ParseArgs(int argc, char** argv)
             opt.mc_axis_max_set = true;
         }
         else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {
-            std::cout << "Usage: experiments [--list] [--suite name] [--csv path] [--only name] [--match substring] [--seed n] [--threads n] [--auto] [--target-minutes n] [--target-seconds n] [--calibrate-seconds n] [--no-progress] [--assert] [--montecarlo n] [--mc-family name] [--mc-seeds n] [--mc-axis name] [--mc-drift-min v] [--mc-drift-max v] [--mc-axis-min v] [--mc-axis-max v]\n";
+            std::cout << "Usage: experiments [--list] [--suite name] [--csv path] [--only name] [--match substring] [--seed n] [--threads n] [--poll-rate-hz v] [--auto] [--batch|--no-wallclock] [--target-minutes n] [--target-seconds n] [--calibrate-seconds n] [--no-progress] [--assert] [--montecarlo n] [--mc-family name] [--mc-seeds n] [--mc-axis name] [--mc-drift-min v] [--mc-drift-max v] [--mc-axis-min v] [--mc-axis-max v]\n";
             std::exit(0);
         }
     }
@@ -3272,6 +3329,8 @@ static void WriteCsvHeader(std::ofstream& out)
     out << "sent_ab,recv_ab,lost_ab,sent_ba,recv_ba,lost_ba,sync_time_a_s,sync_time_b_s,metrics_start_s,";
     out << "time_err_mean_ab_us,time_err_p95_ab_us,time_err_p99_ab_us,time_err_max_ab_us,time_err_count_ab,";
     out << "time_err_mean_ba_us,time_err_p95_ba_us,time_err_p99_ba_us,time_err_max_ba_us,time_err_count_ba,";
+    out << "poll_time_err_mean_ab_us,poll_time_err_p95_ab_us,poll_time_err_p99_ab_us,poll_time_err_max_ab_us,poll_time_err_count_ab,";
+    out << "poll_time_err_mean_ba_us,poll_time_err_p95_ba_us,poll_time_err_p99_ba_us,poll_time_err_max_ba_us,poll_time_err_count_ba,";
     out << "owd_err_mean_ab_us,owd_err_p95_ab_us,owd_err_p99_ab_us,owd_err_max_ab_us,owd_err_count_ab,";
     out << "owd_err_mean_ba_us,owd_err_p95_ba_us,owd_err_p99_ba_us,owd_err_max_ba_us,owd_err_count_ba,";
     out << "min_owd_est_a_us,min_owd_est_b_us,min_owd_true_avg_us";
@@ -3360,6 +3419,18 @@ static void WriteCsvRow(std::ofstream& out, const ExperimentConfig& cfg, const E
     out << time_max_ba << ",";
     out << m.ba.time_error_us.Count() << ",";
 
+    out << m.ab.poll_time_error_us.Mean() << ",";
+    out << m.ab.poll_time_error_us.Percentile(0.95) << ",";
+    out << m.ab.poll_time_error_us.Percentile(0.99) << ",";
+    out << m.ab.poll_time_error_us.Max() << ",";
+    out << m.ab.poll_time_error_us.Count() << ",";
+
+    out << m.ba.poll_time_error_us.Mean() << ",";
+    out << m.ba.poll_time_error_us.Percentile(0.95) << ",";
+    out << m.ba.poll_time_error_us.Percentile(0.99) << ",";
+    out << m.ba.poll_time_error_us.Max() << ",";
+    out << m.ba.poll_time_error_us.Count() << ",";
+
     out << owd_mean_ab << ",";
     out << owd_p95_ab << ",";
     out << owd_p99_ab << ",";
@@ -3380,20 +3451,20 @@ static void WriteCsvRow(std::ofstream& out, const ExperimentConfig& cfg, const E
 
 static void PrintSummary(const ExperimentConfig& cfg, const ExperimentMetrics& m)
 {
-    const double time_p95_ab = m.ab.time_error_us.Percentile(0.95);
-    const double time_p95_ba = m.ba.time_error_us.Percentile(0.95);
+    const double poll_p95_ab = m.ab.poll_time_error_us.Percentile(0.95);
+    const double poll_p95_ba = m.ba.poll_time_error_us.Percentile(0.95);
     const double owd_p95_ab = m.ab.owd_error_us.Percentile(0.95);
     const double owd_p95_ba = m.ba.owd_error_us.Percentile(0.95);
 
     std::cout << cfg.name << ": "
               << "syncA=" << (m.sync_a ? "yes" : "no")
               << " syncB=" << (m.sync_b ? "yes" : "no")
-              << " time_p95_ab_us=" << time_p95_ab
-              << " time_p95_ba_us=" << time_p95_ba
+              << " poll_p95_ab_us=" << poll_p95_ab
+              << " poll_p95_ba_us=" << poll_p95_ba
               << " owd_p95_ab_us=" << owd_p95_ab
               << " owd_p95_ba_us=" << owd_p95_ba
-              << " samples_ab=" << m.ab.time_error_us.Count()
-              << " samples_ba=" << m.ba.time_error_us.Count()
+              << " samples_ab=" << m.ab.poll_time_error_us.Count()
+              << " samples_ba=" << m.ba.poll_time_error_us.Count()
               << "\n";
 }
 
@@ -3466,12 +3537,26 @@ static std::vector<ExperimentConfig> BuildExperimentsFromOptions(const CliOption
     else {
         experiments = BuildExperiments();
     }
+
+    if (opt.poll_rate_hz_set) {
+        for (size_t i = 0; i < experiments.size(); ++i) {
+            experiments[i].poll_rate_hz = opt.poll_rate_hz;
+        }
+    }
     return experiments;
 }
 
 int main(int argc, char** argv)
 {
     CliOptions opt = ParseArgs(argc, argv);
+
+    if (opt.batch_mode) {
+        opt.auto_run = false;
+        opt.progress = false;
+    }
+    if (opt.poll_rate_hz_set && opt.poll_rate_hz < 0.0) {
+        opt.poll_rate_hz = 0.0;
+    }
 
     if (opt.threads == 0) {
         opt.threads = GetHardwareThreads();

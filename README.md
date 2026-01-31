@@ -167,6 +167,8 @@ cmake --build build -j
 ./build/experiments --list
 ./build/experiments --csv experiments.csv
 ./build/experiments --csv experiments.csv --threads 4
+./build/experiments --csv experiments.csv --threads 4 --poll-rate-hz 5
+./build/experiments --csv experiments.csv --threads 4 --batch
 ```
 
 Filter experiments:
@@ -176,6 +178,8 @@ Filter experiments:
 ./build/experiments --match asym_
 ```
 
-The CSV includes per-direction time reconstruction error and OWD estimation
-error (mean, p95, p99, max), synchronization time, packet counts, and the
-experiment parameters used to reproduce results.
+The CSV includes per-direction time reconstruction error, poll-time error,
+and OWD estimation error (mean, p95, p99, max), synchronization time, packet
+counts, and the experiment parameters used to reproduce results. Use
+`--batch` (alias `--no-wallclock`) to disable auto-calibration and progress
+output for wallclock-free batch runs.

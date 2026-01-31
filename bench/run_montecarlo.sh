@@ -20,12 +20,16 @@ MC_FAMILY="${MC_FAMILY:-}"
 MC_SEEDS="${MC_SEEDS:-10}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 AUTO="${AUTO:-1}"
+BATCH="${BATCH:-0}"
+POLL_RATE_HZ="${POLL_RATE_HZ:-}"
 TARGET_MINUTES="${TARGET_MINUTES:-}"
 CALIBRATE_SECONDS="${CALIBRATE_SECONDS:-}"
 
 SECONDS=0
 ARGS=(--threads "${THREADS}" --seed "${SEED}" --csv "${OUT_DIR}/montecarlo.csv")
-if [[ "${AUTO}" == "1" ]]; then
+if [[ "${BATCH}" == "1" ]]; then
+  ARGS+=(--batch)
+elif [[ "${AUTO}" == "1" ]]; then
   ARGS+=(--auto)
 fi
 if [[ -n "${TARGET_MINUTES}" ]]; then
@@ -38,6 +42,9 @@ if [[ -n "${MC_FAMILY}" ]]; then
   ARGS+=(--mc-family "${MC_FAMILY}" --mc-seeds "${MC_SEEDS}")
 else
   ARGS+=(--montecarlo "${SAMPLES}")
+fi
+if [[ -n "${POLL_RATE_HZ}" ]]; then
+  ARGS+=(--poll-rate-hz "${POLL_RATE_HZ}")
 fi
 if [[ -n "${EXTRA_ARGS}" ]]; then
   # shellcheck disable=SC2206

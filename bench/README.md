@@ -16,6 +16,7 @@ Environment options:
 - `MATCH` or `ONLY` (filter experiments)
 - `SUITE` (default suite or `testplan` for exhaustive coverage)
 - `EXTRA_ARGS` (additional flags for `experiments`)
+  - Example: `EXTRA_ARGS="--poll-rate-hz 5"` to override poll sampling rate
 - `AUTO` (default: 1, enable 10-minute auto-scaling)
 - `TARGET_MINUTES` (override auto target minutes)
 - `CALIBRATE_SECONDS` (override calibration duration)
@@ -58,6 +59,17 @@ Run Monte Carlo sampling and generate metric-pair heatmaps:
 bench/.venv/bin/python bench/report_montecarlo.py benchmarks/run_mc_YYYYMMDD_HHMMSS/montecarlo.csv benchmarks/montecarlo_report.pdf
 ```
 
+Environment overrides:
+- `SAMPLES` (default: 1000)
+- `THREADS` (default: nproc)
+- `SEED` (default: 12345)
+- `MC_FAMILY` / `MC_SEEDS` (family sweep, default seeds: 10)
+- `AUTO` (default: 1, enable 10-minute auto-scaling)
+- `BATCH=1` to disable auto/progress (event-driven batch mode)
+- `POLL_RATE_HZ=5` to override application poll rate
+- `TARGET_MINUTES` / `CALIBRATE_SECONDS` (auto-scaling tuning)
+- `EXTRA_ARGS` (additional `experiments` flags)
+
 Auto-scaling (default) calibrates for 10s and targets ~10 minutes; set `AUTO=0` to use fixed `SAMPLES`.
 
 To run a named Monte Carlo family sweep (MC-F01..MC-F20):
@@ -96,6 +108,32 @@ Optional environment filters:
 - `SCENARIO_FILTER=E0` to limit scenarios
 - `METHOD_FILTER=M1` to limit methods
 - `DURATION=0.5` to override scenario duration (seconds)
+- `POLL_RATE_HZ=10` to override application poll rate (Hz)
 
 Outputs are written under `benchmarks/run_peer_YYYYMMDD_HHMMSS/` and include
 `peer_bench.csv` and `peer_bench_report.pdf`.
+
+## CPU utilization
+
+See `bench/CPU_UTILIZATION.md` for sample CPU utilization snapshots on 128-thread runs.
+
+## Poll-rate sweep
+
+Sweep application poll rates and summarize poll-time error metrics:
+
+```bash
+./bench/poll_rate_sweep.sh
+```
+
+Optional environment overrides:
+- `POLL_RATES="2 5 10 20 50"` (Hz values to sweep)
+- `SCENARIO=E1` (scenario name)
+- `METHOD=M2` (method name)
+- `DURATION=1` (seconds)
+- `SEEDS=3` (per-rate seeds)
+- `THREADS=3` (per-process threads)
+
+Outputs are written under `benchmarks/run_poll_rate_YYYYMMDD_HHMMSS/` and include
+`poll_rate_*hz.csv` plus `poll_rate_summary.csv`.
+
+See `bench/POLL_RATE_NOTES.md` for cross-method poll-rate sweep summaries.

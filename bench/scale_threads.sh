@@ -16,6 +16,7 @@ mkdir -p "${OUT_DIR}"
 SAMPLES="${SAMPLES:-10000}"
 SEED="${SEED:-7777}"
 THREADS_LIST="${THREADS_LIST:-1 2 4 8 16 32}"
+BATCH="${BATCH:-0}"
 
 printf "threads,runtime_seconds\n" > "${OUT_DIR}/scale.csv"
 
@@ -24,7 +25,11 @@ for t in ${THREADS_LIST}; do
     continue
   fi
   SECONDS=0
-  "${EXE}" --montecarlo "${SAMPLES}" --threads "$t" --seed "${SEED}" --csv "${OUT_DIR}/mc_${t}.csv" > "${OUT_DIR}/mc_${t}.log"
+  args=(--montecarlo "${SAMPLES}" --threads "$t" --seed "${SEED}" --csv "${OUT_DIR}/mc_${t}.csv")
+  if [[ "${BATCH}" == "1" ]]; then
+    args+=(--batch --no-progress)
+  fi
+  "${EXE}" "${args[@]}" > "${OUT_DIR}/mc_${t}.log"
   echo "$t,${SECONDS}" >> "${OUT_DIR}/scale.csv"
   sleep 0.5
 

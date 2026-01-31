@@ -1131,6 +1131,53 @@ bool TestTimeEncoding()
     return true;
 }
 
+bool TestRemoteTimeEstimate()
+{
+    cout << "TestRemoteTimeEstimate...";
+
+    TimeSynchronizer a, b;
+    const int64_t offset_a = 0;
+    const int64_t offset_b = 5 * 1000 * 1000LL;
+    SimulateSyncPair(a, b, offset_a, offset_b, 20000, 20000);
+
+    if (!a.IsSynchronized() || !b.IsSynchronized()) {
+        cout << "Failed to synchronize before remote-time test" << endl;
+        return false;
+    }
+
+    {
+        TimeSynchronizer cold;
+        uint64_t remote_est = 0;
+        if (cold.GetRemoteTimeUsec(1234567ULL, remote_est)) {
+            cout << "Unexpected success before synchronization" << endl;
+            return false;
+        }
+    }
+
+    const uint64_t t_start = 5 * 1000 * 1000ULL;
+    const uint64_t t_end = (1ULL << (24 + kTime23LostBits)) - 2000000ULL;
+    unsigned delta = 0;
+    for (uint64_t t = t_start; t <= t_end; t += 5 * 1000 * 1000ULL) {
+        const uint64_t local_a = ClampUsecSigned((int64_t)t + offset_a);
+        const uint64_t expected_remote = ClampUsecSigned((int64_t)t + offset_b);
+        uint64_t remote_est = 0;
+        if (!a.GetRemoteTimeUsec(local_a, remote_est)) {
+            cout << "Failed to estimate remote time at t=" << t << endl;
+            return false;
+        }
+        if (!is_near((unsigned)remote_est, (unsigned)expected_remote, kTime23ErrorBound + 64, delta)) {
+            cout << "Remote time error too large at t=" << t
+                 << " delta=" << delta
+                 << " expected=" << expected_remote
+                 << " got=" << remote_est << endl;
+            return false;
+        }
+    }
+
+    cout << "Success!" << endl;
+    return true;
+}
+
 bool TestDecodeReorder()
 {
     cout << "TestDecodeReorder...";
@@ -1289,6 +1336,9 @@ int main()
         result = TIMESYNC_RET_FAIL;
     }
     if (!TestTimeEncoding()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestRemoteTimeEstimate()) {
         result = TIMESYNC_RET_FAIL;
     }
     if (!TestDecodeReorder()) {
