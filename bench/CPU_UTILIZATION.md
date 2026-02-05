@@ -25,3 +25,19 @@ Sampled CPU usage with 128 threads using a heavier grid run:
 Notes:
 - CPU percentage is the sum of per-thread %CPU from `ps -L`.
 - Both runs show the process spinning up 129 threads, with high aggregate CPU utilization.
+
+## 2026-02-02: Thread utilization check (64 threads)
+
+Measured with `/usr/bin/time` and verified system limits:
+
+- Command (short): `./build/peer_bench --scenario E7_drift --grid --seeds 10 --threads 64 --duration 10 --out /tmp/peer_util.csv`
+  - CPU%: ~1167% (≈11.7 cores)
+- Command (long): `./build/peer_bench --scenario E7_drift --grid --seeds 100 --threads 64 --duration 30 --out /tmp/peer_util_long.csv`
+  - CPU%: ~1260% (≈12.6 cores)
+
+Environment checks:
+- cgroup quota: `cpu.max` = `max 100000` (no quota)
+- cpuset: `0-127` (full affinity)
+- process affinity: `taskset -pc $$` => `0-127`
+
+Interpretation: no OS/cgroup CPU cap detected; the lower CPU% likely reflects workload granularity or scheduling overhead rather than a hard limit.

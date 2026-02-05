@@ -89,6 +89,46 @@ void WindowedMinTS24::Update(
     }
 }
 
+//------------------------------------------------------------------------------
+// WindowedQuantileTS24
+
+void WindowedQuantileTS24::Update(
+    Counter24 value,
+    uint64_t timestamp,
+    const uint64_t windowLengthTime)
+{
+    Samples.push_back(Sample(value, timestamp));
+    const uint64_t cutoff = (timestamp > windowLengthTime) ? (timestamp - windowLengthTime) : 0;
+    while (!Samples.empty() && Samples.front().Timestamp < cutoff) {
+        Samples.pop_front();
+    }
+}
+
+Counter24 WindowedQuantileTS24::GetQuantile(double quantile) const
+{
+    if (Samples.empty()) {
+        return Counter24(0);
+    }
+    double q = quantile;
+    if (q < 0.0) {
+        q = 0.0;
+    } else if (q > 1.0) {
+        q = 1.0;
+    }
+    std::vector<Counter24> values;
+    values.reserve(Samples.size());
+    for (const auto& sample : Samples) {
+        values.push_back(sample.Value);
+    }
+    size_t idx = 0;
+    if (values.size() > 1) {
+        idx = (size_t)std::floor(q * (values.size() - 1));
+    }
+    std::nth_element(values.begin(), values.begin() + idx, values.end(),
+        [](const Counter24& a, const Counter24& b) { return a < b; });
+    return values[idx];
+}
+
 
 //------------------------------------------------------------------------------
 // TimeSynchronizer
@@ -101,6 +141,17 @@ void TimeSynchronizer::OnPeerMinDeltaTS24(Counter24 minDeltaTS24)
     Recalculate();
 }
 
+void TimeSynchronizer::Reset()
+{
+    Synchronized.store(false);
+    RemoteTimeDeltaUsec.store(0);
+    MinimumOneWayDelayUsec.store(kDefaultOWDUsec);
+    WindowedMinTS24Deltas = WindowedMinTS24();
+    WindowedQuantileTS24Deltas.Reset();
+    LastFC_MinDeltaTS24 = 0;
+    GotPeerUpdate = false;
+}
+
 unsigned TimeSynchronizer::OnAuthenticatedDatagramTimestamp(
     Counter24 remoteSendTS24,
     uint64_t localRecvUsec)
@@ -111,6 +162,7 @@ unsigned TimeSynchronizer::OnAuthenticatedDatagramTimestamp(
     const Counter24 deltaTS24 = localTS24 - remoteSendTS24;
 
     WindowedMinTS24Deltas.Update(deltaTS24, localRecvUsec, DriftWindowUsec.load());
+    WindowedQuantileTS24Deltas.Update(deltaTS24, localRecvUsec, DriftWindowUsec.load());
 
     Recalculate();
 
@@ -146,11 +198,16 @@ unsigned TimeSynchronizer::OnAuthenticatedDatagramTimestamp(
 
 void TimeSynchronizer::Recalculate()
 {
-    if (!WindowedMinTS24Deltas.IsValid() || !GotPeerUpdate)
+    if ((MinQuantile > 0.0 ? !WindowedQuantileTS24Deltas.IsValid() : !WindowedMinTS24Deltas.IsValid()) ||
+        !GotPeerUpdate)
+    {
         return;
+    }
 
     // min(OWD_i) + ClockDelta(L-R)_i
-    const Counter24 minRecvDeltaTS24 = WindowedMinTS24Deltas.GetBest();
+    const Counter24 minRecvDeltaTS24 = (MinQuantile > 0.0)
+        ? WindowedQuantileTS24Deltas.GetQuantile(MinQuantile)
+        : WindowedMinTS24Deltas.GetBest();
 
     // min(OWD_j) + ClockDelta(R-L)_j
     const Counter24 minSendDeltaTS24 = LastFC_MinDeltaTS24;

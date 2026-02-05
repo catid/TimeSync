@@ -2,6 +2,12 @@
 
 All sweeps use `bench/poll_rate_sweep.sh` with `DURATION=1`, `SEEDS=3`, `THREADS=3`,
 and poll rates `2 5 10 20 50` Hz. Metrics report mean poll_time_err p95 (us) across seeds.
+`peer_bench` now emits poll_time_err_count_* columns; older runs before this change
+may show 0.0 placeholders in count summaries. When counts are present,
+`poll_rate_sweep.sh` filters p95 stats to rows with count > 0.
+Budget summaries include percent_over_budget (share of rows exceeding budget).
+Unless noted, historical runs used the then-default probe rate (10 Hz). The current
+default probe rate is 1 Hz for apples-to-apples sync intervals.
 
 ## E1_stationary_jitter
 
@@ -267,3 +273,263 @@ Source: `benchmarks/run_poll_rate_m4_piggyback_e3_20260131_003109/poll_rate_summ
 
 - M1 p95 increases from ~0.5 ms to ~0.9 ms as poll rate rises, then plateaus.
 - M4 TimeSync/Piggyback stay flat around 0.49-0.51 s across poll rates.
+
+## E4_loss_burst
+
+### M1 (Cristian baseline)
+
+Source: `benchmarks/run_poll_rate_m1_e4_20260131_061235/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 491.3 | 295.0 |
+| 5 | 515.0 | 372.7 |
+| 10 | 518.7 | 372.7 |
+| 20 | 518.7 | 372.7 |
+| 50 | 518.7 | 372.7 |
+
+### M4 (TimeSync)
+
+Source: `benchmarks/run_poll_rate_m4_timesync_e4_20260131_061254/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 340021.3 | 326634.7 |
+| 5 | 340088.0 | 326634.7 |
+| 10 | 340141.3 | 326634.7 |
+| 20 | 340141.3 | 326634.7 |
+| 50 | 340141.3 | 326624.0 |
+
+### M4 (Piggyback)
+
+Source: `benchmarks/run_poll_rate_m4_piggyback_e4_20260131_061316/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 340262.5 | 326261.7 |
+| 5 | 340262.8 | 326261.7 |
+| 10 | 340262.8 | 326261.7 |
+| 20 | 340262.8 | 326261.7 |
+| 50 | 340262.8 | 326261.5 |
+
+### Observations (E4)
+
+- M1 p95 rises modestly with higher poll rates and then plateaus.
+- M4 TimeSync/Piggyback stay flat around 0.326-0.340 s across poll rates.
+
+## E5_reorder_dup
+
+### M1 (Cristian baseline)
+
+Source: `benchmarks/run_poll_rate_m1_e5_20260131_061340/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 368.7 | 331.7 |
+| 5 | 512.7 | 378.7 |
+| 10 | 551.0 | 380.0 |
+| 20 | 551.0 | 380.0 |
+| 50 | 551.0 | 380.0 |
+
+### M4 (TimeSync)
+
+Source: `benchmarks/run_poll_rate_m4_timesync_e5_20260131_061402/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 506818.7 | 493317.3 |
+| 5 | 510034.7 | 493317.3 |
+| 10 | 510098.7 | 493317.3 |
+| 20 | 510098.7 | 493317.3 |
+| 50 | 510048.0 | 493317.3 |
+
+### M4 (Piggyback)
+
+Source: `benchmarks/run_poll_rate_m4_piggyback_e5_20260131_061423/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 510341.8 | 489523.5 |
+| 5 | 510346.8 | 489565.7 |
+| 10 | 510347.3 | 489605.3 |
+| 20 | 510347.3 | 489605.3 |
+| 50 | 510346.7 | 489582.0 |
+
+### Observations (E5)
+
+- M1 p95 increases with higher poll rates, then plateaus.
+- M4 TimeSync/Piggyback remain flat around 0.49-0.51 s across poll rates.
+
+## E6_path_change
+
+### M1 (Cristian baseline)
+
+Source: `benchmarks/run_poll_rate_m1_e6_20260131_061442/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 231.3 | 158.7 |
+| 5 | 311.7 | 208.7 |
+| 10 | 368.7 | 217.7 |
+| 20 | 368.7 | 217.7 |
+| 50 | 368.7 | 217.7 |
+
+### M4 (TimeSync)
+
+Source: `benchmarks/run_poll_rate_m4_timesync_e6_20260131_061509/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 510050.7 | 489989.3 |
+| 5 | 510053.3 | 489989.3 |
+| 10 | 510266.7 | 489989.3 |
+| 20 | 510266.7 | 489989.3 |
+| 50 | 510128.0 | 489989.3 |
+
+### M4 (Piggyback)
+
+Source: `benchmarks/run_poll_rate_m4_piggyback_e6_20260131_061530/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 510478.8 | 489546.3 |
+| 5 | 510497.3 | 489604.3 |
+| 10 | 510498.0 | 489616.7 |
+| 20 | 510498.0 | 489617.2 |
+| 50 | 510496.3 | 489611.0 |
+
+### Observations (E6)
+
+- M1 p95 increases with higher poll rates and then plateaus.
+- M4 TimeSync/Piggyback remain flat around 0.49-0.51 s across poll rates.
+
+## E8_budget_200bps
+
+### M1 (Cristian baseline)
+
+Source: `benchmarks/run_poll_rate_m1_e8_20260131_061715/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 0.0 | 0.0 |
+| 5 | 0.0 | 0.0 |
+| 10 | 0.0 | 0.0 |
+| 20 | 0.0 | 0.0 |
+| 50 | 0.0 | 0.0 |
+
+### M2 (NTP baseline)
+
+Source: `benchmarks/run_poll_rate_m2_e8_20260131_061936/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 0.0 | 0.0 |
+| 5 | 0.0 | 0.0 |
+| 10 | 0.0 | 0.0 |
+| 20 | 0.0 | 0.0 |
+| 50 | 0.0 | 0.0 |
+
+### M3 (PTP baseline)
+
+Source: `benchmarks/run_poll_rate_m3_ptp_e8_20260131_062023/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 0.0 | 0.0 |
+| 5 | 0.0 | 0.0 |
+| 10 | 0.0 | 0.0 |
+| 20 | 0.0 | 0.0 |
+| 50 | 0.0 | 0.0 |
+
+### M4 (TimeSync)
+
+Source: `benchmarks/run_poll_rate_m4_timesync_e8_20260131_061747/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 510066.7 | 489976.0 |
+| 5 | 510066.7 | 489976.0 |
+| 10 | 510176.0 | 489976.0 |
+| 20 | 510176.0 | 489976.0 |
+| 50 | 510176.0 | 489976.0 |
+
+### M4 (Piggyback)
+
+Source: `benchmarks/run_poll_rate_m4_piggyback_e8_20260131_061810/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 510461.8 | 489568.2 |
+| 5 | 510529.3 | 489588.5 |
+| 10 | 510533.8 | 489595.3 |
+| 20 | 510533.8 | 489595.3 |
+| 50 | 510531.0 | 489592.8 |
+
+### Observations (E8)
+
+- M1/M2/M3 report zero poll_time_err in this budget scenario (all metrics zeroed in CSVs).
+- M4 TimeSync/Piggyback remain flat around 0.49-0.51 s across poll rates.
+- M4 TimeSync shows poll counts scaling with poll rate (2, 5, 10, 19, 46 per seed).
+- E8 uses overhead_budget_bps=200 with probe_rate_hz=10 for baselines, yet poll counts remain zero.
+- M1 overhead_bps averages ~360 (>200 budget), while M4 TimeSync averages ~186 (<200 budget).
+- Budget margin estimates: M1 ~+160 bps (over), M4 TimeSync ~-14 bps (under).
+- Percent over budget: M1 100% of rows, M4 TimeSync 0% of rows.
+- Lowering probe_rate_hz to 1 for M1/M2 did not reduce overhead (still ~360 bps) or percent_over_budget (still 100%).
+
+## E9_teleop
+
+### M1 (Cristian baseline)
+
+Source: `benchmarks/run_poll_rate_m1_e9_20260131_061832/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 0.0 | 0.0 |
+| 5 | 0.0 | 0.0 |
+| 10 | 0.0 | 0.0 |
+| 20 | 0.0 | 0.0 |
+| 50 | 0.0 | 0.0 |
+
+### M2 (NTP baseline)
+
+Source: `benchmarks/run_poll_rate_m2_e9_20260131_062000/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 0.0 | 0.0 |
+| 5 | 0.0 | 0.0 |
+| 10 | 0.0 | 0.0 |
+| 20 | 0.0 | 0.0 |
+| 50 | 0.0 | 0.0 |
+
+### M4 (TimeSync)
+
+Source: `benchmarks/run_poll_rate_m4_timesync_e9_20260131_061855/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 515042.7 | 0.0 |
+| 5 | 515136.0 | 0.0 |
+| 10 | 515360.0 | 0.0 |
+| 20 | 515360.0 | 0.0 |
+| 50 | 515288.0 | 0.0 |
+
+### M4 (Piggyback)
+
+Source: `benchmarks/run_poll_rate_m4_piggyback_e9_20260131_061916/poll_rate_summary.csv`
+
+| poll_rate_hz | mean_p95_ab_us | mean_p95_ba_us |
+| --- | --- | --- |
+| 2 | 516107.8 | 0.0 |
+| 5 | 516225.3 | 0.0 |
+| 10 | 516250.8 | 0.0 |
+| 20 | 516252.5 | 0.0 |
+| 50 | 516236.0 | 0.0 |
+
+### Observations (E9)
+
+- M1/M2 show zero poll_time_err in this teleop scenario; teleop RMS metrics are present in CSV rows.
+- M4 TimeSync/Piggyback report AB poll_time_err p95 ~515-516 ms while BA poll_time_err remains zero in summaries.
+- M4 TimeSync AB poll counts scale with poll rate, while BA counts remain zero.
+- E9 has overhead_budget_bps=0 and probe_rate_hz=10 for baselines; poll counts remain zero.
+- Teleop RMS averages ~0.328 across most rates (both M1 and M4), with a slight dip near 20 Hz; M1 overhead ~620 bps vs M4 TimeSync ~306 bps.

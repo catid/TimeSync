@@ -121,7 +121,9 @@ def main():
             f"Methods: {len(methods)}",
             f"Rows: {len(rows)}",
             "",
-            "Metrics included: poll time/OWD error, skew error, convergence time, overhead, teleop RMS/max.",
+            "Metrics included: poll time/OWD error, poll counts, skew error, convergence time, overhead, teleop RMS/max.",
+            "Scenario params included: poll_rate_hz, probe_rate_hz, overhead_budget_bps.",
+            "Budget columns: budget_margin_bps, over_budget (1 = overhead exceeds budget).",
         ]
         ax.text(0.0, 1.0, "\n".join(lines), va="top", fontsize=11)
         pdf.savefig(fig)
@@ -155,6 +157,50 @@ def main():
                 ax.grid(axis="y", linestyle=":", alpha=0.4)
             fig.tight_layout()
             pdf.savefig(fig)
+            plt.close(fig)
+
+            # Skew p95 (AB)
+            fig, ax = plt.subplots(figsize=(11, 5))
+            labels = []
+            skew_vals = []
+            for key, items in grouped.items():
+                if key[0] != scenario:
+                    continue
+                label = f"{key[1]}|{key[2]}|{key[3]}"
+                labels.append(label)
+                skew_vals.append(np.median(metric_values(items, "skew_p95_ab_ppm")))
+            if labels:
+                x = np.arange(len(labels))
+                ax.bar(x, skew_vals, color="#54A24B")
+                ax.set_title(f"{scenario}: skew p95 (AB)")
+                ax.set_ylabel("ppm")
+                ax.set_xticks(x)
+                ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+                ax.grid(axis="y", linestyle=":", alpha=0.4)
+                fig.tight_layout()
+                pdf.savefig(fig)
+            plt.close(fig)
+
+            # Convergence time (AB/BA)
+            fig, ax = plt.subplots(figsize=(11, 5))
+            labels = []
+            conv_vals = []
+            for key, items in grouped.items():
+                if key[0] != scenario:
+                    continue
+                label = f"{key[1]}|{key[2]}|{key[3]}"
+                labels.append(label)
+                conv_vals.append(np.median(metric_values(items, "converge_ab_s")))
+            if labels:
+                x = np.arange(len(labels))
+                ax.bar(x, conv_vals, color="#B279A2")
+                ax.set_title(f"{scenario}: converge time (AB)")
+                ax.set_ylabel("seconds")
+                ax.set_xticks(x)
+                ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+                ax.grid(axis="y", linestyle=":", alpha=0.4)
+                fig.tight_layout()
+                pdf.savefig(fig)
             plt.close(fig)
 
         # Pareto frontier: overhead vs OWD p95

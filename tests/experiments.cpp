@@ -2178,7 +2178,7 @@ static std::vector<ExperimentConfig> BuildTestPlan()
         ExperimentConfig cfg = BaseConfig("UT-E11_clock_step_forward");
         cfg.duration_us = kMedium;
         cfg.clock_step_enabled = true;
-        cfg.clock_step_time_us = 40 * kSecond;
+        cfg.clock_step_time_us = 10 * kSecond;
         cfg.clock_step_b_us = 200000;
         add(cfg);
     }
@@ -2186,7 +2186,7 @@ static std::vector<ExperimentConfig> BuildTestPlan()
         ExperimentConfig cfg = BaseConfig("UT-E12_clock_step_backward");
         cfg.duration_us = kMedium;
         cfg.clock_step_enabled = true;
-        cfg.clock_step_time_us = 40 * kSecond;
+        cfg.clock_step_time_us = 10 * kSecond;
         cfg.clock_step_b_us = -20000;
         add(cfg);
     }
@@ -2194,10 +2194,55 @@ static std::vector<ExperimentConfig> BuildTestPlan()
         ExperimentConfig cfg = BaseConfig("UT-E13_clock_step_opposite");
         cfg.duration_us = kMedium;
         cfg.clock_step_enabled = true;
-        cfg.clock_step_time_us = 40 * kSecond;
+        cfg.clock_step_time_us = 10 * kSecond;
         cfg.clock_step_a_us = 100000;
         cfg.clock_step_b_us = -100000;
         add(cfg);
+    }
+    {
+        struct StepCase {
+            const char* tag;
+            int64_t step_us;
+            uint64_t duration_us;
+            uint64_t step_time_us;
+        };
+        const StepCase cases[] = {
+            {"small", 2000000LL, kMedium, 10 * kSecond},
+            {"large", 30000000LL, kLong, 40 * kSecond},
+        };
+        for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
+            const StepCase& sc = cases[ci];
+            const int64_t steps[] = {sc.step_us, -sc.step_us};
+            for (int si = 0; si < 2; ++si) {
+                const char* dir = (steps[si] >= 0) ? "fwd" : "back";
+                {
+                    ExperimentConfig cfg = BaseConfig("UT-E15_clock_step");
+                    cfg.duration_us = sc.duration_us;
+                    cfg.clock_step_enabled = true;
+                    cfg.clock_step_time_us = sc.step_time_us;
+                    cfg.clock_step_a_us = steps[si];
+                    cfg.clock_step_b_us = 0;
+                    char name[96];
+                    std::snprintf(name, sizeof(name),
+                        "UT-E15_clock_step_%s_a_%s", sc.tag, dir);
+                    cfg.name = name;
+                    add(cfg);
+                }
+                {
+                    ExperimentConfig cfg = BaseConfig("UT-E16_clock_step");
+                    cfg.duration_us = sc.duration_us;
+                    cfg.clock_step_enabled = true;
+                    cfg.clock_step_time_us = sc.step_time_us;
+                    cfg.clock_step_a_us = 0;
+                    cfg.clock_step_b_us = steps[si];
+                    char name[96];
+                    std::snprintf(name, sizeof(name),
+                        "UT-E16_clock_step_%s_b_%s", sc.tag, dir);
+                    cfg.name = name;
+                    add(cfg);
+                }
+            }
+        }
     }
     {
         ExperimentConfig cfg = BaseConfig("UT-E14_high_skew_low_rate");
@@ -2220,7 +2265,8 @@ static std::vector<ExperimentConfig> BuildMonteCarloFamily(const string& family,
     if (key == "all") {
         const char* families[] = {
             "f01","f02","f03","f04","f05","f06","f07","f08","f09","f10",
-            "f11","f12","f13","f14","f15","f16","f17","f18","f19","f20"
+            "f11","f12","f13","f14","f15","f16","f17","f18","f19","f20",
+            "f21","f22"
         };
         for (size_t i = 0; i < sizeof(families) / sizeof(families[0]); ++i) {
             std::vector<ExperimentConfig> sub = BuildMonteCarloFamily(families[i], seeds);
@@ -2768,6 +2814,123 @@ static std::vector<ExperimentConfig> BuildMonteCarloFamily(const string& family,
         return exps;
     }
 
+    if (key == "f21" || key == "mc-f21" || key == "mc_f21" || key == "mcf21" ||
+        key == "video" || key == "mc-video" || key == "mc_video" || key == "video-link") {
+        const double bases_ms[] = {20, 60, 120};
+        const double jitters_ms[] = {1.0, 5.0};
+        const double sigmas[] = {0.35, 0.60};
+        struct Profile {
+            const char* tag;
+            bool congestion;
+            bool burst_loss;
+            bool path_step;
+        };
+        const Profile profiles[] = {
+            {"base", false, false, false},
+            {"cong", true, false, false},
+            {"burst", false, true, false},
+            {"step", false, false, true},
+        };
+        for (size_t bi = 0; bi < sizeof(bases_ms) / sizeof(bases_ms[0]); ++bi) {
+            for (size_t ji = 0; ji < sizeof(jitters_ms) / sizeof(jitters_ms[0]); ++ji) {
+                for (size_t si = 0; si < sizeof(sigmas) / sizeof(sigmas[0]); ++si) {
+                    for (size_t pi = 0; pi < sizeof(profiles) / sizeof(profiles[0]); ++pi) {
+                        const Profile& p = profiles[pi];
+                        ExperimentConfig cfg = BaseConfig("MC-F21");
+                        cfg.duration_us = 60 * kSecond;
+                        SetSymmetricBase(cfg, bases_ms[bi]);
+                        cfg.delay_ab.jitter_mode = JitterMode::LogNormal;
+                        cfg.delay_ba.jitter_mode = JitterMode::LogNormal;
+                        cfg.delay_ab.jitter_us = (uint32_t)std::llround(jitters_ms[ji] * 1000.0);
+                        cfg.delay_ba.jitter_us = cfg.delay_ab.jitter_us;
+                        cfg.delay_ab.lognormal_sigma = sigmas[si];
+                        cfg.delay_ba.lognormal_sigma = sigmas[si];
+
+                        if (p.congestion) {
+                            const uint32_t amp_us = (bases_ms[bi] <= 60.0) ? 20000 : 60000;
+                            cfg.delay_ab.queue_amp_us = amp_us;
+                            cfg.delay_ba.queue_amp_us = amp_us;
+                            cfg.delay_ab.queue_period_us = 8 * kSecond;
+                            cfg.delay_ba.queue_period_us = 8 * kSecond;
+                        }
+                        if (p.burst_loss) {
+                            SetLossBoth(cfg, 0.02);
+                            cfg.loss_ab.burst_start_prob = 0.05;
+                            cfg.loss_ba.burst_start_prob = 0.05;
+                            cfg.loss_ab.burst_len_min = 5;
+                            cfg.loss_ab.burst_len_max = 30;
+                            cfg.loss_ba.burst_len_min = 5;
+                            cfg.loss_ba.burst_len_max = 30;
+                        }
+                        if (p.path_step) {
+                            cfg.delay_ab.step_at_us = 30 * kSecond;
+                            cfg.delay_ba.step_at_us = 30 * kSecond;
+                            const int32_t step_us = (bases_ms[bi] <= 60.0) ? 20000 : 50000;
+                            cfg.delay_ab.step_delta_us = step_us;
+                            cfg.delay_ba.step_delta_us = step_us;
+                            cfg.delay_ab.step2_at_us = 45 * kSecond;
+                            cfg.delay_ba.step2_at_us = 45 * kSecond;
+                            cfg.delay_ab.step2_delta_us = -step_us / 2;
+                            cfg.delay_ba.step2_delta_us = -step_us / 2;
+                        }
+
+                        char name[160];
+                        std::snprintf(
+                            name, sizeof(name),
+                            "MC-F21_video_b%.0f_j%.1f_s%.2f_%s",
+                            bases_ms[bi], jitters_ms[ji], sigmas[si], p.tag);
+                        cfg.name = name;
+                        add(cfg);
+                    }
+                }
+            }
+        }
+        return exps;
+    }
+
+    if (key == "f22" || key == "mc-f22" || key == "mc_f22" || key == "mcf22" ||
+        key == "clock-step" || key == "clock_step" || key == "mc-clock-step" || key == "mc_clock_step") {
+        struct StepCase {
+            const char* tag;
+            int64_t step_us;
+            uint64_t duration_us;
+            uint64_t step_time_us;
+        };
+        const StepCase cases[] = {
+            {"small", 2000000LL, 60 * kSecond, 20 * kSecond},
+            {"large", 30000000LL, 120 * kSecond, 40 * kSecond},
+        };
+        for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
+            const StepCase& sc = cases[ci];
+            const int64_t steps[] = {sc.step_us, -sc.step_us};
+            for (int si = 0; si < 2; ++si) {
+                const char* dir = (steps[si] >= 0) ? "fwd" : "back";
+                for (int side = 0; side < 2; ++side) {
+                    ExperimentConfig cfg = BaseConfig("MC-F22");
+                    cfg.duration_us = sc.duration_us;
+                    SetSymmetricBase(cfg, 60.0);
+                    SetGaussianJitter(cfg.delay_ab, 3.0, 4.0);
+                    SetGaussianJitter(cfg.delay_ba, 3.0, 4.0);
+                    cfg.clock_step_enabled = true;
+                    cfg.clock_step_time_us = sc.step_time_us;
+                    if (side == 0) {
+                        cfg.clock_step_a_us = steps[si];
+                    } else {
+                        cfg.clock_step_b_us = steps[si];
+                    }
+                    char name[160];
+                    std::snprintf(
+                        name, sizeof(name),
+                        "MC-F22_step_%s_%s_%s",
+                        sc.tag, (side == 0) ? "a" : "b", dir);
+                    cfg.name = name;
+                    add(cfg);
+                }
+            }
+        }
+        return exps;
+    }
+
     return exps;
 }
 
@@ -3120,6 +3283,11 @@ static bool ValidateExperiment(const ExperimentConfig& cfg, const ExperimentMetr
     if (StartsWith(name, "UT-D03") ||
         StartsWith(name, "UT-B09") ||
         StartsWith(name, "UT-E14")) {
+        return true;
+    }
+
+    if (StartsWith(name, "UT-E15_clock_step_large") ||
+        StartsWith(name, "UT-E16_clock_step_large")) {
         return true;
     }
 

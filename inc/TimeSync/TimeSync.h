@@ -31,7 +31,11 @@
 
 #include "Counter.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <deque>
+#include <vector>
 
 /**
     Time Synchronization Protocol
@@ -263,6 +267,46 @@ private:
     bool HasSample = false;
 };
 
+//------------------------------------------------------------------------------
+// WindowedQuantileTS24
+
+/// Windowed quantile in TS24 units
+class WindowedQuantileTS24
+{
+public:
+    struct Sample
+    {
+        Counter24 Value;
+        uint64_t Timestamp;
+
+        explicit Sample(Counter24 value = 0, uint64_t timestamp = 0)
+            : Value(value)
+            , Timestamp(timestamp)
+        {
+        }
+    };
+
+    inline bool IsValid() const
+    {
+        return !Samples.empty();
+    }
+
+    inline void Reset()
+    {
+        Samples.clear();
+    }
+
+    void Update(
+        Counter24 value,
+        uint64_t timestamp,
+        const uint64_t windowLengthTime);
+
+    Counter24 GetQuantile(double quantile) const;
+
+private:
+    std::deque<Sample> Samples;
+};
+
 
 //------------------------------------------------------------------------------
 // TimeSynchronizer
@@ -310,6 +354,9 @@ public:
     /// Get the minimum TS24 (receipt - send) delta seen in the past interval
     inline Counter24 GetMinDeltaTS24() const
     {
+        if (MinQuantile > 0.0) {
+            return WindowedQuantileTS24Deltas.GetQuantile(MinQuantile);
+        }
         return WindowedMinTS24Deltas.GetBest();
     }
 
@@ -341,6 +388,25 @@ public:
     {
         return DriftWindowUsec.load();
     }
+
+    /// Set the quantile used for the minimum delta envelope (0 = strict min)
+    inline void SetMinQuantile(double quantile)
+    {
+        if (quantile < 0.0) {
+            quantile = 0.0;
+        } else if (quantile > 1.0) {
+            quantile = 1.0;
+        }
+        MinQuantile = quantile;
+    }
+
+    inline double GetMinQuantile() const
+    {
+        return MinQuantile;
+    }
+
+    /// Reset synchronization state and sample windows (keeps configuration)
+    void Reset();
 
     /// Returns 16-bit remote time field to send in a packet
     inline uint16_t ToRemoteTime16(uint64_t localUsec)
@@ -419,9 +485,13 @@ protected:
     /// Windowed minimum value for received packet timestamp deltas
     /// Keep track of the smallest (receipt - send) time delta seen so far
     WindowedMinTS24 WindowedMinTS24Deltas; ///< in Timestamp24 units
+    WindowedQuantileTS24 WindowedQuantileTS24Deltas;
 
     /// Drift window for WindowedMinTS24Deltas
     std::atomic<uint64_t> DriftWindowUsec = ATOMIC_VAR_INIT(kDriftWindowUsec);
+
+    /// Quantile used for min-delta envelope (0 = strict min)
+    double MinQuantile = 0.0;
 
     /// Keep a copy of the last MinDeltaUsec from the flow control data from peer
     Counter24 LastFC_MinDeltaTS24 = 0;
