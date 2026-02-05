@@ -10,9 +10,11 @@ GRID="${GRID:-0}"
 TRAIN_ONLY="${TRAIN_ONLY:-0}"
 HOLDOUT_ONLY="${HOLDOUT_ONLY:-0}"
 DURATION="${DURATION:-0}"
+PROFILE="${PROFILE:-}"
 SCENARIO_FILTER="${SCENARIO_FILTER:-}"
 METHOD_FILTER="${METHOD_FILTER:-}"
 POLL_RATE_HZ="${POLL_RATE_HZ:-}"
+PROBE_RATE_HZ="${PROBE_RATE_HZ:-}"
 
 mkdir -p "${OUT_DIR}"
 
@@ -36,11 +38,17 @@ fi
 if [[ -n "${METHOD_FILTER}" ]]; then
   CMD+=(--method "${METHOD_FILTER}")
 fi
+if [[ -n "${PROFILE}" ]]; then
+  CMD+=(--profile "${PROFILE}")
+fi
 if [[ "${DURATION}" != "0" ]]; then
   CMD+=(--duration "${DURATION}")
 fi
 if [[ -n "${POLL_RATE_HZ}" ]]; then
   CMD+=(--poll-rate-hz "${POLL_RATE_HZ}")
+fi
+if [[ -n "${PROBE_RATE_HZ}" ]]; then
+  CMD+=(--probe-rate-hz "${PROBE_RATE_HZ}")
 fi
 
 "${CMD[@]}"

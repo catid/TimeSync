@@ -10741,6 +10741,15 @@ static bool IsSkewScenario(const ScenarioConfig& cfg)
         || (name.find("slew") != string::npos);
 }
 
+static bool IsLowJitterLongScenario(const ScenarioConfig& cfg)
+{
+    static const uint64_t kMinDurationUs = 60 * 1000 * 1000ULL;
+    static const uint32_t kMaxJitterUs = 1000;
+    return cfg.duration_us >= kMinDurationUs
+        && cfg.delay_ab.jitter_us <= kMaxJitterUs
+        && cfg.delay_ba.jitter_us <= kMaxJitterUs;
+}
+
 static std::vector<ScenarioConfig> BuildScenarios()
 {
     std::vector<ScenarioConfig> sc;
@@ -20269,13 +20278,20 @@ static void WriteCsvRow(std::ofstream& out, const ScenarioConfig& scenario, cons
 
 struct CliOptions
 {
+    enum class ScenarioProfile
+    {
+        Core,
+        Skew,
+        LowJitterLong,
+    };
+
     string out_csv = "peer_bench.csv";
     unsigned seeds = 100;
     bool grid = false;
     bool train_only = false;
     bool holdout_only = false;
     bool include_disabled = false;
-    bool skew_only = false;
+    ScenarioProfile scenario_profile = ScenarioProfile::Core;
     unsigned threads = 0;
     string scenario_filter;
     string method_filter;
@@ -20320,7 +20336,25 @@ static CliOptions ParseArgs(int argc, char** argv)
             opt.include_disabled = true;
         }
         else if (!std::strcmp(argv[i], "--skew")) {
-            opt.skew_only = true;
+            opt.scenario_profile = CliOptions::ScenarioProfile::Skew;
+        }
+        else if (!std::strcmp(argv[i], "--profile") && i + 1 < argc) {
+            const char* profile = argv[++i];
+            if (!std::strcmp(profile, "core")) {
+                opt.scenario_profile = CliOptions::ScenarioProfile::Core;
+            }
+            else if (!std::strcmp(profile, "skew")) {
+                opt.scenario_profile = CliOptions::ScenarioProfile::Skew;
+            }
+            else if (!std::strcmp(profile, "low-jitter-long")
+                || !std::strcmp(profile, "low_jitter_long")
+                || !std::strcmp(profile, "lowjitterlong")) {
+                opt.scenario_profile = CliOptions::ScenarioProfile::LowJitterLong;
+            }
+            else {
+                std::cerr << "Unknown profile '" << profile
+                          << "' (expected: core|skew|low-jitter-long)\n";
+            }
         }
         else if (!std::strcmp(argv[i], "--threads") && i + 1 < argc) {
             opt.threads = (unsigned)std::atoi(argv[++i]);
@@ -20480,11 +20514,18 @@ static std::vector<RunItem> BuildRunItems(const CliOptions& opt)
         if (!opt.include_disabled && !scenarios[i].core) {
             continue;
         }
-        if (opt.skew_only && !IsSkewScenario(scenarios[i])) {
-            continue;
+        if (opt.scenario_profile == CliOptions::ScenarioProfile::Skew) {
+            if (!IsSkewScenario(scenarios[i])) {
+                continue;
+            }
+            if (IsStressScenario(scenarios[i])) {
+                continue;
+            }
         }
-        if (opt.skew_only && IsStressScenario(scenarios[i])) {
-            continue;
+        else if (opt.scenario_profile == CliOptions::ScenarioProfile::LowJitterLong) {
+            if (!IsLowJitterLongScenario(scenarios[i])) {
+                continue;
+            }
         }
         if (!opt.scenario_exact.empty() && scenarios[i].name != opt.scenario_exact) {
             continue;
@@ -20698,6 +20739,26 @@ static int RunUnitTests()
         ok &= has("E126_video_heavy_tail_mix");
         ok &= has("E128_ts24_wrap_stress");
         ok &= has("E130_heavytail_step_reorder");
+
+        size_t low_jitter_long = 0;
+        size_t low_jitter_long_core = 0;
+        for (const auto& sc : scenarios) {
+            if (!IsLowJitterLongScenario(sc)) {
+                continue;
+            }
+            ++low_jitter_long;
+            if (!ShouldExcludeFromCore(sc)) {
+                ++low_jitter_long_core;
+            }
+        }
+        if (low_jitter_long < 2) {
+            std::cerr << "Unit test failed: expected at least 2 low-jitter long scenarios\n";
+            ok = false;
+        }
+        if (low_jitter_long_core < 1) {
+            std::cerr << "Unit test failed: expected at least 1 core low-jitter long scenario\n";
+            ok = false;
+        }
     }
 
     // Video latency bounds (20–120 ms base delay)
