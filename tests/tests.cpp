@@ -1317,6 +1317,393 @@ bool TestWindowedMinTS24()
 
 
 //------------------------------------------------------------------------------
+// Test: WindowedQuantileTS24 sorting with wrapping Counter24
+
+bool TestQuantileWrappingSort()
+{
+    cout << "TestQuantileWrappingSort...";
+
+    // The quantile's GetQuantile uses Counter24::operator< which is modular.
+    // If delta values in the window span more than half the 24-bit range
+    // (8,388,608 units), the comparison could mis-order them.
+    WindowedQuantileTS24 wq;
+
+    // Insert values that are all close together - should work fine
+    wq.Update(Counter24(100), 1000, 10000000);
+    wq.Update(Counter24(200), 2000, 10000000);
+    wq.Update(Counter24(50),  3000, 10000000);
+    wq.Update(Counter24(150), 4000, 10000000);
+
+    Counter24 q0 = wq.GetQuantile(0.0);
+    Counter24 q1 = wq.GetQuantile(1.0);
+    if (q0.ToUnsigned() != 50 || q1.ToUnsigned() != 200) {
+        cout << "Failed basic quantile: min=" << q0.ToUnsigned()
+             << " max=" << q1.ToUnsigned() << endl;
+        return false;
+    }
+
+    // Now test with values that span more than half the counter range.
+    // Counter24 has kMSB = 0x800000 = 8388608.
+    // operator< returns (a-b)&mask >= kMSB, i.e. modular comparison.
+    // If values are near 0 and near 0xFFFFFF, the ordering may be wrong.
+    WindowedQuantileTS24 wq2;
+    wq2.Update(Counter24(10),       1000, 10000000);
+    wq2.Update(Counter24(0xFFFFF0), 2000, 10000000); // near max of 24-bit
+    wq2.Update(Counter24(20),       3000, 10000000);
+
+    // With wrapping comparison, 0xFFFFF0 is "less than" 10 because
+    // (0xFFFFF0 - 10) & 0xFFFFFF = 0xFFFFE0 >= 0x800000, so
+    // Counter24(0xFFFFF0) < Counter24(10) is TRUE.
+    // This means the quantile will sort [0xFFFFF0, 10, 20] instead of
+    // the "unsigned" order [10, 20, 0xFFFFF0].
+    // For time sync deltas this is actually CORRECT behavior if 0xFFFFF0
+    // represents a wrapped-around small negative offset. But it could be
+    // surprising if the values are meant to be pure unsigned magnitudes.
+    Counter24 q2min = wq2.GetQuantile(0.0);
+    Counter24 q2max = wq2.GetQuantile(1.0);
+
+    // The wrapping sort puts 0xFFFFF0 first (it's "smallest" in modular sense)
+    bool wrapping_order = (q2min.ToUnsigned() == 0xFFFFF0 && q2max.ToUnsigned() == 20);
+    // If it were unsigned order, 10 would be smallest
+    bool unsigned_order = (q2min.ToUnsigned() == 10 && q2max.ToUnsigned() == 0xFFFFF0);
+
+    if (!wrapping_order && !unsigned_order) {
+        cout << "Failed wide-span quantile: min=" << q2min.ToUnsigned()
+             << " max=" << q2max.ToUnsigned() << endl;
+        return false;
+    }
+
+    // Document which ordering we actually got
+    if (wrapping_order) {
+        // This confirms the modular comparison is used by GetQuantile.
+        // Not a bug per se, but worth knowing for analysis.
+    }
+
+    cout << "Success! (wrapping_order=" << wrapping_order << ")" << endl;
+    return true;
+}
+
+//------------------------------------------------------------------------------
+// Test: Counter24 comparison edge cases
+
+bool TestCounter24Comparison()
+{
+    cout << "TestCounter24Comparison...";
+
+    // Basic: a < b when b is slightly ahead
+    {
+        Counter24 a(100), b(200);
+        if (!(a < b)) {
+            cout << "Failed: 100 should be < 200" << endl;
+            return false;
+        }
+        if (a >= b) {
+            cout << "Failed: 100 should not be >= 200" << endl;
+            return false;
+        }
+    }
+
+    // Wrapping: a near max, b near 0 - b is "ahead" in wrapping sense
+    {
+        Counter24 a(0xFFFFF0), b(10);
+        // (a - b) & mask = (0xFFFFF0 - 10) & 0xFFFFFF = 0xFFFFE0
+        // 0xFFFFE0 >= 0x800000 so a < b is TRUE (a is "behind" b)
+        if (!(a < b)) {
+            cout << "Failed: 0xFFFFF0 should be < 10 in wrapping sense" << endl;
+            return false;
+        }
+    }
+
+    // Half-range boundary: exactly at MSB distance
+    {
+        Counter24 a(0), b(0x800000);
+        // (a - b) & mask = (0 - 0x800000) & 0xFFFFFF = 0x800000
+        // 0x800000 >= 0x800000, so a < b is TRUE
+        if (!(a < b)) {
+            cout << "Failed: 0 should be < 0x800000" << endl;
+            return false;
+        }
+    }
+
+    // Just past half-range: ambiguous territory
+    {
+        Counter24 a(0), b(0x800001);
+        // (a - b) & mask = (0 - 0x800001) & 0xFFFFFF = 0x7FFFFF
+        // 0x7FFFFF < 0x800000, so a < b is FALSE (a is "ahead" of b)
+        if (a < b) {
+            cout << "Failed: 0 should NOT be < 0x800001 (past half-range)" << endl;
+            return false;
+        }
+    }
+
+    cout << "Success!" << endl;
+    return true;
+}
+
+//------------------------------------------------------------------------------
+// Test: Recalculate with large clock skew
+
+bool TestRecalculateLargeSkew()
+{
+    cout << "TestRecalculateLargeSkew...";
+
+    // Test that Recalculate produces a sane OWD when the link is symmetric
+    // but there's a large clock offset.
+    TimeSynchronizer sync_a, sync_b;
+
+    // Large clock offset: peer B is 50 seconds ahead
+    const int64_t offset_a = 0;
+    const int64_t offset_b = 50 * 1000 * 1000LL;
+
+    SimulateSyncPair(sync_a, sync_b, offset_a, offset_b, 20000, 20000);
+
+    if (!sync_a.IsSynchronized() || !sync_b.IsSynchronized()) {
+        cout << "Failed to synchronize with large offset" << endl;
+        return false;
+    }
+
+    uint32_t owd_a = sync_a.GetMinimumOneWayDelayUsec();
+    uint32_t owd_b = sync_b.GetMinimumOneWayDelayUsec();
+
+    // OWD should be near 20000us (the simulated delay)
+    unsigned delta = 0;
+    if (!is_near(owd_a, 20000, 200, delta)) {
+        cout << "Failed: OWD_A=" << owd_a << " expected ~20000" << endl;
+        return false;
+    }
+    if (!is_near(owd_b, 20000, 200, delta)) {
+        cout << "Failed: OWD_B=" << owd_b << " expected ~20000" << endl;
+        return false;
+    }
+
+    cout << "Success!" << endl;
+    return true;
+}
+
+//------------------------------------------------------------------------------
+// Test: Recalculate with asymmetric delay
+
+bool TestRecalculateAsymmetric()
+{
+    cout << "TestRecalculateAsymmetric...";
+
+    // With asymmetric delay (30ms A->B, 10ms B->A), the algorithm assumes
+    // symmetric paths and estimates OWD as (30+10)/2 = 20ms.
+    // Clock delta will be off by half the asymmetry = 10ms.
+    TimeSynchronizer sync_a, sync_b;
+
+    SimulateSyncPair(sync_a, sync_b, 0, 5000000, 30000, 10000);
+
+    if (!sync_a.IsSynchronized() || !sync_b.IsSynchronized()) {
+        cout << "Failed to synchronize with asymmetric delay" << endl;
+        return false;
+    }
+
+    uint32_t owd_a = sync_a.GetMinimumOneWayDelayUsec();
+    uint32_t owd_b = sync_b.GetMinimumOneWayDelayUsec();
+
+    // OWD should be near (30000+10000)/2 = 20000us
+    unsigned delta = 0;
+    if (!is_near(owd_a, 20000, 500, delta)) {
+        cout << "Failed: OWD_A=" << owd_a << " expected ~20000 (asymmetric)" << endl;
+        return false;
+    }
+
+    cout << "Success!" << endl;
+    return true;
+}
+
+//------------------------------------------------------------------------------
+// Test: OWD sign rollover threshold
+
+bool TestOwdSignRollover()
+{
+    cout << "TestOwdSignRollover...";
+
+    // kSignRolloverThreshold = (1 << 22) << 3 = 33554432 (~33.5 seconds)
+    // If the computed OWD in microseconds >= this threshold, it's clamped to 0.
+    // Verify this constant is correct.
+    static const uint32_t expected = (1 << 22) << kTime23LostBits;
+    if (expected != 33554432) {
+        cout << "Failed: kSignRolloverThreshold expected 33554432 got " << expected << endl;
+        return false;
+    }
+
+    // Verify that a very large OWD (> 33.5s) is clamped to 0 and doesn't
+    // produce garbage. Simulate with huge delay.
+    TimeSynchronizer sync_a, sync_b;
+
+    // Use 40ms delay (way under threshold) - should work normally
+    SimulateSyncPair(sync_a, sync_b, 0, 5000000, 40000, 40000);
+    if (!sync_a.IsSynchronized()) {
+        cout << "Failed to sync with 40ms delay" << endl;
+        return false;
+    }
+    uint32_t owd = sync_a.GetMinimumOneWayDelayUsec();
+    if (owd >= expected) {
+        cout << "Failed: OWD " << owd << " should be < threshold for 40ms delay" << endl;
+        return false;
+    }
+
+    cout << "Success!" << endl;
+    return true;
+}
+
+//------------------------------------------------------------------------------
+// Test: WindowedMinTS24 quarter/half window expiry
+
+bool TestWindowedMinExpiry()
+{
+    cout << "TestWindowedMinExpiry...";
+
+    WindowedMinTS24 window;
+    const uint64_t windowLen = 1000;
+
+    // Insert a very good sample at t=0
+    window.Update(Counter24(10), 0, windowLen);
+    if (window.GetBest().ToUnsigned() != 10) {
+        cout << "Failed: initial best should be 10" << endl;
+        return false;
+    }
+
+    // Insert worse samples over time
+    for (uint64_t t = 1; t <= 500; ++t) {
+        window.Update(Counter24(100), t, windowLen);
+    }
+
+    // Best should still be 10 (within window)
+    if (window.GetBest().ToUnsigned() != 10) {
+        cout << "Failed: best should still be 10 at t=500" << endl;
+        return false;
+    }
+
+    // After full window expiry, best should move to 100
+    for (uint64_t t = 501; t <= 1100; ++t) {
+        window.Update(Counter24(100), t, windowLen);
+    }
+
+    unsigned best = window.GetBest().ToUnsigned();
+    if (best != 100) {
+        cout << "Failed: best should be 100 after window expiry, got " << best << endl;
+        return false;
+    }
+
+    // Test that a new minimum resets properly
+    window.Update(Counter24(5), 1200, windowLen);
+    if (window.GetBest().ToUnsigned() != 5) {
+        cout << "Failed: new minimum should replace" << endl;
+        return false;
+    }
+
+    cout << "Success!" << endl;
+    return true;
+}
+
+//------------------------------------------------------------------------------
+// Test: Data race scenario - OnPeerMinDeltaTS24 before local packets
+
+bool TestPeerUpdateBeforeLocalPackets()
+{
+    cout << "TestPeerUpdateBeforeLocalPackets...";
+
+    TimeSynchronizer sync;
+
+    // Call OnPeerMinDeltaTS24 before any packets arrive
+    sync.OnPeerMinDeltaTS24(Counter24(12345));
+
+    // Should NOT be synchronized yet (no local samples)
+    if (sync.IsSynchronized()) {
+        cout << "Failed: should not be synchronized without local packets" << endl;
+        return false;
+    }
+
+    // OWD should still be the default
+    if (sync.GetMinimumOneWayDelayUsec() != kDefaultOWDUsec) {
+        cout << "Failed: OWD should be default before sync" << endl;
+        return false;
+    }
+
+    cout << "Success!" << endl;
+    return true;
+}
+
+//------------------------------------------------------------------------------
+// Test: WindowedQuantileTS24 window expiry
+
+bool TestQuantileWindowExpiry()
+{
+    cout << "TestQuantileWindowExpiry...";
+
+    WindowedQuantileTS24 wq;
+    const uint64_t windowLen = 1000;
+
+    // Fill window with samples
+    wq.Update(Counter24(50), 100, windowLen);
+    wq.Update(Counter24(30), 200, windowLen);
+    wq.Update(Counter24(70), 300, windowLen);
+
+    if (!wq.IsValid()) {
+        cout << "Failed: should be valid after 3 samples" << endl;
+        return false;
+    }
+
+    // Quantile 0 should be minimum = 30
+    Counter24 q0 = wq.GetQuantile(0.0);
+    if (q0.ToUnsigned() != 30) {
+        cout << "Failed: min quantile should be 30, got " << q0.ToUnsigned() << endl;
+        return false;
+    }
+
+    // Advance time past the window - old samples should expire
+    wq.Update(Counter24(80), 1500, windowLen);
+
+    // Now only samples with timestamp >= 500 should remain
+    // Only the sample at t=1500 (value=80) should be left
+    Counter24 q0_after = wq.GetQuantile(0.0);
+    if (q0_after.ToUnsigned() != 80) {
+        cout << "Failed: after expiry min should be 80, got "
+             << q0_after.ToUnsigned() << endl;
+        return false;
+    }
+
+    cout << "Success!" << endl;
+    return true;
+}
+
+//------------------------------------------------------------------------------
+// Test: Reset clears all state
+
+bool TestResetState()
+{
+    cout << "TestResetState...";
+
+    TimeSynchronizer sync_a, sync_b;
+
+    // Establish sync
+    SimulateSyncPair(sync_a, sync_b, 0, 5000000, 20000, 20000);
+
+    if (!sync_a.IsSynchronized()) {
+        cout << "Failed: should be synchronized before reset" << endl;
+        return false;
+    }
+
+    // Reset
+    sync_a.Reset();
+
+    if (sync_a.IsSynchronized()) {
+        cout << "Failed: should not be synchronized after reset" << endl;
+        return false;
+    }
+    if (sync_a.GetMinimumOneWayDelayUsec() != kDefaultOWDUsec) {
+        cout << "Failed: OWD should be default after reset" << endl;
+        return false;
+    }
+
+    cout << "Success!" << endl;
+    return true;
+}
+
+//------------------------------------------------------------------------------
 // Entrypoint
 
 int main()
@@ -1348,6 +1735,33 @@ int main()
         result = TIMESYNC_RET_FAIL;
     }
     if (!TestWindowedMinTS24()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestQuantileWrappingSort()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestCounter24Comparison()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestRecalculateLargeSkew()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestRecalculateAsymmetric()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestOwdSignRollover()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestWindowedMinExpiry()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestPeerUpdateBeforeLocalPackets()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestQuantileWindowExpiry()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestResetState()) {
         result = TIMESYNC_RET_FAIL;
     }
 

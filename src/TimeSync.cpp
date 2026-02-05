@@ -135,14 +135,16 @@ Counter24 WindowedQuantileTS24::GetQuantile(double quantile) const
 
 void TimeSynchronizer::OnPeerMinDeltaTS24(Counter24 minDeltaTS24)
 {
+    std::lock_guard<std::mutex> lock(Mutex);
     LastFC_MinDeltaTS24 = minDeltaTS24;
     GotPeerUpdate = true;
 
-    Recalculate();
+    RecalculateLocked();
 }
 
 void TimeSynchronizer::Reset()
 {
+    std::lock_guard<std::mutex> lock(Mutex);
     Synchronized.store(false);
     RemoteTimeDeltaUsec.store(0);
     MinimumOneWayDelayUsec.store(kDefaultOWDUsec);
@@ -156,6 +158,8 @@ unsigned TimeSynchronizer::OnAuthenticatedDatagramTimestamp(
     Counter24 remoteSendTS24,
     uint64_t localRecvUsec)
 {
+    std::lock_guard<std::mutex> lock(Mutex);
+
     const Counter24 localTS24 = (uint32_t)(localRecvUsec >> kTime23LostBits);
 
     // OWD_i + ClockDelta(L-R)_i = Local Receive Time - Remote Send Time
@@ -164,7 +168,7 @@ unsigned TimeSynchronizer::OnAuthenticatedDatagramTimestamp(
     WindowedMinTS24Deltas.Update(deltaTS24, localRecvUsec, DriftWindowUsec.load());
     WindowedQuantileTS24Deltas.Update(deltaTS24, localRecvUsec, DriftWindowUsec.load());
 
-    Recalculate();
+    RecalculateLocked();
 
     // Estimated one-way-delay (OWD) for this datagram in microseconds.
     // This does not include processing time only network delay and perhaps
@@ -180,7 +184,7 @@ unsigned TimeSynchronizer::OnAuthenticatedDatagramTimestamp(
 
         // While the OWD is an estimate, the relative delay between that
         // smallest packet pair and the current datagram is actually precise:
-        const Counter24 minDeltaTS24 = GetMinDeltaTS24();
+        const Counter24 minDeltaTS24 = GetMinDeltaTS24Locked();
         if (deltaTS24 > minDeltaTS24)
         {
             const Counter24 relativeTS24 = deltaTS24 - minDeltaTS24;
@@ -196,7 +200,7 @@ unsigned TimeSynchronizer::OnAuthenticatedDatagramTimestamp(
     return networkTripUsec;
 }
 
-void TimeSynchronizer::Recalculate()
+void TimeSynchronizer::RecalculateLocked()
 {
     if ((MinQuantile > 0.0 ? !WindowedQuantileTS24Deltas.IsValid() : !WindowedMinTS24Deltas.IsValid()) ||
         !GotPeerUpdate)

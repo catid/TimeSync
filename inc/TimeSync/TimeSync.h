@@ -35,6 +35,7 @@
 #include <atomic>
 #include <cmath>
 #include <deque>
+#include <mutex>
 #include <vector>
 
 /**
@@ -354,6 +355,7 @@ public:
     /// Get the minimum TS24 (receipt - send) delta seen in the past interval
     inline Counter24 GetMinDeltaTS24() const
     {
+        std::lock_guard<std::mutex> lock(Mutex);
         if (MinQuantile > 0.0) {
             return WindowedQuantileTS24Deltas.GetQuantile(MinQuantile);
         }
@@ -473,6 +475,13 @@ public:
     }
 
 protected:
+    /// Mutex protecting non-atomic members from concurrent access.
+    /// OnPeerMinDeltaTS24() and OnAuthenticatedDatagramTimestamp() may be
+    /// called from different threads; this mutex serializes their access
+    /// to WindowedMinTS24Deltas, WindowedQuantileTS24Deltas,
+    /// LastFC_MinDeltaTS24, GotPeerUpdate, and MinQuantile.
+    mutable std::mutex Mutex;
+
     /// Synchronized?
     std::atomic<bool> Synchronized = ATOMIC_VAR_INIT(false);
 
@@ -500,6 +509,15 @@ protected:
     bool GotPeerUpdate = false;
 
 
-    /// Recalculate MinimumOneWayDelayUsec and RemoteTimeDeltaUsec
-    void Recalculate();
+    /// Get min delta without locking (caller must hold Mutex)
+    inline Counter24 GetMinDeltaTS24Locked() const
+    {
+        if (MinQuantile > 0.0) {
+            return WindowedQuantileTS24Deltas.GetQuantile(MinQuantile);
+        }
+        return WindowedMinTS24Deltas.GetBest();
+    }
+
+    /// Recalculate MinimumOneWayDelayUsec and RemoteTimeDeltaUsec (caller must hold Mutex)
+    void RecalculateLocked();
 };

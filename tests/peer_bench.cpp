@@ -82,7 +82,7 @@ public:
 
     double NextDouble01()
     {
-        return (double)Next() / (double)UINT32_MAX;
+        return (double)Next() / ((double)UINT32_MAX + 1.0);
     }
 
     uint64_t State = 0;
@@ -95,6 +95,8 @@ static double RandNormal(PCGRandom& rng)
     double u2 = rng.NextDouble01();
     if (u1 < 1e-12) {
         u1 = 1e-12;
+    } else if (u1 >= 1.0) {
+        u1 = 1.0 - 1e-12;
     }
     const double mag = std::sqrt(-2.0 * std::log(u1));
     const double z0 = mag * std::cos(2.0 * 3.14159265358979323846 * u2);
@@ -210,7 +212,7 @@ struct P2Quantile
                      (n_ip1 - n_i - ds) * (q[i] - q[i - 1]) / (n_i - n_im1));
                 if (q[i - 1] < qn && qn < q[i + 1]) {
                     q[i] = qn;
-                } else {
+                } else if (n[i + ds] != n[i]) {
                     q[i] += (double)ds * (q[i + ds] - q[i]) / (double)(n[i + ds] - n[i]);
                 }
                 n[i] += ds;
@@ -262,6 +264,10 @@ struct SampleStats
             sorted = false;
         }
 
+        p10.Add(v);
+        p50.Add(v);
+        p75.Add(v);
+        p90.Add(v);
         p95.Add(v);
         p99.Add(v);
     }
@@ -303,12 +309,25 @@ struct SampleStats
             const size_t idx = (size_t)std::ceil(p * (double)(n - 1));
             return exact_samples[idx];
         }
+        if (std::fabs(p - 0.10) < 1e-6) {
+            return p10.Value();
+        }
+        if (std::fabs(p - 0.50) < 1e-6) {
+            return p50.Value();
+        }
+        if (std::fabs(p - 0.75) < 1e-6) {
+            return p75.Value();
+        }
+        if (std::fabs(p - 0.90) < 1e-6) {
+            return p90.Value();
+        }
         if (std::fabs(p - 0.95) < 1e-6) {
             return p95.Value();
         }
         if (std::fabs(p - 0.99) < 1e-6) {
             return p99.Value();
         }
+        // Fallback: interpolate between nearest tracked quantiles
         return Min() + (Max() - Min()) * p;
     }
 
@@ -330,9 +349,13 @@ private:
     double sum = 0.0;
     double sum_sq = 0.0;
     double min = 1e30;
-    double max = 0.0;
+    double max = -1e30;
     mutable bool sorted = false;
     mutable std::vector<double> exact_samples;
+    P2Quantile p10 = P2Quantile(0.10);
+    P2Quantile p50 = P2Quantile(0.50);
+    P2Quantile p75 = P2Quantile(0.75);
+    P2Quantile p90 = P2Quantile(0.90);
     P2Quantile p95 = P2Quantile(0.95);
     P2Quantile p99 = P2Quantile(0.99);
 };
