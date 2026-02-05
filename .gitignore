@@ -259,6 +259,7 @@ paket-files/
 benchmarks/run_*/
 benchmarks/*.csv
 benchmarks/*.pdf
+*.csv
 
 # Python virtual environments
 .venv/

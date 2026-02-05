@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 #include <deque>
 #include <fstream>
 #include <iostream>
@@ -14,9 +16,45 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
+#include <sys/types.h>
+#include <sys/stat.h>
 
 using std::string;
+
+struct TraceConfig
+{
+    bool enabled = false;
+    string dir;
+    uint64_t interval_us = 1000000;
+};
+
+static TraceConfig g_trace;
+
+static string SanitizeTag(const string& input)
+{
+    string out;
+    out.reserve(input.size());
+    for (char ch : input) {
+        if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '-' || ch == '_') {
+            out.push_back(ch);
+        } else {
+            out.push_back('_');
+        }
+    }
+    return out;
+}
+
+static void EnsureDir(const string& path)
+{
+    if (path.empty()) {
+        return;
+    }
+    if (mkdir(path.c_str(), 0755) != 0 && errno != EEXIST) {
+        std::cerr << "Unable to create trace dir: " << path << "\n";
+    }
+}
 
 //------------------------------------------------------------------------------
 // PRNG (PCG)
@@ -69,6 +107,26 @@ static uint32_t RandRange(PCGRandom& rng, uint32_t minv, uint32_t maxv)
         return minv;
     }
     return minv + (rng.Next() % (maxv - minv + 1));
+}
+
+static uint64_t RandRangeU64(PCGRandom& rng, uint64_t minv, uint64_t maxv)
+{
+    if (maxv <= minv) {
+        return minv;
+    }
+    const uint64_t span = maxv - minv;
+    const uint64_t r = (uint64_t)rng.Next() << 32 | (uint64_t)rng.Next();
+    return minv + (r % (span + 1));
+}
+
+static int64_t RandRangeInt64(PCGRandom& rng, int64_t minv, int64_t maxv)
+{
+    if (maxv <= minv) {
+        return minv;
+    }
+    const uint64_t span = (uint64_t)(maxv - minv);
+    const uint64_t r = (uint64_t)rng.Next() << 32 | (uint64_t)rng.Next();
+    return minv + (int64_t)(r % (span + 1));
 }
 
 static double RandRangeDouble(PCGRandom& rng, double minv, double maxv)
@@ -191,6 +249,7 @@ struct SampleStats
     {
         ++count;
         sum += v;
+        sum_sq += v * v;
         if (v < min) {
             min = v;
         }
@@ -215,6 +274,16 @@ struct SampleStats
             return 0.0;
         }
         return sum / (double)count;
+    }
+
+    double Variance() const
+    {
+        if (count == 0) {
+            return 0.0;
+        }
+        const double mean = sum / (double)count;
+        const double var = (sum_sq / (double)count) - mean * mean;
+        return var > 0.0 ? var : 0.0;
     }
 
     double Percentile(double p) const
@@ -259,12 +328,44 @@ private:
     static const size_t kExactMax = 2048;
     size_t count = 0;
     double sum = 0.0;
+    double sum_sq = 0.0;
     double min = 1e30;
     double max = 0.0;
     mutable bool sorted = false;
     mutable std::vector<double> exact_samples;
     P2Quantile p95 = P2Quantile(0.95);
     P2Quantile p99 = P2Quantile(0.99);
+};
+
+struct SlidingMin
+{
+    uint64_t window_us = 0;
+    std::deque<std::pair<uint64_t, double>> q;
+
+    void Reset(uint64_t new_window_us)
+    {
+        window_us = new_window_us;
+        q.clear();
+    }
+
+    void Push(uint64_t t_us, double value)
+    {
+        if (window_us == 0) {
+            return;
+        }
+        while (!q.empty() && q.back().second >= value) {
+            q.pop_back();
+        }
+        q.emplace_back(t_us, value);
+        const uint64_t cutoff = (t_us > window_us) ? (t_us - window_us) : 0;
+        while (!q.empty() && q.front().first < cutoff) {
+            q.pop_front();
+        }
+    }
+
+    bool Ready() const { return !q.empty(); }
+
+    double Min() const { return q.empty() ? 0.0 : q.front().second; }
 };
 
 //------------------------------------------------------------------------------
@@ -301,6 +402,9 @@ struct DelayModel
     uint32_t bimodal_delay_us = 0;
     uint32_t queue_amp_us = 0;
     uint64_t queue_period_us = 0;
+    uint32_t square_amp_us = 0;
+    uint64_t square_period_us = 0;
+    double square_duty = 0.5;
     int32_t ramp_us_per_s = 0;
     uint64_t step_at_us = 0;
     int32_t step_delta_us = 0;
@@ -313,10 +417,34 @@ struct DelayModel
     uint32_t rw_max_us = 0;
     uint64_t rw_last_update_us = 0;
     int32_t rw_value_us = 0;
+    bool markov_enabled = false;
+    uint64_t markov_step_interval_us = 100000;
+    double markov_p_switch = 0.1;
+    uint32_t markov_base_low_us = 0;
+    uint32_t markov_base_high_us = 0;
+    uint32_t markov_jitter_low_us = 0;
+    uint32_t markov_jitter_high_us = 0;
+    bool markov_high = false;
+    uint64_t markov_last_update_us = 0;
 
     uint32_t SampleDelay(uint64_t now_us, PCGRandom& rng)
     {
-        int64_t delay = base_delay_us;
+        uint32_t base_delay = base_delay_us;
+        uint32_t jitter = jitter_us;
+        if (markov_enabled) {
+            if (markov_last_update_us == 0) {
+                markov_last_update_us = now_us;
+            }
+            while (markov_last_update_us + markov_step_interval_us <= now_us) {
+                markov_last_update_us += markov_step_interval_us;
+                if (rng.NextDouble01() < markov_p_switch) {
+                    markov_high = !markov_high;
+                }
+            }
+            base_delay = markov_high ? markov_base_high_us : markov_base_low_us;
+            jitter = markov_high ? markov_jitter_high_us : markov_jitter_low_us;
+        }
+        int64_t delay = base_delay;
 
         if (ramp_us_per_s != 0) {
             delay += (int64_t)((double)ramp_us_per_s * (double)now_us / 1000000.0);
@@ -334,6 +462,13 @@ struct DelayModel
                                  (double)(now_us % queue_period_us) / (double)queue_period_us;
             const double q = 0.5 * (1.0 + std::sin(phase));
             delay += (int64_t)(q * (double)queue_amp_us);
+        }
+
+        if (square_amp_us > 0 && square_period_us > 0) {
+            const double phase = (double)(now_us % square_period_us) / (double)square_period_us;
+            if (phase < square_duty) {
+                delay += (int64_t)square_amp_us;
+            }
         }
 
         if (saw_period_us > 0 && saw_amp_us > 0) {
@@ -357,18 +492,18 @@ struct DelayModel
             delay += rw_value_us;
         }
 
-        if (jitter_us > 0) {
+        if (jitter > 0) {
             if (jitter_mode == JitterMode::Uniform) {
-                delay += RandRange(rng, 0, jitter_us);
+                delay += RandRange(rng, 0, jitter);
             }
             else if (jitter_mode == JitterMode::NormalAbs) {
-                const double j = std::fabs(RandNormal(rng) * (double)jitter_us);
+                const double j = std::fabs(RandNormal(rng) * (double)jitter);
                 delay += (int64_t)j;
             }
             else if (jitter_mode == JitterMode::Gaussian) {
-                double j = RandNormal(rng) * (double)jitter_us;
+                double j = RandNormal(rng) * (double)jitter;
                 if (jitter_clip_sigma > 0.0) {
-                    const double limit = jitter_clip_sigma * (double)jitter_us;
+                    const double limit = jitter_clip_sigma * (double)jitter;
                     if (j > limit) j = limit;
                     else if (j < -limit) j = -limit;
                 }
@@ -376,7 +511,7 @@ struct DelayModel
             }
             else if (jitter_mode == JitterMode::LogNormal) {
                 const double sigma = lognormal_sigma;
-                const double mu = std::log((double)jitter_us + 1.0);
+                const double mu = std::log((double)jitter + 1.0);
                 const double j = std::exp(mu + sigma * RandNormal(rng)) - 1.0;
                 delay += (int64_t)j;
             }
@@ -466,6 +601,9 @@ struct ClockModel
     bool drift_step_enabled = false;
     uint64_t drift_step_time_us = 0;
     double drift_step_delta_ppm = 0.0;
+    double drift_ramp_ppm_per_s = 0.0;
+    double drift_ramp_max_ppm = 0.0;
+    uint64_t drift_ramp_start_us = 0;
 
     int64_t offset_us = 0;
     uint32_t quantize_us = 0;
@@ -475,6 +613,9 @@ struct ClockModel
     bool clock_step_enabled = false;
     uint64_t clock_step_time_us = 0;
     int64_t clock_step_us = 0;
+    bool clock_freeze_enabled = false;
+    uint64_t clock_freeze_start_us = 0;
+    uint64_t clock_freeze_end_us = 0;
 
     double current_ppm = 0.0;
 };
@@ -503,6 +644,20 @@ static double CurrentDriftPpm(ClockModel& model, uint64_t now_us, PCGRandom& rng
             (double)(now_us % model.drift_sine_period_us) / (double)model.drift_sine_period_us;
         ppm += model.drift_sine_amp_ppm * std::sin(phase);
     }
+    if (model.drift_ramp_ppm_per_s != 0.0) {
+        const uint64_t start_us = model.drift_ramp_start_us;
+        const double t_s = (now_us > start_us) ? ((double)(now_us - start_us) * 1e-6) : 0.0;
+        double ramp = model.drift_ramp_ppm_per_s * t_s;
+        const double max_ppm = model.drift_ramp_max_ppm;
+        if (max_ppm > 0.0) {
+            if (ramp > max_ppm) {
+                ramp = max_ppm;
+            } else if (ramp < -max_ppm) {
+                ramp = -max_ppm;
+            }
+        }
+        ppm += ramp;
+    }
     ppm += model.drift_rw_ppm;
     if (model.drift_step_enabled && now_us >= model.drift_step_time_us) {
         ppm += model.drift_step_delta_ppm;
@@ -516,6 +671,19 @@ static uint64_t ComputeLocalTimeUsec(uint64_t true_us, ClockModel& model, PCGRan
     const double ppm = CurrentDriftPpm(model, true_us, rng);
     const double scale = 1.0 + ppm * 1e-6;
     double local = (double)model.offset_us + (double)true_us * scale;
+
+    if (model.clock_freeze_enabled &&
+        model.clock_freeze_end_us > model.clock_freeze_start_us &&
+        true_us >= model.clock_freeze_start_us) {
+        const double freeze_local = (double)model.offset_us +
+            (double)model.clock_freeze_start_us * scale;
+        if (true_us < model.clock_freeze_end_us) {
+            local = freeze_local;
+        } else {
+            const double resume_dt = (double)(true_us - model.clock_freeze_end_us);
+            local = freeze_local + resume_dt * scale;
+        }
+    }
 
     if (model.clock_step_enabled && true_us >= model.clock_step_time_us) {
         local += (double)model.clock_step_us;
@@ -559,6 +727,47 @@ enum class MethodKind
     Ntp,
     Ptp,
     TimeSync,
+    TimeSyncQuantile,
+    TimeSyncQuantileSwap,
+    TimeSyncQuantileNearHit,
+    TimeSyncQuantileAdaptive,
+    TimeSyncBlockQuantile,
+    TimeSyncHybrid,
+    TimeSyncEnsemble,
+    TimeSyncSloped,
+    TimeSyncSkew,
+    TimeSyncSkewReg,
+    TimeSyncAdaptive,
+    TimeSyncAdaptiveGuard,
+    TimeSyncAdaptiveBins,
+    TimeSyncDualWindow,
+    TimeSyncHysteresis,
+    TimeSyncSkewCorrected,
+    TimeSyncCUSUM,
+    TimeSyncVarGate,
+    TimeSyncPerDirSkew,
+    TimeSyncStepReset,
+    TimeSyncShadow,
+    TimeSyncShadowSkew,
+    TimeSyncNFHS,
+    TimeSyncStepGuard,
+    TimeSyncConsensus,
+    TimeSyncTilted,
+    TimeSyncSlope,
+    TimeSyncAgeComp,
+    TimeSyncMinReg,
+    TimeSyncMultiWindow,
+    TimeSyncEnvelopeDecay,
+    TimeSyncDualSlope,
+    TimeSyncKMin,
+    TimeSyncKBest,
+    TimeSyncMoE,
+    TimeSyncRttBins,
+    TimeSyncDDAC,
+    TimeSyncDDACBlend,
+    TimeSyncStateMachine,
+    TimeSyncPolicy,
+    TimeSyncProbe,
     Piggyback
 };
 
@@ -567,7 +776,8 @@ enum class EstimatorKind
     Min,
     Quantile,
     Median,
-    Regression
+    Regression,
+    RobustRegression
 };
 
 enum class DisciplineKind
@@ -576,7 +786,8 @@ enum class DisciplineKind
     PLL,
     FLL,
     Hybrid,
-    Kalman
+    Kalman,
+    StateSpace
 };
 
 static const char* MethodName(MethodKind k)
@@ -586,9 +797,164 @@ static const char* MethodName(MethodKind k)
         case MethodKind::Ntp: return "M2_NTP";
         case MethodKind::Ptp: return "M3_PTP";
         case MethodKind::TimeSync: return "M4_TimeSync";
+        case MethodKind::TimeSyncQuantile: return "M4_TimeSyncQuantile";
+        case MethodKind::TimeSyncQuantileSwap: return "M4_TimeSyncQuantileSwap";
+        case MethodKind::TimeSyncQuantileNearHit: return "M4_TimeSyncQuantileNearHit";
+        case MethodKind::TimeSyncQuantileAdaptive: return "M4_TimeSyncQuantileAdaptive";
+        case MethodKind::TimeSyncBlockQuantile: return "M4_TimeSyncBlockQuantile";
+        case MethodKind::TimeSyncHybrid: return "M4_TimeSyncHybrid";
+        case MethodKind::TimeSyncEnsemble: return "M4_TimeSyncEnsemble";
+        case MethodKind::TimeSyncSloped: return "M4_TimeSyncSloped";
+        case MethodKind::TimeSyncSkew: return "M4_TimeSyncSkew";
+        case MethodKind::TimeSyncSkewReg: return "M4_TimeSyncSkewReg";
+        case MethodKind::TimeSyncAdaptive: return "M4_TimeSyncAdaptive";
+        case MethodKind::TimeSyncAdaptiveGuard: return "M4_TimeSyncAdaptiveGuard";
+        case MethodKind::TimeSyncAdaptiveBins: return "M4_TimeSyncAdaptiveBins";
+        case MethodKind::TimeSyncDualWindow: return "M4_TimeSyncDualWindow";
+        case MethodKind::TimeSyncHysteresis: return "M4_TimeSyncHysteresis";
+        case MethodKind::TimeSyncSkewCorrected: return "M4_TimeSyncSkewCorrected";
+        case MethodKind::TimeSyncCUSUM: return "M4_TimeSyncCUSUM";
+        case MethodKind::TimeSyncVarGate: return "M4_TimeSyncVarGate";
+        case MethodKind::TimeSyncPerDirSkew: return "M4_TimeSyncPerDirSkew";
+        case MethodKind::TimeSyncStepReset: return "M4_TimeSyncStepReset";
+        case MethodKind::TimeSyncShadow: return "M4_TimeSyncShadow";
+        case MethodKind::TimeSyncShadowSkew: return "M4_TimeSyncShadowSkew";
+        case MethodKind::TimeSyncNFHS: return "M4_TimeSyncNFHS";
+        case MethodKind::TimeSyncStepGuard: return "M4_TimeSyncStepGuard";
+        case MethodKind::TimeSyncConsensus: return "M4_TimeSyncConsensus";
+        case MethodKind::TimeSyncTilted: return "M4_TimeSyncTilted";
+        case MethodKind::TimeSyncSlope: return "M4_TimeSyncSlope";
+        case MethodKind::TimeSyncAgeComp: return "M4_TimeSyncAgeComp";
+        case MethodKind::TimeSyncMinReg: return "M4_TimeSyncMinReg";
+        case MethodKind::TimeSyncMultiWindow: return "M4_TimeSyncMultiWindow";
+        case MethodKind::TimeSyncEnvelopeDecay: return "M4_TimeSyncEnvelopeDecay";
+        case MethodKind::TimeSyncDualSlope: return "M4_TimeSyncDualSlope";
+        case MethodKind::TimeSyncKMin: return "M4_TimeSyncKMin";
+        case MethodKind::TimeSyncKBest: return "M4_TimeSyncKBest";
+        case MethodKind::TimeSyncMoE: return "M4_TimeSyncMoE";
+        case MethodKind::TimeSyncRttBins: return "M4_TimeSyncRttBins";
+        case MethodKind::TimeSyncDDAC: return "M4_TimeSyncDDAC";
+        case MethodKind::TimeSyncDDACBlend: return "M4_TimeSyncDDACBlend";
+        case MethodKind::TimeSyncStateMachine: return "M4_TimeSyncStateMachine";
+        case MethodKind::TimeSyncPolicy: return "M4_TimeSyncPolicy";
+        case MethodKind::TimeSyncProbe: return "M4_TimeSyncProbe";
         case MethodKind::Piggyback: return "M4_Piggyback";
     }
     return "Unknown";
+}
+
+static bool UsesTimeSyncCore(MethodKind k)
+{
+    return (k == MethodKind::TimeSync ||
+        k == MethodKind::TimeSyncQuantile ||
+        k == MethodKind::TimeSyncQuantileSwap ||
+        k == MethodKind::TimeSyncQuantileNearHit ||
+        k == MethodKind::TimeSyncQuantileAdaptive ||
+        k == MethodKind::TimeSyncBlockQuantile ||
+        k == MethodKind::TimeSyncHybrid ||
+        k == MethodKind::TimeSyncEnsemble ||
+        k == MethodKind::TimeSyncSloped ||
+        k == MethodKind::TimeSyncSkew ||
+        k == MethodKind::TimeSyncSkewReg ||
+        k == MethodKind::TimeSyncAdaptive ||
+        k == MethodKind::TimeSyncAdaptiveGuard ||
+        k == MethodKind::TimeSyncAdaptiveBins ||
+        k == MethodKind::TimeSyncDualWindow ||
+        k == MethodKind::TimeSyncHysteresis ||
+        k == MethodKind::TimeSyncSkewCorrected ||
+        k == MethodKind::TimeSyncCUSUM ||
+        k == MethodKind::TimeSyncVarGate ||
+        k == MethodKind::TimeSyncPerDirSkew ||
+        k == MethodKind::TimeSyncStepReset ||
+        k == MethodKind::TimeSyncShadow ||
+        k == MethodKind::TimeSyncShadowSkew ||
+        k == MethodKind::TimeSyncNFHS ||
+        k == MethodKind::TimeSyncStepGuard ||
+        k == MethodKind::TimeSyncConsensus ||
+        k == MethodKind::TimeSyncTilted ||
+        k == MethodKind::TimeSyncSlope ||
+        k == MethodKind::TimeSyncAgeComp ||
+        k == MethodKind::TimeSyncMinReg ||
+        k == MethodKind::TimeSyncMultiWindow ||
+        k == MethodKind::TimeSyncEnvelopeDecay ||
+        k == MethodKind::TimeSyncDualSlope ||
+        k == MethodKind::TimeSyncKMin ||
+        k == MethodKind::TimeSyncKBest ||
+        k == MethodKind::TimeSyncMoE ||
+        k == MethodKind::TimeSyncRttBins ||
+        k == MethodKind::TimeSyncDDAC ||
+        k == MethodKind::TimeSyncDDACBlend ||
+        k == MethodKind::TimeSyncStateMachine ||
+        k == MethodKind::TimeSyncPolicy ||
+        k == MethodKind::TimeSyncProbe);
+}
+
+static bool IsTimeSyncQuantileFamily(MethodKind k)
+{
+    return (k == MethodKind::TimeSyncQuantile ||
+        k == MethodKind::TimeSyncQuantileNearHit ||
+        k == MethodKind::TimeSyncQuantileAdaptive);
+}
+
+static bool UsesMinDeltaExchange(MethodKind k)
+{
+    return UsesTimeSyncCore(k) || k == MethodKind::Piggyback;
+}
+
+static bool UsesCustomTimeSync(MethodKind k)
+{
+    return (k == MethodKind::TimeSyncShadow ||
+        k == MethodKind::TimeSyncShadowSkew ||
+        k == MethodKind::TimeSyncNFHS ||
+        k == MethodKind::TimeSyncStepGuard ||
+        k == MethodKind::TimeSyncConsensus ||
+        k == MethodKind::TimeSyncTilted ||
+        k == MethodKind::TimeSyncSlope ||
+        k == MethodKind::TimeSyncAgeComp ||
+        k == MethodKind::TimeSyncMinReg ||
+        k == MethodKind::TimeSyncMultiWindow ||
+        k == MethodKind::TimeSyncEnvelopeDecay ||
+        k == MethodKind::TimeSyncDualSlope ||
+        k == MethodKind::TimeSyncKMin ||
+        k == MethodKind::TimeSyncKBest ||
+        k == MethodKind::TimeSyncMoE ||
+        k == MethodKind::TimeSyncRttBins ||
+        k == MethodKind::TimeSyncDDAC ||
+        k == MethodKind::TimeSyncDDACBlend ||
+        k == MethodKind::TimeSyncStateMachine ||
+        k == MethodKind::TimeSyncPolicy ||
+        k == MethodKind::TimeSyncAdaptiveBins ||
+        k == MethodKind::TimeSyncBlockQuantile);
+}
+
+static bool UsesProbes(MethodKind k)
+{
+    return (k == MethodKind::Cristian ||
+        k == MethodKind::Ntp ||
+        k == MethodKind::Ptp ||
+        k == MethodKind::TimeSyncProbe);
+}
+
+
+static bool UsesEstimatorRemote(MethodKind k)
+{
+    return (k == MethodKind::TimeSyncSkew ||
+        k == MethodKind::TimeSyncSkewReg ||
+        k == MethodKind::TimeSyncSkewCorrected ||
+        k == MethodKind::TimeSyncDualWindow ||
+        k == MethodKind::TimeSyncPerDirSkew ||
+        k == MethodKind::TimeSyncProbe ||
+        k == MethodKind::Piggyback ||
+        k == MethodKind::Cristian ||
+        k == MethodKind::Ntp ||
+        k == MethodKind::Ptp);
+}
+
+static bool UsesSkewCorrection(MethodKind k)
+{
+    return (k == MethodKind::TimeSyncSkewCorrected ||
+        k == MethodKind::TimeSyncDualWindow ||
+        k == MethodKind::TimeSyncPerDirSkew);
 }
 
 static const char* EstimatorName(EstimatorKind k)
@@ -598,6 +964,7 @@ static const char* EstimatorName(EstimatorKind k)
         case EstimatorKind::Quantile: return "pquant";
         case EstimatorKind::Median: return "median";
         case EstimatorKind::Regression: return "regress";
+        case EstimatorKind::RobustRegression: return "theilsen";
     }
     return "unknown";
 }
@@ -610,6 +977,7 @@ static const char* DisciplineName(DisciplineKind k)
         case DisciplineKind::FLL: return "fll";
         case DisciplineKind::Hybrid: return "hybrid";
         case DisciplineKind::Kalman: return "kalman";
+        case DisciplineKind::StateSpace: return "kalman_ss";
     }
     return "unknown";
 }
@@ -619,6 +987,18 @@ struct OffsetSample
     uint64_t t_us = 0;
     double offset_us = 0.0; // remote - local
 };
+
+struct SlopedSample
+{
+    uint64_t t_us = 0;
+    double delta_us = 0.0;
+};
+
+static bool ComputeTheilSenOffset(
+    const std::deque<OffsetSample>& samples,
+    uint64_t now_us,
+    double& out_offset_us,
+    double& out_skew_ppm);
 
 struct OffsetEstimator
 {
@@ -630,6 +1010,19 @@ struct OffsetEstimator
 
     double offset_est = 0.0;
     double skew_est_ppm = 0.0;
+    double kalman_q_offset_us2 = 0.0;
+    double kalman_q_skew_ppm2 = 0.0;
+    double kalman_r_us2 = 0.0;
+    double ensemble_blend = 0.5;
+    bool ensemble_use_confidence = true;
+    size_t ensemble_npkt_min = 20;
+    double ensemble_iqr_min_us = 200.0;
+    double ensemble_iqr_k = 10.0;
+    double kalman_p00 = 0.0;
+    double kalman_p01 = 0.0;
+    double kalman_p10 = 0.0;
+    double kalman_p11 = 0.0;
+    uint64_t kalman_last_t_us = 0;
 
     std::deque<OffsetSample> samples;
 
@@ -671,38 +1064,53 @@ struct OffsetEstimator
             std::nth_element(values.begin(), values.begin() + idx, values.end());
             raw_offset = values[idx];
         }
-        else if (estimator == EstimatorKind::Regression) {
-            // Linear regression on (t, offset)
-            double sum_t = 0.0;
-            double sum_o = 0.0;
-            double sum_tt = 0.0;
-            double sum_to = 0.0;
-            const double t0 = (double)samples.front().t_us;
-            const double denom_scale = 1e-6;
-            for (size_t i = 0; i < samples.size(); ++i) {
-                const double t = ((double)samples[i].t_us - t0) * denom_scale;
-                const double o = samples[i].offset_us;
-                sum_t += t;
-                sum_o += o;
-                sum_tt += t * t;
-                sum_to += t * o;
+        else if (estimator == EstimatorKind::Regression ||
+            estimator == EstimatorKind::RobustRegression) {
+            if (estimator == EstimatorKind::RobustRegression) {
+                double offset = raw_offset;
+                double slope = 0.0;
+                if (ComputeTheilSenOffset(samples, t_us, offset, slope)) {
+                    raw_offset = offset;
+                    raw_skew_ppm = slope;
+                }
+            } else {
+                // Linear regression on (t, offset)
+                double sum_t = 0.0;
+                double sum_o = 0.0;
+                double sum_tt = 0.0;
+                double sum_to = 0.0;
+                const double t0 = (double)samples.front().t_us;
+                const double denom_scale = 1e-6;
+                for (size_t i = 0; i < samples.size(); ++i) {
+                    const double t = ((double)samples[i].t_us - t0) * denom_scale;
+                    const double o = samples[i].offset_us;
+                    sum_t += t;
+                    sum_o += o;
+                    sum_tt += t * t;
+                    sum_to += t * o;
+                }
+                const double n = (double)samples.size();
+                const double denom = (n * sum_tt - sum_t * sum_t);
+                double slope = 0.0;
+                if (std::fabs(denom) > 1e-9) {
+                    slope = (n * sum_to - sum_t * sum_o) / denom; // us per second
+                }
+                raw_skew_ppm = slope;
+                const double t_curr = ((double)t_us - t0) * denom_scale;
+                const double intercept = (sum_o - slope * sum_t) / n;
+                raw_offset = intercept + slope * t_curr;
             }
-            const double n = (double)samples.size();
-            const double denom = (n * sum_tt - sum_t * sum_t);
-            double slope = 0.0;
-            if (std::fabs(denom) > 1e-9) {
-                slope = (n * sum_to - sum_t * sum_o) / denom; // us per second
-            }
-            raw_skew_ppm = slope;
-            const double t_curr = ((double)t_us - t0) * denom_scale;
-            const double intercept = (sum_o - slope * sum_t) / n;
-            raw_offset = intercept + slope * t_curr;
         }
 
         if (!initialized) {
             offset_est = raw_offset;
             skew_est_ppm = raw_skew_ppm;
             initialized = true;
+            kalman_p00 = 1e6;
+            kalman_p01 = 0.0;
+            kalman_p10 = 0.0;
+            kalman_p11 = 1e4;
+            kalman_last_t_us = t_us;
             return;
         }
 
@@ -750,6 +1158,43 @@ struct OffsetEstimator
                 const double resid = raw_offset - offset_est;
                 offset_est = offset_est + alpha * resid;
                 skew_est_ppm = skew_est_ppm + (beta / dt) * resid;
+                break;
+            }
+            case DisciplineKind::StateSpace: {
+                const uint64_t last_us = kalman_last_t_us;
+                double dt = (t_us > last_us) ? (double)(t_us - last_us) / 1000000.0 : dt_s;
+                if (dt <= 1e-6) {
+                    dt = 1e-3;
+                }
+                const double q_offset = (kalman_q_offset_us2 > 0.0) ? kalman_q_offset_us2 : 10.0;
+                const double q_skew = (kalman_q_skew_ppm2 > 0.0) ? kalman_q_skew_ppm2 : 0.01;
+                const double r_meas = (kalman_r_us2 > 0.0) ? kalman_r_us2 : 10000.0;
+
+                const double x0_pred = offset_est + skew_est_ppm * dt;
+                const double x1_pred = skew_est_ppm;
+
+                const double p00 = kalman_p00;
+                const double p01 = kalman_p01;
+                const double p10 = kalman_p10;
+                const double p11 = kalman_p11;
+                const double p00_pred = p00 + dt * (p10 + p01) + dt * dt * p11 + q_offset * dt;
+                const double p01_pred = p01 + dt * p11;
+                const double p10_pred = p10 + dt * p11;
+                const double p11_pred = p11 + q_skew * dt;
+
+                const double resid = raw_offset - x0_pred;
+                const double s = p00_pred + r_meas;
+                const double k0 = (s > 1e-12) ? (p00_pred / s) : 0.0;
+                const double k1 = (s > 1e-12) ? (p10_pred / s) : 0.0;
+
+                offset_est = x0_pred + k0 * resid;
+                skew_est_ppm = x1_pred + k1 * resid;
+
+                kalman_p00 = (1.0 - k0) * p00_pred;
+                kalman_p01 = (1.0 - k0) * p01_pred;
+                kalman_p10 = p10_pred - k1 * p00_pred;
+                kalman_p11 = p11_pred - k1 * p01_pred;
+                kalman_last_t_us = t_us;
                 break;
             }
         }
@@ -817,9 +1262,10 @@ struct ScenarioConfig
     string name;
     ScenarioKind kind = ScenarioKind::Standard;
     bool train = true;
+    bool core = true;
     uint64_t duration_us = 30 * 1000 * 1000ULL;
     double send_rate_hz = 60.0;
-    double probe_rate_hz = 10.0;
+    double probe_rate_hz = 1.0;
     double poll_rate_hz = 10.0;
     uint64_t mindelta_interval_us = 1000000;
     uint64_t metrics_warmup_us = 1000 * 1000ULL;
@@ -841,9 +1287,17 @@ struct ScenarioConfig
     uint64_t inject_late_at_us = 0;
     uint32_t inject_late_delay_us = 0;
 
+    bool ts24_poison_enabled = false;
+    double ts24_poison_prob_ab = 0.0;
+    double ts24_poison_prob_ba = 0.0;
+    int64_t ts24_poison_offset_us_ab = 0;
+    int64_t ts24_poison_offset_us_ba = 0;
+
     double drift_ppm_a = 0.0;
     double drift_ppm_b = 0.0;
     double drift_sine_amp_ppm = 0.0;
+    double drift_sine_amp_ppm_a = 0.0;
+    double drift_sine_amp_ppm_b = 0.0;
     uint64_t drift_sine_period_us = 0;
     double drift_rw_step_ppm = 0.0;
     uint64_t drift_rw_step_interval_us = 1000000;
@@ -851,17 +1305,35 @@ struct ScenarioConfig
     uint64_t drift_step_time_us = 0;
     double drift_step_delta_ppm_a = 0.0;
     double drift_step_delta_ppm_b = 0.0;
+    double drift_ramp_ppm_per_s_a = 0.0;
+    double drift_ramp_ppm_per_s_b = 0.0;
+    double drift_ramp_max_ppm = 0.0;
+    uint64_t drift_ramp_start_us = 0;
 
     int64_t offset_a_us = 0;
     int64_t offset_b_us = 0;
     uint32_t quantize_us = 0;
     uint32_t recv_noise_us = 0;
+    uint32_t recv_noise_us_a = 0;
+    uint32_t recv_noise_us_b = 0;
     NoiseMode recv_noise_mode = NoiseMode::Uniform;
     double recv_noise_sigma = 0.5;
     bool clock_step_enabled = false;
     uint64_t clock_step_time_us = 0;
     int64_t clock_step_a_us = 0;
     int64_t clock_step_b_us = 0;
+    bool clock_step_random = false;
+    bool clock_step_random_side = false;
+    uint64_t clock_step_time_min_us = 0;
+    uint64_t clock_step_time_max_us = 0;
+    int64_t clock_step_min_us = 0;
+    int64_t clock_step_max_us = 0;
+    bool clock_freeze_a = false;
+    bool clock_freeze_b = false;
+    uint64_t clock_freeze_a_start_us = 0;
+    uint64_t clock_freeze_a_end_us = 0;
+    uint64_t clock_freeze_b_start_us = 0;
+    uint64_t clock_freeze_b_end_us = 0;
 
     double overhead_budget_bps = 0.0; // if >0, adjust probe/sample rate
     uint32_t payload_bytes = 64;
@@ -874,14 +1346,370 @@ struct MethodConfig
     DisciplineKind discipline = DisciplineKind::Hybrid;
     double quantile = 0.01;
     uint64_t window_us = 2 * 1000 * 1000ULL;
+    uint64_t short_window_us = 200000;
+    double timesync_quantile = 0.0;
+    double quantile_swap_low = 0.0;
+    double quantile_swap_high = 0.1;
+    double quantile_swap_jitter_enter_us = 200.0;
+    double quantile_swap_jitter_exit_us = 100.0;
+    double quantile_swap_iqr_enter_us = 400.0;
+    double quantile_swap_iqr_exit_us = 200.0;
+    double quantile_near_low = 0.0;
+    double quantile_near_high = 0.1;
+    double quantile_near_enter_ratio = 0.05;
+    double quantile_near_exit_ratio = 0.20;
+    size_t quantile_near_min_samples = 20;
+    double kalman_q_offset_us2 = 0.0;
+    double kalman_q_skew_ppm2 = 0.0;
+    double kalman_r_us2 = 0.0;
+    double ensemble_blend = 0.5;
+    bool ensemble_use_confidence = true;
+    size_t ensemble_npkt_min = 20;
+    double ensemble_iqr_min_us = 200.0;
+    double ensemble_iqr_k = 10.0;
+    double quantile_adapt_low = 0.01;
+    double quantile_adapt_mid = 0.05;
+    double quantile_adapt_high = 0.10;
+    double quantile_adapt_iqr_low_us = 200.0;
+    double quantile_adapt_iqr_high_us = 800.0;
+    uint64_t quantile_adapt_hold_us = 0;
+    size_t quantile_adapt_min_samples = 0;
+    double block_quantile = 0.05;
+    size_t block_min_bins = 5;
+    bool quantile_use_cse = false;
+    double quantile_cse_blend = 0.0;
+    bool quantile_use_cse_gate = false;
+    bool quantile_use_short_high = false;
+    double quantile_short = 0.05;
+    bool quantile_flip_reset = false;
+    bool quantile_flip_hold = false;
+    bool quantile_flip_use_short = false;
+    bool quantile_flip_shrink = false;
+    bool quantile_flip_use_xor = false;
+    bool quantile_use_offset_slope = false;
+    double quantile_offset_slope_min_us_s = 0.0;
+    int quantile_flip_n_consec = 2;
+    double quantile_flip_min_ppm = 5.0;
+    uint64_t quantile_flip_hold_us = 0;
+    uint64_t quantile_flip_window_us = 0;
+    bool quantile_near_stale_reset = false;
+    int quantile_near_stale_n_consec = 3;
+    uint64_t quantile_near_stale_hold_us = 0;
+    uint64_t quantile_near_cooldown_us = 0;
+    bool quantile_cusum_gate = false;
+    uint64_t sloped_window_us = 5000000;
+    uint64_t sloped_window_min_us = 0;
+    uint64_t sloped_window_max_us = 0;
+    uint64_t sloped_window_step_us = 0;
+    bool sloped_window_adaptive_grow = false;
+    bool sloped_window_adaptive_shrink = false;
+    size_t sloped_min_samples = 5;
+    double sloped_clamp_ppm = 200.0;
+    double sloped_gate_iqr_us = 0.0;
+    size_t sloped_gate_min_samples = 0;
+    uint64_t sloped_blend_fast_us = 0;
+    uint64_t sloped_blend_slow_us = 0;
+    double sloped_blend_alpha = 0.0;
+    uint64_t minreg_window_us = 0;
+    size_t minreg_min_samples = 0;
+    double minreg_clamp_ppm = 0.0;
+    bool minreg_use_theilsen = false;
+    bool minreg_use_huber = false;
+    double minreg_huber_k = 1.5;
+    bool minreg_use_cse_gate = false;
+    bool minreg_use_short_p10 = false;
+    uint64_t multiwin_short_us = 0;
+    uint64_t multiwin_mid_us = 0;
+    uint64_t multiwin_long_us = 0;
+    bool multiwin_use_cse_gate = false;
+    double decay_rate_us_per_s = 0.0;
+    bool decay_use_cse = false;
+    double decay_rate_min_us_per_s = 0.0;
+    double decay_rate_max_us_per_s = 0.0;
+    double decay_rate_scale = 0.0;
+    bool decay_use_near_ratio = false;
+    double decay_near_ratio_floor = 0.0;
+    bool policy_use_quantile = false;
+    bool policy_use_tilted = false;
+    bool policy_use_decay = false;
+    bool policy_use_multiwin = false;
+    bool policy_use_local_skew = false;
+    double policy_near_ratio_low = 0.0;
+    double policy_iqr_high_us = 0.0;
+    double policy_rtt_step_us = 0.0;
+    double policy_skew_min_ppm = 0.0;
+    uint64_t policy_skew_window_us = 0;
+    size_t policy_skew_min_samples = 0;
+    double policy_skew_beta = 0.0;
+    double policy_skew_max_ppm = 0.0;
+    double policy_skew_net_max = 0.0;
+    double policy_skew_iqr_max_us = 0.0;
+    bool policy_skew_use_rtt_guard = false;
+    bool policy_force_multi_on_shrink = false;
+    uint64_t policy_force_multi_hold_us = 0;
+    bool quantile_use_policy_skew_gate = false;
+    double quantile_policy_skew_min_ppm = 0.0;
+    bool policy_quantile_requires_skew = false;
+    bool policy_quantile_block_high_iqr = false;
+    bool policy_prioritize_decay = false;
+    bool policy_quantile_prefer_low_near = false;
+    bool policy_near_ignore_stable = false;
+    bool policy_tilted_requires_skew = false;
+    size_t policy_min_samples = 0;
+    uint64_t policy_hold_us = 0;
+    int policy_switch_n = 0;
+    bool policy_require_rtt_guard = false;
     int sample_stride = 1; // stamp every N packets
-    double probe_rate_hz = 10.0;
-    uint64_t mindelta_interval_us = 1000000;
+    double probe_rate_hz = 0.0;
+    uint64_t mindelta_interval_us = 0;
     bool timestamp_data = true;
     bool use_timesync = true;
     bool use_envelope = true;
+    bool enable_probes = false;
+    bool probe_skew_only = false;
+    double extra_mindelta_bytes = 0.0;
+    double vargate_trigger_us = 100.0;
+    double vargate_var_threshold_us2 = 10000.0;
+    size_t vargate_window_size = 20;
+    uint64_t vargate_hold_us = 0;
+    uint64_t min_window_floor_us = 0;
+    double stationary_var_max_us2 = 0.0;
+    double stationary_delta_max_us = 0.0;
+    size_t stationary_window_size = 0;
+    bool hyst_use_gsp = false;
+    bool hyst_use_stepguard = false;
+    bool hyst_use_quantile_swap = false;
+    double hysteresis_trigger_us = 100.0;
+    int hysteresis_trigger_count = 3;
+    uint64_t hysteresis_hold_us = 0;
+    double cusum_k_us = 50.0;
+    double cusum_h_us = 500.0;
+    uint64_t cusum_hold_us = 0;
+    double perdir_skew_gate_ppm = 200.0;
+    double perdir_skew_blend = 0.5;
+    double perdir_skew_quantize_ppm = 0.0;
+    double adaptive_trigger_us = 100.0;
+    bool adaptive_use_gsp_trigger = false;
+    bool adaptive_use_stepguard = false;
+    bool adaptive_use_quantile_swap = false;
+    bool adaptive_use_rtt_delta = false;
+    double adaptive_rtt_delta_us = 0.0;
+    bool adaptive_use_rtt_iqr = false;
+    double adaptive_rtt_iqr_us = 0.0;
+    bool adaptive_use_cse_trigger = false;
+    double adaptive_skew_trigger_ppm = 0.0;
+    uint64_t adaptive_age_trigger_us = 0;
+    int adaptive_trigger_count_req = 1;
+    double adaptive_shrink_ratio = 0.0;
+    double adaptive_expand_ratio = 0.0;
+    bool adaptive_trigger_use_jitter = false;
+    double adaptive_trigger_jitter_k = 0.0;
+    double adaptive_trigger_jitter_min_us = 0.0;
+    double adaptive_guard_var_threshold_us2 = 10000.0;
+    size_t adaptive_guard_window_size = 20;
+    int adaptive_guard_sign_count = 3;
+    uint64_t adaptive_guard_hold_us = 0;
+    uint64_t adaptive_bins_min_window_us = 0;
+    uint64_t adaptive_bins_max_window_us = 0;
+    uint64_t adaptive_bins_hold_us = 0;
+    double hybrid_trigger_us = 100.0;
+    double hybrid_var_threshold_us2 = 10000.0;
+    size_t hybrid_window_size = 20;
+    int hybrid_sign_count = 3;
+    uint64_t hybrid_hold_us = 0;
+    size_t robust_delta_window_size = 0;
+    double robust_delta_z = 3.0;
+    double robust_delta_floor_us = 50.0;
+    uint64_t stats_long_window_us = 0;
+    uint64_t stats_short_window_us = 0;
+    double stats_gnear_us = 25.0;
+    bool jitter_guard_use_ewma = false;
+    double jitter_guard_alpha = 0.2;
+    double jitter_guard_min_us = 25.0;
+    double rtt_guard_delta_us = 200.0;
+    double rtt_guard_iqr_us = 200.0;
+    bool rtt_guard_strict = false;
+    uint64_t rtt_guard_min_window_us = 0;
+    double rtt_guard_min_delta_us = 0.0;
+    double promo_max_ppm = 400.0;
+    double promo_max_k = 1.5;
+    bool promo_use_cse_gate = false;
+    // Guarded shadow promotion (GSP)
+    double gsp_guard_min_us = 50.0;
+    double gsp_guard_k = 4.0;
+    double gsp_iqr_min_us = 200.0;
+    double gsp_iqr_k = 10.0;
+    double gsp_gnear_min_us = 25.0;
+    double gsp_gnear_k = 2.0;
+    size_t gsp_npkt_min = 20;
+    int gsp_n_consec = 3;
+    uint64_t gsp_age_ok_us = 3000000;
+    bool gsp_use_xor_gate = false;
+    bool gsp_use_rtt_guard = false;
+    // Shadow + skew
+    uint64_t shadow_skew_window_us = 30000000;
+    size_t shadow_skew_min_samples = 8;
+    double shadow_skew_clamp_ppm = 100.0;
+    double shadow_skew_alpha = 0.10;
+    bool shadow_skew_use_rtt_guard = true;
+    bool shadow_use_cse = false;
+    bool shadow_use_stepguard = false;
+    bool tilted_use_stepguard = false;
+    bool tilted_use_shadow = false;
+    // Coupled skew estimator (CSE)
+    uint64_t cse_window_us = 30000000;
+    size_t cse_min_samples = 8;
+    double cse_beta = 0.05;
+    double cse_max_ppm = 500.0;
+    double cse_net_slope_max = 5.0;
+    double cse_iqr_min_us = 200.0;
+    double cse_iqr_k = 10.0;
+    bool cse_use_rtt_guard = true;
+    // Age-compensated minima
+    uint64_t age_comp_max_age_us = 0;
+    double age_comp_min_ppm = 0.0;
+    bool age_comp_use_rtt_guard = true;
+    bool age_comp_use_stepguard = false;
+    double age_comp_clamp_margin_us = 0.0;
+    double age_comp_clamp_k = 0.0;
+    double age_comp_fixed_ppm = 0.0;
+    uint64_t state_drift_hold_us = 0;
+    uint64_t state_step_hold_us = 0;
+    // DD-AC
+    size_t ddac_npkt_min = 20;
+    double ddac_iqr_min_us = 200.0;
+    double ddac_iqr_k = 10.0;
+    double ddac_net_slope_max = 5.0;
+    double ddac_beta = 0.05;
+    double ddac_max_ppm = 200.0;
+    double ddac_min_ppm = 1.0;
+    uint64_t ddac_age_gap_us = 5000000;
+    double ddac_clamp_margin_us = 100.0;
+    double ddac_clamp_k = 0.0;
+    bool ddac_use_rtt_guard = true;
+    bool ddac_use_age_gap = true;
+    bool ddac_use_peer_age_elapsed = true;
+    bool ddac_enable_step = false;
+    double ddac_step_gb_us = 1000.0;
+    int ddac_step_n_consec = 2;
+    double ddac_step_rtt_guard_us = 200.0;
+    uint64_t ddac_step_holdoff_us = 3000000;
+    bool ddac_step_require_stable = true;
+    double ddac_blend_skew_ppm = 50.0;
+    // KMin / KBest
+    size_t kmin_k = 1;
+    bool kmin_use_stale_gate = false;
+    bool kmin_use_xor_gate = false;
+    bool kmin_use_rtt_guard = false;
+    bool kmin_use_age_weight = false;
+    double kmin_age_weight_us_per_s = 0.0;
+    size_t kbest_k = 3;
+    int kbest_n_consec = 2;
+    size_t kbest_npkt_min = 20;
+    double kbest_guard_min_us = 50.0;
+    double kbest_guard_k = 4.0;
+    double kbest_iqr_min_us = 200.0;
+    double kbest_iqr_k = 10.0;
+    double kbest_gnear_min_us = 25.0;
+    double kbest_gnear_k = 2.0;
+    bool kbest_use_rtt_guard = true;
+    // Mixture-of-Experts (anchor + tracker)
+    double moe_kp = 0.2;
+    double moe_ki = 0.02;
+    double moe_blend = 0.5;
+    double moe_max_ppm = 200.0;
+    double moe_resid_max_us = 500.0;
+    size_t moe_npkt_min = 20;
+    double moe_iqr_min_us = 200.0;
+    double moe_iqr_k = 10.0;
+    double moe_guard_min_us = 50.0;
+    double moe_guard_k = 4.0;
+    bool moe_use_rtt_guard = true;
+    bool moe_use_xor_gate = false;
+    bool moe_use_near_ratio = false;
+    bool moe_use_confidence_blend = false;
+    double moe_near_ratio_min = 0.0;
+    uint64_t moe_unstable_reset_us = 0;
+    uint64_t rtt_bin_us = 10000;
+    size_t rtt_bin_count = 8;
+    double rtt_bin_alpha = 0.2;
+    size_t rtt_bin_min_samples = 3;
+    bool saw_use = false;
+    double saw_slope_min_us = 50.0;
+    uint64_t saw_period_min_us = 2000000;
+    uint64_t saw_period_max_us = 20000000;
+    double saw_period_tol = 0.25;
+    size_t saw_min_flips = 3;
+    uint64_t saw_hold_us = 10000000;
+    uint64_t saw_short_window_us = 10000000;
+    // NFHS
+    uint64_t nfhs_age_us = 5000000;
+    uint64_t nfhs_miss_us = 4000000;
+    int nfhs_n_consec = 2;
+    size_t nfhs_npkt_min = 20;
+    double nfhs_iqr_min_us = 200.0;
+    double nfhs_iqr_k = 10.0;
+    double nfhs_gnear_min_us = 50.0;
+    double nfhs_gnear_k = 2.0;
+    bool nfhs_use_rtt_guard = true;
+    bool nfhs_use_near_ratio = false;
+    double nfhs_near_ratio_max = 0.1;
+    // Step guard
+    double step_threshold_us = 1000.0;
+    double step_threshold_k = 0.0;
+    int step_n_consec = 2;
+    size_t step_npkt_min = 20;
+    double step_iqr_min_us = 200.0;
+    double step_iqr_k = 10.0;
+    double step_gnear_min_us = 50.0;
+    double step_gnear_k = 2.0;
+    bool step_gnear_use_iqr = false;
+    bool step_nonear_use_p10 = false;
+    size_t step_innov_window_size = 0;
+    double step_innov_k = 0.0;
+    bool step_use_rtt_guard = true;
+    double step_rtt_guard_delta_us = 0.0;
+    double step_rtt_guard_iqr_us = 0.0;
+    bool step_use_near_ratio = false;
+    double step_near_ratio_max = 0.0;
+    bool step_single_dir_reset = false;
+    bool step_use_xor_gate = false;
+    bool step_use_sym_gate = false;
+    bool step_use_probe_offset = false;
+    bool step_probe_relax = false;
+    bool step_probe_relax_nonear = false;
+    bool step_probe_only = false;
+    bool step_probe_hard = false;
+    bool step_probe_innov = false;
+    bool step_guard_reset_bins = false;
+    // Step reset guard
+    bool stepreset_use_rtt_guard = false;
+    bool stepreset_use_xor_gate = false;
+    bool stepreset_use_sticky_gate = false;
+    uint64_t stepreset_hold_us = 0;
+    // Consensus-slope (Hough-style)
+    size_t consensus_buffer_size = 64;
+    size_t consensus_min_samples = 8;
+    double consensus_candidate_frac = 0.10;
+    double consensus_candidate_floor_us = 25.0;
+    double consensus_slope_bin_ppm = 2.0;
+    double consensus_slope_max_ppm = 500.0;
+    double consensus_percentile = 0.05;
+    double consensus_iqr_min_us = 200.0;
+    double consensus_iqr_k = 10.0;
+    bool consensus_use_rtt_guard = true;
+    bool consensus_use_short_baseline = false;
+    bool ts24_plausibility = false;
+    double ts24_neg_eps_us = 0.0;
+    double ts24_delta_max_us = 0.0;
+    double ts24_min_phys_us = 0.0;
     string variant_name;
 };
+
+static bool MethodUsesProbes(const MethodConfig& method)
+{
+    return method.enable_probes || UsesProbes(method.kind);
+}
 
 struct RunItem
 {
@@ -904,15 +1732,110 @@ struct DirectionMetrics
     SampleStats poll_time_err_us;
     SampleStats skew_err_ppm;
     SampleStats owd_err_us;
+    SampleStats short_p10_us;
+    SampleStats short_iqr_us;
+    SampleStats short_near_hits;
+    uint64_t poll_over_5ms = 0;
+    uint64_t poll_over_10ms = 0;
+    uint64_t poll_over_20ms = 0;
+    uint64_t poll_over_50ms = 0;
+
+    uint64_t ts24_drops = 0;
 
     bool converged = false;
     uint64_t converge_time_us = 0;
+
+    bool step_recovered = false;
+    uint64_t step_recover_time_us = 0;
+    bool step_recover_cons = false;
+    uint64_t step_recover_cons_time_us = 0;
+    uint32_t step_recover_cons_count = 0;
+    bool step_recovered_5ms = false;
+    uint64_t step_recover_time_5ms = 0;
+    bool step_recover_cons_5ms = false;
+    uint64_t step_recover_cons_time_5ms = 0;
+    uint32_t step_recover_cons_count_5ms = 0;
+    bool step_recovered_10ms = false;
+    uint64_t step_recover_time_10ms = 0;
+    bool step_recover_cons_10ms = false;
+    uint64_t step_recover_cons_time_10ms = 0;
+    uint32_t step_recover_cons_count_10ms = 0;
+    bool step_recovered_20ms = false;
+    uint64_t step_recover_time_20ms = 0;
+    bool step_recover_cons_20ms = false;
+    uint64_t step_recover_cons_time_20ms = 0;
+    uint32_t step_recover_cons_count_20ms = 0;
+    bool step_recovered_50ms = false;
+    uint64_t step_recover_time_50ms = 0;
+    bool step_recover_cons_50ms = false;
+    uint64_t step_recover_cons_time_50ms = 0;
+    uint32_t step_recover_cons_count_50ms = 0;
+    bool step_recovered_100ms = false;
+    uint64_t step_recover_time_100ms = 0;
+    bool step_recover_cons_100ms = false;
+    uint64_t step_recover_cons_time_100ms = 0;
+    uint32_t step_recover_cons_count_100ms = 0;
+    bool step_recovered_500ms = false;
+    uint64_t step_recover_time_500ms = 0;
+    bool step_recover_cons_500ms = false;
+    uint64_t step_recover_cons_time_500ms = 0;
+    uint32_t step_recover_cons_count_500ms = 0;
+    double step_peak_err_us = 0.0;
+    double step_auc_err_us_s = 0.0;
+    uint64_t step_last_poll_us = 0;
+};
+
+struct MethodCounters
+{
+    uint64_t gsp_promotions = 0;
+    uint64_t nfhs_promotions = 0;
+    uint64_t step_resets = 0;
+    uint64_t adaptive_bins_changes = 0;
+    uint64_t step_guard_ticks = 0;
+    uint64_t step_guard_stable = 0;
+    uint64_t step_guard_enough = 0;
+    uint64_t step_guard_nonear = 0;
+    uint64_t step_guard_near_ratio_ok = 0;
+    uint64_t step_guard_rtt_ok = 0;
+    uint64_t step_guard_xor_ok = 0;
+    uint64_t step_guard_sym_ok = 0;
+    uint64_t step_guard_stale_ab = 0;
+    uint64_t step_guard_stale_ba = 0;
+    uint64_t step_guard_innov_ok = 0;
+    uint64_t step_guard_all_ok = 0;
+    uint64_t shadow_skew_updates = 0;
+    uint64_t cse_updates = 0;
+    uint64_t consensus_updates = 0;
+    uint64_t minreg_updates = 0;
+    uint64_t multiwin_updates = 0;
+    uint64_t decay_updates = 0;
+    uint64_t kmin_updates = 0;
+    uint64_t kbest_advances = 0;
+    uint64_t moe_updates = 0;
+    uint64_t moe_blends = 0;
+    double moe_conf_mean = 0.0;
+    uint64_t ddac_skew_updates = 0;
+    uint64_t ddac_age_comp = 0;
+    uint64_t ddac_clamp_hits = 0;
+    uint64_t ddac_step_resets = 0;
+    uint64_t ddac_step_in_hits = 0;
+    uint64_t ddac_step_out_hits = 0;
+    uint64_t ddac_step_xor_hits = 0;
+    uint64_t ddac_step_streak_max = 0;
+    double ddac_gap_in_mean_us = 0.0;
+    double ddac_gap_in_p95_us = 0.0;
+    double ddac_gap_out_mean_us = 0.0;
+    double ddac_gap_out_p95_us = 0.0;
+    uint64_t age_comp_updates = 0;
+    uint64_t tilted_updates = 0;
 };
 
 struct BenchmarkMetrics
 {
     DirectionMetrics ab;
     DirectionMetrics ba;
+    MethodCounters method_a;
+    MethodCounters method_b;
 
     double overhead_bps = 0.0;
     double cpu_ops = 0.0;
@@ -927,6 +1850,13 @@ struct BenchmarkMetrics
     double teleop_rms_error = 0.0;
     double teleop_max_error = 0.0;
     double teleop_settle_s = 0.0;
+
+    SampleStats rtt_short_us;
+    SampleStats rtt_long_us;
+    SampleStats rtt_delta_us;
+    SampleStats rtt_short_iqr_us;
+    uint64_t rtt_guard_ok = 0;
+    uint64_t rtt_guard_total = 0;
 };
 
 //------------------------------------------------------------------------------
@@ -956,11 +1886,23 @@ struct Message
     Counter23 app_ts23 = 0;
     Counter24 min_delta = 0;
     uint32_t env_delta_us = 0;
+    double skew_est_ppm = 0.0;
+    bool skew_valid = false;
 
     // Probe fields
     uint64_t t1_local = 0;
     uint64_t t2_remote = 0;
     uint64_t t3_remote = 0;
+
+    // DD-AC report fields
+    bool ddac_valid = false;
+    uint32_t ddac_seq = 0;
+    double ddac_min_long_us = 0.0;
+    uint64_t ddac_age_us = 0;
+    double ddac_p10_us = 0.0;
+    double ddac_iqr_us = 0.0;
+    uint32_t ddac_count = 0;
+    double ddac_p0_us = 0.0;
 };
 
 struct ArrivalEvent
@@ -978,6 +1920,214 @@ struct ArrivalCompare
     }
 };
 
+struct ShortStatsSnapshot
+{
+    bool valid = false;
+    double p0 = 0.0;
+    double p10 = 0.0;
+    double p25 = 0.0;
+    double p75 = 0.0;
+    double iqr = 0.0;
+    size_t count = 0;
+    size_t near_hits = 0;
+};
+
+struct SlopeSample
+{
+    double value_us = 0.0;
+    uint64_t t_us = 0;
+};
+
+struct LongWindowBins
+{
+    struct Bin
+    {
+        double min_us = 0.0;
+        uint64_t min_time_us = 0;
+        uint32_t count = 0;
+        uint64_t sec = 0;
+        bool valid = false;
+    };
+
+    void Reset(uint64_t window_us_in)
+    {
+        window_us = std::max<uint64_t>(window_us_in, bin_us);
+        const size_t bins_needed = (size_t)std::max<uint64_t>(1, window_us / bin_us);
+        bins.assign(bins_needed, Bin());
+    }
+
+    void Update(uint64_t now_us, double delta_us)
+    {
+        if (window_us == 0 || bins.empty()) {
+            return;
+        }
+        const uint64_t sec = now_us / bin_us;
+        const size_t idx = (size_t)(sec % bins.size());
+        Bin& b = bins[idx];
+        if (!b.valid || b.sec != sec) {
+            b.valid = true;
+            b.sec = sec;
+            b.count = 1;
+            b.min_us = delta_us;
+            b.min_time_us = now_us;
+            return;
+        }
+        b.count++;
+        if (delta_us < b.min_us) {
+            b.min_us = delta_us;
+            b.min_time_us = now_us;
+        }
+    }
+
+    bool GetMin(uint64_t now_us, double& out_min, uint64_t& out_time, uint32_t& out_count) const
+    {
+        if (bins.empty()) {
+            return false;
+        }
+        const uint64_t now_sec = now_us / bin_us;
+        bool found = false;
+        double min_value = 0.0;
+        uint64_t min_time = 0;
+        uint32_t total_count = 0;
+        for (const auto& b : bins) {
+            if (!b.valid) {
+                continue;
+            }
+            if (now_sec >= b.sec && (now_sec - b.sec) >= bins.size()) {
+                continue;
+            }
+            total_count += b.count;
+            if (!found || b.min_us < min_value) {
+                found = true;
+                min_value = b.min_us;
+                min_time = b.min_time_us;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+        out_min = min_value;
+        out_time = min_time;
+        out_count = total_count;
+        return true;
+    }
+
+    bool GetQuantile(uint64_t now_us, double quantile, double& out_min, uint64_t& out_time, uint32_t& out_count) const
+    {
+        if (bins.empty()) {
+            return false;
+        }
+        const uint64_t now_sec = now_us / bin_us;
+        std::vector<const Bin*> valid;
+        uint32_t total_count = 0;
+        for (const auto& b : bins) {
+            if (!b.valid) {
+                continue;
+            }
+            if (now_sec >= b.sec && (now_sec - b.sec) >= bins.size()) {
+                continue;
+            }
+            valid.push_back(&b);
+            total_count += b.count;
+        }
+        if (valid.empty()) {
+            return false;
+        }
+        double q = quantile;
+        if (q < 0.0) q = 0.0;
+        if (q > 1.0) q = 1.0;
+        std::sort(valid.begin(), valid.end(),
+            [](const Bin* a, const Bin* b) { return a->min_us < b->min_us; });
+        const size_t idx = (size_t)std::floor(q * (double)(valid.size() - 1));
+        const Bin* pick = valid[idx];
+        out_min = pick->min_us;
+        out_time = pick->min_time_us;
+        out_count = total_count;
+        return true;
+    }
+
+    uint64_t window_us = 0;
+    uint64_t bin_us = 1000000;
+    std::vector<Bin> bins;
+};
+
+struct ShortWindowStats
+{
+    struct Sample
+    {
+        double delta_us = 0.0;
+        uint64_t t_us = 0;
+    };
+
+    void Reset(uint64_t window_us_in)
+    {
+        window_us = window_us_in;
+        samples.clear();
+    }
+
+    void Add(uint64_t now_us, double delta_us)
+    {
+        if (window_us == 0) {
+            return;
+        }
+        Sample s;
+        s.delta_us = delta_us;
+        s.t_us = now_us;
+        samples.push_back(s);
+        Prune(now_us);
+    }
+
+    void Prune(uint64_t now_us)
+    {
+        if (window_us == 0) {
+            return;
+        }
+        const uint64_t cutoff = (now_us > window_us) ? (now_us - window_us) : 0;
+        while (!samples.empty() && samples.front().t_us < cutoff) {
+            samples.pop_front();
+        }
+    }
+
+    bool Compute(uint64_t now_us, double min_long_us, double gnear_us, ShortStatsSnapshot& out)
+    {
+        Prune(now_us);
+        if (samples.empty()) {
+            out = ShortStatsSnapshot();
+            return false;
+        }
+        std::vector<double> values;
+        values.reserve(samples.size());
+        size_t near_hits = 0;
+        const double near_threshold = min_long_us + gnear_us;
+        for (const auto& s : samples) {
+            values.push_back(s.delta_us);
+            if (s.delta_us <= near_threshold) {
+                near_hits++;
+            }
+        }
+        std::sort(values.begin(), values.end());
+        auto idx = [&](double q) -> size_t {
+            if (values.size() <= 1) {
+                return 0;
+            }
+            const double clamped = std::max(0.0, std::min(1.0, q));
+            return (size_t)std::floor(clamped * (double)(values.size() - 1));
+        };
+        out.valid = true;
+        out.count = values.size();
+        out.near_hits = near_hits;
+        out.p0 = values.front();
+        out.p10 = values[idx(0.10)];
+        out.p25 = values[idx(0.25)];
+        out.p75 = values[idx(0.75)];
+        out.iqr = out.p75 - out.p25;
+        return true;
+    }
+
+    uint64_t window_us = 0;
+    std::deque<Sample> samples;
+};
+
 struct NodeState
 {
     ClockModel clock;
@@ -986,6 +2136,152 @@ struct NodeState
     double peer_env_value = 0.0;
     bool peer_env_valid = false;
     TimeSynchronizer timesync;
+    TimeSynchronizer timesync_short;
+    double last_timesync_offset_us = 0.0;
+    bool last_timesync_offset_valid = false;
+    uint64_t drift_window_us = 0;
+    uint64_t drift_window_restore_us = 0;
+    double ts_offset_us = 0.0;
+    uint64_t ts_offset_time_us = 0;
+    bool ts_offset_valid = false;
+    double peer_skew_est_ppm = 0.0;
+    bool peer_skew_valid = false;
+    int adaptive_trigger_count = 0;
+    int adaptive_sign = 0;
+    uint64_t adaptive_hold_until_us = 0;
+    uint64_t adaptive_bins_window_us = 0;
+    uint64_t adaptive_bins_restore_us = 0;
+    int adaptive_bins_stale_streak = 0;
+    uint64_t adaptive_bins_changes = 0;
+    bool hyst_force_trigger = false;
+    bool adaptive_force_trigger = false;
+    int hybrid_trigger_count = 0;
+    int hybrid_sign = 0;
+    bool hybrid_use_fast = false;
+    uint64_t hybrid_hold_until_us = 0;
+    std::deque<SlopedSample> sloped_samples;
+    std::deque<SlopedSample> minreg_samples;
+    std::deque<SlopedSample> peer_min_samples;
+    double sloped_skew_ppm = 0.0;
+    bool sloped_skew_valid = false;
+    uint64_t sloped_window_us_current = 0;
+    std::deque<SlopeSample> consensus_samples;
+    double consensus_slope_ppm = 0.0;
+    bool consensus_slope_valid = false;
+    std::deque<SlopedSample> shadow_skew_samples;
+    double shadow_skew_ppm = 0.0;
+    bool shadow_skew_valid = false;
+    std::deque<double> step_innov_window;
+    std::deque<SlopeSample> cse_samples;
+    double cse_skew_ppm = 0.0;
+    bool cse_skew_valid = false;
+    bool cse_gate_ok = false;
+    std::deque<SlopeSample> policy_skew_samples;
+    double policy_skew_ppm = 0.0;
+    bool policy_skew_valid = false;
+    uint64_t policy_skew_updates = 0;
+    size_t kbest_offset = 0;
+    int kbest_stale_streak = 0;
+    double kbest_last_min0 = 0.0;
+    double moe_offset_us = 0.0;
+    double moe_skew_ppm = 0.0;
+    uint64_t moe_time_us = 0;
+    bool moe_valid = false;
+    double moe_conf_sum = 0.0;
+    uint64_t moe_conf_count = 0;
+    std::vector<double> rtt_bin_offsets;
+    std::vector<uint32_t> rtt_bin_counts;
+    double rtt_short_last_us = 0.0;
+    bool rtt_short_valid = false;
+    std::deque<SlopeSample> saw_samples;
+    std::deque<uint64_t> saw_flip_times;
+    int saw_last_sign = 0;
+    uint64_t saw_hold_until_us = 0;
+    uint64_t saw_short_restore_us = 0;
+    uint64_t saw_short_base_us = 0;
+    bool quantile_swap_high = false;
+    bool quantile_near_high = false;
+    int quantile_flip_streak = 0;
+    int quantile_cse_sign = 0;
+    int quantile_near_stale_streak = 0;
+    uint64_t quantile_near_cooldown_until_us = 0;
+    uint64_t quantile_hold_until_us = 0;
+    double quantile_hold_q = 0.0;
+    bool quantile_hold_use_short = false;
+    double quantile_prev_offset_us = 0.0;
+    uint64_t quantile_prev_offset_time_us = 0;
+    bool quantile_prev_offset_valid = false;
+    int quantile_offset_sign = 0;
+    int quantile_offset_streak = 0;
+    uint64_t quantile_last_near_hit_us = 0;
+    double quantile_adapt_last_q = -1.0;
+    uint64_t quantile_adapt_hold_until_us = 0;
+    uint32_t ddac_seq = 0;
+    bool ddac_peer_valid = false;
+    uint32_t ddac_peer_seq = 0;
+    double ddac_peer_min_long_us = 0.0;
+    uint64_t ddac_peer_age_us = 0;
+    double ddac_peer_p10_us = 0.0;
+    double ddac_peer_iqr_us = 0.0;
+    uint32_t ddac_peer_count = 0;
+    double ddac_peer_p0_us = 0.0;
+    uint64_t ddac_peer_rx_us = 0;
+    double ddac_prev_p10_in = 0.0;
+    double ddac_prev_p10_out = 0.0;
+    uint32_t ddac_prev_seq = 0;
+    bool ddac_prev_valid = false;
+    double ddac_skew_ppm = 0.0;
+    bool ddac_skew_valid = false;
+    uint64_t ddac_holdoff_until_us = 0;
+    int ddac_step_streak = 0;
+    int ddac_step_streak_max = 0;
+    uint64_t ddac_step_in_hits = 0;
+    uint64_t ddac_step_out_hits = 0;
+    uint64_t ddac_step_xor_hits = 0;
+    SampleStats ddac_gap_in_us;
+    SampleStats ddac_gap_out_us;
+    bool stepreset_guard_ok = false;
+    bool stepreset_xor_ok = false;
+    bool stepreset_dir_ok = false;
+    double cusum_pos = 0.0;
+    double cusum_neg = 0.0;
+    uint64_t cusum_hold_until_us = 0;
+    std::deque<double> offset_delta_window;
+    std::deque<double> hybrid_delta_window;
+    std::deque<double> robust_delta_window;
+    size_t robust_delta_window_size = 0;
+    double robust_delta_z = 3.0;
+    double robust_delta_floor_us = 50.0;
+    int state_mode = 0;
+    uint64_t state_until_us = 0;
+    int policy_mode = 0;
+    int policy_pending_mode = 0;
+    int policy_switch_streak = 0;
+    uint64_t policy_hold_until_us = 0;
+    uint64_t policy_switches = 0;
+
+    LongWindowBins long_bins;
+    LongWindowBins tilted_bins;
+    ShortWindowStats short_stats;
+    uint64_t stats_long_window_us = 0;
+    uint64_t stats_short_window_us = 0;
+    uint64_t next_short_stats_us = 0;
+    double long_min_us = 0.0;
+    uint64_t long_min_time_us = 0;
+    bool long_min_valid = false;
+    double tilted_min_us = 0.0;
+    uint64_t tilted_min_time_us = 0;
+    bool tilted_min_valid = false;
+    ShortStatsSnapshot short_snapshot;
+    bool jitter_ewma_valid = false;
+    double jitter_ewma_us = 0.0;
+    bool jitter_guard_use_ewma = false;
+    double jitter_guard_alpha = 0.2;
+    double jitter_guard_min_us = 25.0;
+
+    uint64_t ts24_remote_ext = 0;
+    bool ts24_remote_valid = false;
+    uint64_t ts24_drop_count = 0;
 
     uint64_t last_min_delta_send_us = 0;
     uint64_t last_probe_send_us = 0;
@@ -993,6 +2289,251 @@ struct NodeState
 
     bool synced = false;
     uint64_t sync_time_us = 0;
+
+    double effective_min_us = 0.0;
+    uint64_t effective_min_time_us = 0;
+    bool effective_min_valid = false;
+    double decay_min_us = 0.0;
+    uint64_t decay_last_us = 0;
+    bool decay_valid = false;
+    double peer_min_us = 0.0;
+    bool peer_min_valid = false;
+    double peer_min_raw_us = 0.0;
+    bool peer_min_raw_valid = false;
+    double algo_offset_us = 0.0;
+    uint64_t algo_offset_time_us = 0;
+    bool algo_offset_valid = false;
+
+    int gsp_stale_streak = 0;
+    uint64_t nfhs_last_near_hit_us = 0;
+    int nfhs_stale_streak = 0;
+    int step_streak = 0;
+    uint64_t gsp_promotions = 0;
+    uint64_t nfhs_promotions = 0;
+    uint64_t step_resets = 0;
+    bool step_reset_dir = false;
+    uint64_t step_guard_ticks = 0;
+    uint64_t step_guard_stable = 0;
+    uint64_t step_guard_enough = 0;
+    uint64_t step_guard_nonear = 0;
+    uint64_t step_guard_near_ratio_ok = 0;
+    uint64_t step_guard_rtt_ok = 0;
+    uint64_t step_guard_xor_ok = 0;
+    uint64_t step_guard_sym_ok = 0;
+    uint64_t step_guard_stale_ab = 0;
+    uint64_t step_guard_stale_ba = 0;
+    uint64_t step_guard_innov_ok = 0;
+    uint64_t step_guard_all_ok = 0;
+    uint64_t shadow_skew_updates = 0;
+    uint64_t cse_updates = 0;
+    uint64_t consensus_updates = 0;
+    uint64_t minreg_updates = 0;
+    uint64_t multiwin_updates = 0;
+    uint64_t decay_updates = 0;
+    uint64_t kmin_updates = 0;
+    uint64_t kbest_advances = 0;
+    uint64_t moe_updates = 0;
+    uint64_t moe_blends = 0;
+    uint64_t ddac_skew_updates = 0;
+    uint64_t ddac_age_comp = 0;
+    uint64_t ddac_clamp_hits = 0;
+    uint64_t ddac_step_resets = 0;
+    uint64_t age_comp_updates = 0;
+    uint64_t tilted_updates = 0;
+};
+
+struct TraceRttSnapshot
+{
+    bool valid = false;
+    bool guard_ok = false;
+    double short_us = 0.0;
+    double long_us = 0.0;
+    double delta_us = 0.0;
+    double iqr_us = 0.0;
+};
+
+static uint64_t ActiveWindowUs(const NodeState& node, const MethodConfig& method)
+{
+    if (node.drift_window_us > 0) {
+        return node.drift_window_us;
+    }
+    if (method.window_us > 0) {
+        return method.window_us;
+    }
+    return node.stats_long_window_us;
+}
+
+static double TraceSkewPpm(const NodeState& node, const MethodConfig& method, bool& valid)
+{
+    valid = false;
+    double skew_ppm = 0.0;
+    if (method.kind == MethodKind::TimeSyncShadowSkew && node.shadow_skew_valid) {
+        valid = true;
+        skew_ppm = node.shadow_skew_ppm;
+    } else if ((method.kind == MethodKind::TimeSyncTilted ||
+                method.kind == MethodKind::TimeSyncAdaptive ||
+                method.kind == MethodKind::TimeSyncAdaptiveGuard ||
+                method.kind == MethodKind::TimeSyncHybrid) &&
+               node.cse_skew_valid) {
+        valid = true;
+        skew_ppm = node.cse_skew_ppm;
+    } else if (method.kind == MethodKind::TimeSyncPolicy) {
+        if (node.policy_skew_valid) {
+            valid = true;
+            skew_ppm = node.policy_skew_ppm;
+        } else if (node.cse_skew_valid) {
+            valid = true;
+            skew_ppm = node.cse_skew_ppm;
+        }
+    } else if (method.kind == MethodKind::TimeSyncSlope && node.sloped_skew_valid) {
+        valid = true;
+        skew_ppm = node.sloped_skew_ppm;
+    } else if (method.kind == MethodKind::TimeSyncMoE && node.moe_valid) {
+        valid = true;
+        skew_ppm = node.moe_skew_ppm;
+    } else if ((method.kind == MethodKind::TimeSyncDDAC || method.kind == MethodKind::TimeSyncDDACBlend) &&
+               node.ddac_skew_valid) {
+        valid = true;
+        skew_ppm = node.ddac_skew_ppm;
+    } else if ((method.kind == MethodKind::TimeSyncSkew ||
+                method.kind == MethodKind::TimeSyncSkewReg ||
+                method.kind == MethodKind::TimeSyncSkewCorrected ||
+                method.kind == MethodKind::TimeSyncPerDirSkew) &&
+               node.estimator.Ready()) {
+        valid = true;
+        skew_ppm = node.estimator.skew_est_ppm;
+    } else if (node.cse_skew_valid) {
+        valid = true;
+        skew_ppm = node.cse_skew_ppm;
+    }
+    return skew_ppm;
+}
+
+struct TraceWriter
+{
+    std::ofstream out;
+    uint64_t next_tick_us = 0;
+    uint64_t interval_us = 1000000;
+    bool enabled = false;
+
+    void Open(const TraceConfig& cfg, const ScenarioConfig& scenario,
+              const MethodConfig& method, uint64_t seed)
+    {
+        if (!cfg.enabled || cfg.dir.empty()) {
+            enabled = false;
+            return;
+        }
+        enabled = true;
+        interval_us = (cfg.interval_us > 0) ? cfg.interval_us : 1000000;
+        const string fname = SanitizeTag(scenario.name) + "__" +
+            SanitizeTag(MethodName(method.kind)) + "__" +
+            SanitizeTag(EstimatorName(method.estimator)) + "__" +
+            SanitizeTag(DisciplineName(method.discipline)) + "__seed" +
+            std::to_string(seed) + ".csv";
+        const string path = cfg.dir + "/" + fname;
+        out.open(path.c_str());
+        if (!out) {
+            enabled = false;
+            std::cerr << "Unable to open trace output: " << path << "\n";
+            return;
+        }
+        out << "time_us,node,scenario,method,estimator,discipline,seed,"
+            << "short_p10_us,short_iqr_us,short_near_hits,short_count,near_hit_rate,"
+            << "long_min_us,long_min_age_us,effective_min_us,effective_min_age_us,"
+            << "window_us,short_window_us,drift_window_us,"
+            << "rtt_short_us,rtt_long_us,rtt_delta_us,rtt_iqr_us,rtt_guard_ok,"
+            << "skew_ppm,skew_valid,cse_gate_ok,"
+            << "gsp_promotions,nfhs_promotions,step_resets,ddac_step_resets,"
+            << "quantile_flip_streak,quantile_near_stale_streak,quantile_hold_q,quantile_hold_use_short,"
+            << "adaptive_bins_changes,cusum_pos,cusum_neg,cusum_hold_remaining_us,"
+            << "stepreset_guard_ok,stepreset_xor_ok,stepreset_dir_ok\n";
+    }
+
+    void MaybeWrite(uint64_t now_us,
+                    const ScenarioConfig& scenario,
+                    const MethodConfig& method,
+                    uint64_t seed,
+                    const TraceRttSnapshot& rtt,
+                    const NodeState& node_a,
+                    const NodeState& node_b)
+    {
+        if (!enabled || !out) {
+            return;
+        }
+        if (now_us < next_tick_us) {
+            return;
+        }
+        next_tick_us = now_us + interval_us;
+        WriteNode(now_us, "A", scenario, method, seed, rtt, node_a);
+        WriteNode(now_us, "B", scenario, method, seed, rtt, node_b);
+    }
+
+    void WriteNode(uint64_t now_us,
+                   const char* label,
+                   const ScenarioConfig& scenario,
+                   const MethodConfig& method,
+                   uint64_t seed,
+                   const TraceRttSnapshot& rtt,
+                   const NodeState& node)
+    {
+        const double short_count = static_cast<double>(node.short_snapshot.count);
+        const double near_rate = (short_count > 0.0)
+            ? (static_cast<double>(node.short_snapshot.near_hits) / short_count)
+            : 0.0;
+        const double long_age = node.long_min_valid
+            ? (double)((now_us > node.long_min_time_us) ? (now_us - node.long_min_time_us) : 0ULL)
+            : -1.0;
+        const double eff_age = node.effective_min_valid
+            ? (double)((now_us > node.effective_min_time_us) ? (now_us - node.effective_min_time_us) : 0ULL)
+            : -1.0;
+        bool skew_valid = false;
+        const double skew_ppm = TraceSkewPpm(node, method, skew_valid);
+        const uint64_t hold_remaining = (node.cusum_hold_until_us > now_us)
+            ? (node.cusum_hold_until_us - now_us)
+            : 0;
+        out << now_us << ","
+            << label << ","
+            << scenario.name << ","
+            << MethodName(method.kind) << ","
+            << EstimatorName(method.estimator) << ","
+            << DisciplineName(method.discipline) << ","
+            << seed << ","
+            << (node.short_snapshot.valid ? node.short_snapshot.p10 : 0.0) << ","
+            << (node.short_snapshot.valid ? node.short_snapshot.iqr : 0.0) << ","
+            << node.short_snapshot.near_hits << ","
+            << node.short_snapshot.count << ","
+            << near_rate << ","
+            << (node.long_min_valid ? node.long_min_us : 0.0) << ","
+            << long_age << ","
+            << (node.effective_min_valid ? node.effective_min_us : 0.0) << ","
+            << eff_age << ","
+            << ActiveWindowUs(node, method) << ","
+            << node.stats_short_window_us << ","
+            << node.drift_window_us << ","
+            << (rtt.valid ? rtt.short_us : 0.0) << ","
+            << (rtt.valid ? rtt.long_us : 0.0) << ","
+            << (rtt.valid ? rtt.delta_us : 0.0) << ","
+            << (rtt.valid ? rtt.iqr_us : 0.0) << ","
+            << (rtt.valid && rtt.guard_ok ? 1 : 0) << ","
+            << skew_ppm << ","
+            << (skew_valid ? 1 : 0) << ","
+            << (node.cse_gate_ok ? 1 : 0) << ","
+            << node.gsp_promotions << ","
+            << node.nfhs_promotions << ","
+            << node.step_resets << ","
+            << node.ddac_step_resets << ","
+            << node.quantile_flip_streak << ","
+            << node.quantile_near_stale_streak << ","
+            << node.quantile_hold_q << ","
+            << (node.quantile_hold_use_short ? 1 : 0) << ","
+            << node.adaptive_bins_changes << ","
+            << node.cusum_pos << ","
+            << node.cusum_neg << ","
+            << hold_remaining << ","
+            << (node.stepreset_guard_ok ? 1 : 0) << ","
+            << (node.stepreset_xor_ok ? 1 : 0) << ","
+            << (node.stepreset_dir_ok ? 1 : 0) << "\n";
+    }
 };
 
 //------------------------------------------------------------------------------
@@ -1032,6 +2573,4411 @@ static uint64_t ClampMetricsWarmup(uint64_t warmup_us, uint64_t duration_us)
     return duration_us / 10;
 }
 
+static double MedianOfVector(std::vector<double>& values)
+{
+    if (values.empty()) {
+        return 0.0;
+    }
+    const size_t mid = values.size() / 2;
+    std::nth_element(values.begin(), values.begin() + mid, values.end());
+    double median = values[mid];
+    if ((values.size() % 2) == 0) {
+        const double lower = *std::max_element(values.begin(), values.begin() + mid);
+        median = 0.5 * (median + lower);
+    }
+    return median;
+}
+
+static bool AcceptRobustDelta(NodeState& node, double delta)
+{
+    if (node.robust_delta_window_size == 0 || node.robust_delta_z <= 0.0) {
+        return true;
+    }
+    const double delta_mag = std::fabs(delta);
+    bool accept = true;
+    if (node.robust_delta_window.size() >= 4) {
+        std::vector<double> values(node.robust_delta_window.begin(), node.robust_delta_window.end());
+        const double median = MedianOfVector(values);
+        std::vector<double> devs;
+        devs.reserve(values.size());
+        for (double v : values) {
+            devs.push_back(std::fabs(v - median));
+        }
+        const double mad = MedianOfVector(devs);
+        double scale = std::max(node.robust_delta_floor_us, mad);
+        if (scale <= 0.0) {
+            scale = 1.0;
+        }
+        if (std::fabs(delta_mag - median) > node.robust_delta_z * scale) {
+            accept = false;
+        }
+    }
+    node.robust_delta_window.push_back(delta_mag);
+    while (node.robust_delta_window.size() > node.robust_delta_window_size) {
+        node.robust_delta_window.pop_front();
+    }
+    return accept;
+}
+
+static bool ComputeTs24DeltaSample(
+    NodeState& node,
+    const MethodConfig& method,
+    Counter24 remote_ts24,
+    uint64_t local_recv_us,
+    double& out_delta_us,
+    Counter24& out_delta_ts24)
+{
+    const uint64_t local_ts24_ext = local_recv_us >> kTime23LostBits;
+    const Counter24 local_ts24 = (uint32_t)local_ts24_ext;
+    const Counter24 delta_ts24 = local_ts24 - remote_ts24;
+    out_delta_ts24 = delta_ts24;
+    out_delta_us = (double)(delta_ts24.ToUnsigned() << kTime23LostBits);
+
+    if (!method.ts24_plausibility) {
+        return true;
+    }
+
+    Counter64 remote_ext;
+    if (!node.ts24_remote_valid) {
+        remote_ext = Counter64::ExpandFromTruncated(Counter64(local_ts24_ext), remote_ts24);
+        node.ts24_remote_valid = true;
+    } else {
+        remote_ext = Counter64::ExpandFromTruncated(Counter64(node.ts24_remote_ext), remote_ts24);
+    }
+    node.ts24_remote_ext = remote_ext.ToUnsigned();
+
+    const int64_t delta_ticks = (int64_t)local_ts24_ext - (int64_t)node.ts24_remote_ext;
+    const int64_t delta_ext_us = delta_ticks << kTime23LostBits;
+
+    if (delta_ext_us < -(int64_t)method.ts24_neg_eps_us) {
+        node.ts24_drop_count++;
+        return false;
+    }
+    if (method.ts24_delta_max_us > 0.0 && delta_ext_us > (int64_t)method.ts24_delta_max_us) {
+        node.ts24_drop_count++;
+        return false;
+    }
+    if (method.ts24_min_phys_us > 0.0 && delta_ext_us >= 0 &&
+        delta_ext_us < (int64_t)method.ts24_min_phys_us) {
+        node.ts24_drop_count++;
+        return false;
+    }
+
+    return true;
+}
+
+static double GuardJitter(const NodeState& node, const MethodConfig& method)
+{
+    double jitter = 0.0;
+    if (node.short_snapshot.valid) {
+        jitter = std::max(0.0, node.short_snapshot.p10 - node.short_snapshot.p0);
+    }
+    if (method.jitter_guard_use_ewma && node.jitter_ewma_valid) {
+        jitter = std::max(method.jitter_guard_min_us, node.jitter_ewma_us);
+    }
+    return jitter;
+}
+
+static bool EnsureEffectiveMin(NodeState& node)
+{
+    if (node.effective_min_valid) {
+        return true;
+    }
+    if (!node.long_min_valid) {
+        return false;
+    }
+    node.effective_min_us = node.long_min_us;
+    node.effective_min_time_us = node.long_min_time_us;
+    node.effective_min_valid = true;
+    return true;
+}
+
+static Counter24 UsecToTs24(double usec);
+
+static bool ComputeMinOwdAndOffset(
+    const NodeState& node,
+    double& out_min_owd_us,
+    double& out_offset_us)
+{
+    if (!node.effective_min_valid || !node.peer_min_valid) {
+        return false;
+    }
+    const Counter24 recv_ts24 = UsecToTs24(node.effective_min_us);
+    const Counter24 send_ts24 = UsecToTs24(node.peer_min_us);
+    const Counter23 minOWD_TS23 = (send_ts24 + recv_ts24).ToUnsigned() >> 1;
+    const Counter23 clockDelta_TS23 = (send_ts24 - recv_ts24).ToUnsigned() >> 1;
+    uint32_t min_owd_us = minOWD_TS23.ToUnsigned() << kTime23LostBits;
+    static const uint32_t kSignRolloverThreshold = (1 << 22) << kTime23LostBits;
+    if (min_owd_us >= kSignRolloverThreshold) {
+        min_owd_us = 0;
+    }
+    int32_t signed_delta = (int32_t)clockDelta_TS23.ToUnsigned();
+    if (signed_delta >= (1 << 22)) {
+        signed_delta -= (1 << 23);
+    }
+    out_min_owd_us = (double)min_owd_us;
+    out_offset_us = (double)((int64_t)signed_delta << kTime23LostBits);
+    return true;
+}
+
+static void UpdateAlgoOffset(NodeState& node, uint64_t now_us)
+{
+    double min_owd_us = 0.0;
+    double offset_us = 0.0;
+    if (!ComputeMinOwdAndOffset(node, min_owd_us, offset_us)) {
+        return;
+    }
+    node.algo_offset_us = offset_us;
+    node.algo_offset_time_us = now_us;
+    node.algo_offset_valid = true;
+}
+
+static bool ComputeAlgoOwd(const NodeState& node, Counter24 delta_ts24, double& out_owd_us)
+{
+    double min_owd_us = 0.0;
+    double offset_us = 0.0;
+    if (!ComputeMinOwdAndOffset(node, min_owd_us, offset_us)) {
+        return false;
+    }
+    const Counter24 min_recv_ts24 = UsecToTs24(node.effective_min_us);
+    double relative_us = 0.0;
+    if (delta_ts24 > min_recv_ts24) {
+        const Counter24 rel = delta_ts24 - min_recv_ts24;
+        relative_us = (double)(rel.ToUnsigned() << kTime23LostBits);
+    }
+    out_owd_us = min_owd_us + relative_us;
+    return true;
+}
+
+static Counter24 UsecToTs24(double usec)
+{
+    if (usec <= 0.0) {
+        return Counter24(0);
+    }
+    const uint64_t ticks = (uint64_t)std::llround(usec) >> kTime23LostBits;
+    return Counter24((uint32_t)ticks);
+}
+
+static void MaybeCorruptTs24(
+    const ScenarioConfig& scenario,
+    bool to_b,
+    PCGRandom& rng,
+    Message& msg)
+{
+    if (!scenario.ts24_poison_enabled || !msg.stamped) {
+        return;
+    }
+    const double prob = to_b ? scenario.ts24_poison_prob_ab : scenario.ts24_poison_prob_ba;
+    if (prob <= 0.0 || rng.NextDouble01() >= prob) {
+        return;
+    }
+    const int64_t offset_us = to_b
+        ? scenario.ts24_poison_offset_us_ab
+        : scenario.ts24_poison_offset_us_ba;
+    if (offset_us == 0) {
+        return;
+    }
+    const uint64_t abs_us = (uint64_t)std::llabs(offset_us);
+    const Counter24 delta = UsecToTs24((double)abs_us);
+    msg.ts24 = (offset_us >= 0) ? (msg.ts24 + delta) : (msg.ts24 - delta);
+}
+
+static bool PromoCseGateApplies(const MethodConfig& method)
+{
+    if (!method.promo_use_cse_gate) {
+        return false;
+    }
+    return method.kind == MethodKind::TimeSyncShadow ||
+        method.kind == MethodKind::TimeSyncShadowSkew ||
+        method.kind == MethodKind::TimeSyncNFHS ||
+        method.kind == MethodKind::TimeSyncAdaptiveBins;
+}
+
+static bool AllowPromotionRate(
+    double old_min_us,
+    uint64_t old_time_us,
+    double new_min_us,
+    uint64_t now_us,
+    const MethodConfig& method)
+{
+    if (method.promo_max_ppm <= 0.0) {
+        return true;
+    }
+    if (new_min_us <= old_min_us) {
+        return true;
+    }
+    const uint64_t dt_us = (now_us > old_time_us) ? (now_us - old_time_us) : 0;
+    if (dt_us == 0) {
+        return false;
+    }
+    const double dt_s = (double)dt_us * 1e-6;
+    const double rate_ppm = (new_min_us - old_min_us) / dt_s;
+    const double k = (method.promo_max_k > 0.0) ? method.promo_max_k : 1.0;
+    const double limit_ppm = method.promo_max_ppm * k;
+    return rate_ppm <= limit_ppm;
+}
+
+static void UpdateShadowPromotion(
+    NodeState& node,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool allow_promotion,
+    bool rtt_guard_ok)
+{
+    if (!EnsureEffectiveMin(node)) {
+        return;
+    }
+    if (!node.short_snapshot.valid) {
+        return;
+    }
+    const double p0 = node.short_snapshot.p0;
+    const double p10 = node.short_snapshot.p10;
+    const double iqr = node.short_snapshot.iqr;
+    const size_t count = node.short_snapshot.count;
+    const double jitter = GuardJitter(node, method);
+    const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+    const double iqr_max = std::max(method.gsp_iqr_min_us, method.gsp_iqr_k * jitter);
+    const double gnear = std::max(method.gsp_gnear_min_us, method.gsp_gnear_k * jitter);
+
+    bool stale = (p10 > node.effective_min_us + gb);
+    const bool stable = (iqr <= iqr_max);
+    const bool enough = (count >= method.gsp_npkt_min);
+    const bool no_near = (p0 > node.effective_min_us + gnear);
+    const bool age_ok = (method.gsp_age_ok_us == 0 ||
+        (now_us - node.effective_min_time_us >= method.gsp_age_ok_us));
+
+    if (method.gsp_use_rtt_guard && !rtt_guard_ok) {
+        stale = false;
+    }
+    if (method.gsp_use_xor_gate && !allow_promotion) {
+        stale = false;
+    }
+    if (method.promo_use_cse_gate && !node.cse_gate_ok) {
+        stale = false;
+    }
+    if (stale && !AllowPromotionRate(node.effective_min_us, node.effective_min_time_us, p10, now_us, method)) {
+        stale = false;
+    }
+
+    if (stale && stable && enough && no_near && age_ok) {
+        node.gsp_stale_streak++;
+    } else {
+        node.gsp_stale_streak = 0;
+    }
+
+    if (node.gsp_stale_streak >= std::max(1, method.gsp_n_consec)) {
+        node.effective_min_us = p10;
+        node.effective_min_time_us = now_us;
+        node.effective_min_valid = true;
+        node.gsp_stale_streak = 0;
+        node.gsp_promotions++;
+    }
+}
+
+static void UpdateNfhs(
+    NodeState& node,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool allow_invalidate,
+    bool rtt_guard_ok)
+{
+    if (!EnsureEffectiveMin(node)) {
+        return;
+    }
+    if (!node.short_snapshot.valid) {
+        return;
+    }
+    const double p0 = node.short_snapshot.p0;
+    const double p10 = node.short_snapshot.p10;
+    const double iqr = node.short_snapshot.iqr;
+    const size_t count = node.short_snapshot.count;
+    const double near_ratio = (count > 0) ? ((double)node.short_snapshot.near_hits / (double)count) : 0.0;
+    const double jitter = GuardJitter(node, method);
+    const double iqr_max = std::max(method.nfhs_iqr_min_us, method.nfhs_iqr_k * jitter);
+    const double gnear = std::max(method.nfhs_gnear_min_us, method.nfhs_gnear_k * jitter);
+
+    if (p0 <= node.effective_min_us + gnear) {
+        node.nfhs_last_near_hit_us = now_us;
+    }
+
+    bool stale = (now_us - node.effective_min_time_us >= method.nfhs_age_us) &&
+        (now_us - node.nfhs_last_near_hit_us >= method.nfhs_miss_us) &&
+        (count >= method.nfhs_npkt_min) &&
+        (iqr <= iqr_max);
+
+    if (method.nfhs_use_rtt_guard && !rtt_guard_ok) {
+        stale = false;
+    }
+    if (method.nfhs_use_near_ratio && near_ratio > method.nfhs_near_ratio_max) {
+        stale = false;
+    }
+    if (!allow_invalidate) {
+        stale = false;
+    }
+    if (method.promo_use_cse_gate && !node.cse_gate_ok) {
+        stale = false;
+    }
+    if (stale && !AllowPromotionRate(node.effective_min_us, node.effective_min_time_us, p10, now_us, method)) {
+        stale = false;
+    }
+
+    if (stale) {
+        node.nfhs_stale_streak++;
+    } else {
+        node.nfhs_stale_streak = 0;
+    }
+
+    if (node.nfhs_stale_streak >= std::max(1, method.nfhs_n_consec)) {
+        node.effective_min_us = p10;
+        node.effective_min_time_us = now_us;
+        node.effective_min_valid = true;
+        node.nfhs_stale_streak = 0;
+        node.nfhs_promotions++;
+    }
+}
+
+static void ResetLongBins(LongWindowBins& bins, uint64_t now_us, double seed_us);
+
+static void UpdateAdaptiveBins(
+    NodeState& node,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool allow_shrink,
+    bool rtt_guard_ok)
+{
+    if (!node.long_min_valid || !node.short_snapshot.valid) {
+        return;
+    }
+
+    const double p0 = node.short_snapshot.p0;
+    const double p10 = node.short_snapshot.p10;
+    const double iqr = node.short_snapshot.iqr;
+    const size_t count = node.short_snapshot.count;
+    const double jitter = GuardJitter(node, method);
+    const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+    const double iqr_max = std::max(method.gsp_iqr_min_us, method.gsp_iqr_k * jitter);
+    const double gnear = std::max(method.gsp_gnear_min_us, method.gsp_gnear_k * jitter);
+
+    bool stale = (p10 > node.long_min_us + gb);
+    const bool stable = (iqr <= iqr_max);
+    const bool enough = (count >= method.gsp_npkt_min);
+    const bool no_near = (p0 > node.long_min_us + gnear);
+    const bool age_ok = (method.gsp_age_ok_us == 0 ||
+        (now_us - node.long_min_time_us >= method.gsp_age_ok_us));
+
+    if (method.gsp_use_rtt_guard && !rtt_guard_ok) {
+        stale = false;
+    }
+    if (method.gsp_use_xor_gate && !allow_shrink) {
+        stale = false;
+    }
+    if (method.promo_use_cse_gate && !node.cse_gate_ok) {
+        stale = false;
+    }
+    if (stale && !AllowPromotionRate(node.long_min_us, node.long_min_time_us, p10, now_us, method)) {
+        stale = false;
+    }
+
+    if (stale && stable && enough && no_near && age_ok) {
+        node.adaptive_bins_stale_streak++;
+    } else {
+        node.adaptive_bins_stale_streak = 0;
+    }
+
+    uint64_t max_window = (method.adaptive_bins_max_window_us > 0)
+        ? method.adaptive_bins_max_window_us
+        : node.stats_long_window_us;
+    uint64_t min_window = (method.adaptive_bins_min_window_us > 0)
+        ? method.adaptive_bins_min_window_us
+        : node.stats_short_window_us;
+    if (min_window == 0) {
+        min_window = 1000000;
+    }
+    if (max_window == 0) {
+        max_window = min_window;
+    }
+    const uint64_t hold_us = (method.adaptive_bins_hold_us > 0) ? method.adaptive_bins_hold_us : max_window;
+
+    if (node.adaptive_bins_window_us == 0) {
+        node.adaptive_bins_window_us = max_window;
+    }
+
+    auto set_window = [&](uint64_t window_us, double seed_us) {
+        node.adaptive_bins_window_us = window_us;
+        node.stats_long_window_us = window_us;
+        node.long_bins.Reset(window_us);
+        ResetLongBins(node.long_bins, now_us, seed_us);
+        node.long_min_us = seed_us;
+        node.long_min_time_us = now_us;
+        node.long_min_valid = true;
+        node.effective_min_us = seed_us;
+        node.effective_min_time_us = now_us;
+        node.effective_min_valid = true;
+        node.adaptive_bins_changes++;
+    };
+
+    if (node.adaptive_bins_stale_streak >= std::max(1, method.gsp_n_consec)) {
+        if (node.adaptive_bins_window_us != min_window) {
+            set_window(min_window, p10);
+        }
+        node.adaptive_bins_restore_us = now_us + hold_us;
+        node.adaptive_bins_stale_streak = 0;
+        return;
+    }
+
+    if (node.adaptive_bins_restore_us > 0 && now_us >= node.adaptive_bins_restore_us) {
+        if (node.adaptive_bins_window_us < max_window) {
+            const uint64_t next = std::min(max_window, node.adaptive_bins_window_us * 2);
+            if (next != node.adaptive_bins_window_us) {
+                set_window(next, node.long_min_us);
+            }
+            node.adaptive_bins_restore_us = now_us + hold_us;
+        }
+    }
+}
+
+static void UpdateBlockQuantile(
+    NodeState& node,
+    uint64_t now_us,
+    const MethodConfig& method)
+{
+    double q = method.block_quantile;
+    double qmin = 0.0;
+    uint64_t qtime = 0;
+    uint32_t count = 0;
+    if (!node.long_bins.GetQuantile(now_us, q, qmin, qtime, count)) {
+        return;
+    }
+    size_t valid_bins = 0;
+    const uint64_t now_sec = now_us / node.long_bins.bin_us;
+    for (const auto& b : node.long_bins.bins) {
+        if (!b.valid) {
+            continue;
+        }
+        if (now_sec >= b.sec && (now_sec - b.sec) >= node.long_bins.bins.size()) {
+            continue;
+        }
+        valid_bins++;
+    }
+    if (method.block_min_bins > 0 && valid_bins < method.block_min_bins) {
+        return;
+    }
+    node.effective_min_us = qmin;
+    node.effective_min_time_us = qtime;
+    node.effective_min_valid = true;
+}
+
+static double MedianValue(std::vector<double> values)
+{
+    if (values.empty()) {
+        return 0.0;
+    }
+    const size_t mid = values.size() / 2;
+    std::nth_element(values.begin(), values.begin() + mid, values.end());
+    double med = values[mid];
+    if ((values.size() % 2) == 0) {
+        const double lower = *std::max_element(values.begin(), values.begin() + mid);
+        med = 0.5 * (lower + med);
+    }
+    return med;
+}
+
+static bool EvaluateRttGuard(
+    const ShortStatsSnapshot& ab_short,
+    const ShortStatsSnapshot& ba_short,
+    double ab_long_min,
+    double ba_long_min,
+    double delta_max_us,
+    double iqr_max_us,
+    double& out_rtt_short,
+    double& out_rtt_long,
+    double& out_rtt_iqr,
+    double& out_rtt_delta);
+
+static void UpdateStepGuard(
+    NodeState& node_a,
+    NodeState& node_b,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool rtt_guard_ok)
+{
+    node_a.step_reset_dir = false;
+    node_b.step_reset_dir = false;
+    if (!EnsureEffectiveMin(node_a) || !EnsureEffectiveMin(node_b)) {
+        return;
+    }
+    const bool probe_ready = method.step_use_probe_offset &&
+        MethodUsesProbes(method) &&
+        node_a.estimator.Ready() &&
+        node_b.estimator.Ready();
+    if ((!node_a.short_snapshot.valid || !node_b.short_snapshot.valid) &&
+        !(method.step_probe_only && probe_ready)) {
+        return;
+    }
+
+    double p0_ab = 0.0;
+    double p10_ab = 0.0;
+    double iqr_ab = 0.0;
+    size_t count_ab = 0;
+    double near_ratio_ab = 1.0;
+    double jitter_ab = 0.0;
+    if (node_b.short_snapshot.valid) {
+        p0_ab = node_b.short_snapshot.p0;
+        p10_ab = node_b.short_snapshot.p10;
+        iqr_ab = node_b.short_snapshot.iqr;
+        count_ab = node_b.short_snapshot.count;
+        near_ratio_ab = (count_ab > 0)
+            ? (double)node_b.short_snapshot.near_hits / (double)count_ab
+            : 1.0;
+        jitter_ab = GuardJitter(node_b, method);
+    } else if (method.step_probe_only && probe_ready) {
+        p0_ab = node_b.effective_min_us;
+        p10_ab = node_b.effective_min_us;
+        iqr_ab = 0.0;
+        count_ab = std::max<size_t>(1, method.step_npkt_min);
+        near_ratio_ab = 0.0;
+        jitter_ab = 0.0;
+    }
+
+    double p0_ba = 0.0;
+    double p10_ba = 0.0;
+    double iqr_ba = 0.0;
+    size_t count_ba = 0;
+    double near_ratio_ba = 1.0;
+    double jitter_ba = 0.0;
+    if (node_a.short_snapshot.valid) {
+        p0_ba = node_a.short_snapshot.p0;
+        p10_ba = node_a.short_snapshot.p10;
+        iqr_ba = node_a.short_snapshot.iqr;
+        count_ba = node_a.short_snapshot.count;
+        near_ratio_ba = (count_ba > 0)
+            ? (double)node_a.short_snapshot.near_hits / (double)count_ba
+            : 1.0;
+        jitter_ba = GuardJitter(node_a, method);
+    } else if (method.step_probe_only && probe_ready) {
+        p0_ba = node_a.effective_min_us;
+        p10_ba = node_a.effective_min_us;
+        iqr_ba = 0.0;
+        count_ba = std::max<size_t>(1, method.step_npkt_min);
+        near_ratio_ba = 0.0;
+        jitter_ba = 0.0;
+    }
+
+    const double iqr_max_ab = std::max(method.step_iqr_min_us, method.step_iqr_k * jitter_ab);
+    const double iqr_max_ba = std::max(method.step_iqr_min_us, method.step_iqr_k * jitter_ba);
+    const double gnear_ref_ab = method.step_gnear_use_iqr ? iqr_ab : jitter_ab;
+    const double gnear_ref_ba = method.step_gnear_use_iqr ? iqr_ba : jitter_ba;
+    const double gnear_ab = std::max(method.step_gnear_min_us, method.step_gnear_k * gnear_ref_ab);
+    const double gnear_ba = std::max(method.step_gnear_min_us, method.step_gnear_k * gnear_ref_ba);
+
+    const bool stable = (iqr_ab <= iqr_max_ab) && (iqr_ba <= iqr_max_ba);
+    const bool enough = (count_ab >= method.step_npkt_min) && (count_ba >= method.step_npkt_min);
+    const double nonear_ab = method.step_nonear_use_p10 ? p10_ab : p0_ab;
+    const double nonear_ba = method.step_nonear_use_p10 ? p10_ba : p0_ba;
+    const bool base_no_near = (nonear_ab > node_b.effective_min_us + gnear_ab) &&
+        (nonear_ba > node_a.effective_min_us + gnear_ba);
+    const bool near_ratio_ok = !method.step_use_near_ratio ||
+        (method.step_near_ratio_max > 0.0 &&
+            near_ratio_ab <= method.step_near_ratio_max &&
+            near_ratio_ba <= method.step_near_ratio_max);
+    const bool no_near = method.step_use_near_ratio ? near_ratio_ok : base_no_near;
+    const bool stale_ab = (p10_ab > node_b.effective_min_us + gnear_ab);
+    const bool stale_ba = (p10_ba > node_a.effective_min_us + gnear_ba);
+    const bool xor_ok = (stale_ab != stale_ba);
+    const bool sym_ok = (stale_ab && stale_ba);
+
+    node_a.step_guard_ticks++;
+    node_b.step_guard_ticks++;
+    if (stable) {
+        node_a.step_guard_stable++;
+        node_b.step_guard_stable++;
+    }
+    if (enough) {
+        node_a.step_guard_enough++;
+        node_b.step_guard_enough++;
+    }
+    if (no_near) {
+        node_a.step_guard_nonear++;
+        node_b.step_guard_nonear++;
+    }
+    if (near_ratio_ok) {
+        node_a.step_guard_near_ratio_ok++;
+        node_b.step_guard_near_ratio_ok++;
+    }
+    bool step_rtt_ok = rtt_guard_ok;
+    if (method.step_use_rtt_guard && (method.step_rtt_guard_delta_us > 0.0 || method.step_rtt_guard_iqr_us > 0.0)) {
+        const double delta_us = (method.step_rtt_guard_delta_us > 0.0)
+            ? method.step_rtt_guard_delta_us
+            : method.rtt_guard_delta_us;
+        const double iqr_us = (method.step_rtt_guard_iqr_us > 0.0)
+            ? method.step_rtt_guard_iqr_us
+            : method.rtt_guard_iqr_us;
+        double rtt_short = 0.0;
+        double rtt_long = 0.0;
+        double rtt_iqr = 0.0;
+        double rtt_delta = 0.0;
+        step_rtt_ok = EvaluateRttGuard(
+            node_b.short_snapshot,
+            node_a.short_snapshot,
+            node_b.long_min_us,
+            node_a.long_min_us,
+            delta_us,
+            iqr_us,
+            rtt_short,
+            rtt_long,
+            rtt_iqr,
+            rtt_delta);
+    }
+    if (step_rtt_ok) {
+        node_a.step_guard_rtt_ok++;
+        node_b.step_guard_rtt_ok++;
+    }
+    if (xor_ok) {
+        node_a.step_guard_xor_ok++;
+        node_b.step_guard_xor_ok++;
+    }
+    if (sym_ok) {
+        node_a.step_guard_sym_ok++;
+        node_b.step_guard_sym_ok++;
+    }
+    if (stale_ab) {
+        node_a.step_guard_stale_ab++;
+        node_b.step_guard_stale_ab++;
+    }
+    if (stale_ba) {
+        node_a.step_guard_stale_ba++;
+        node_b.step_guard_stale_ba++;
+    }
+
+    const bool gate_rtt_ok = !method.step_use_rtt_guard || step_rtt_ok;
+    const bool gate_xor_ok = !method.step_use_xor_gate || xor_ok;
+    const bool gate_sym_ok = !method.step_use_sym_gate || sym_ok;
+    const bool hard_probe = method.step_probe_hard && probe_ready;
+    const bool stable_ok = (method.step_probe_relax && probe_ready) ? true : stable;
+    const bool enough_ok = (method.step_probe_relax && probe_ready) ? true : enough;
+    const bool no_near_ok = (method.step_probe_relax_nonear && probe_ready) ? true : no_near;
+    const bool gate_xor_ok_final = hard_probe ? true : gate_xor_ok;
+    const bool gate_sym_ok_final = hard_probe ? true : gate_sym_ok;
+    const bool stable_final = hard_probe ? true : stable_ok;
+    const bool enough_final = hard_probe ? true : enough_ok;
+    const bool no_near_final = hard_probe ? true : no_near_ok;
+
+    if (!(stable_final && enough_final && no_near_final && gate_rtt_ok && gate_xor_ok_final && gate_sym_ok_final)) {
+        node_a.step_streak = 0;
+        node_b.step_streak = 0;
+        return;
+    }
+
+    double offset_fast_a = 0.5 * (p10_ab - p10_ba);
+    double offset_fast_b = -offset_fast_a;
+    if (method.step_use_probe_offset) {
+        if (node_a.estimator.Ready()) {
+            offset_fast_a = node_a.estimator.offset_est;
+            offset_fast_b = -offset_fast_a;
+        }
+        if (node_b.estimator.Ready()) {
+            offset_fast_b = node_b.estimator.offset_est;
+        }
+    }
+    const double offset_pred = node_a.algo_offset_valid ? node_a.algo_offset_us : offset_fast_a;
+    const double innov = offset_fast_a - offset_pred;
+    double threshold = method.step_threshold_us;
+
+    if (method.step_threshold_k > 0.0) {
+        const double iqr_max = std::max(iqr_ab, iqr_ba);
+        const double dyn = method.step_threshold_k * iqr_max;
+        if (dyn > threshold) {
+            threshold = dyn;
+        }
+    }
+
+    const bool innov_gate_ok = (stable && enough) ||
+        (method.step_probe_innov && probe_ready);
+    if (method.step_innov_k > 0.0 && method.step_innov_window_size > 0 && innov_gate_ok) {
+        auto update_window = [&](NodeState& node) {
+            node.step_innov_window.push_back(innov);
+            while (node.step_innov_window.size() > method.step_innov_window_size) {
+                node.step_innov_window.pop_front();
+            }
+        };
+        update_window(node_a);
+        update_window(node_b);
+
+        std::vector<double> vals(node_a.step_innov_window.begin(), node_a.step_innov_window.end());
+        const double med = MedianValue(vals);
+        std::vector<double> devs;
+        devs.reserve(vals.size());
+        for (double v : vals) {
+            devs.push_back(std::fabs(v - med));
+        }
+        const double mad = MedianValue(devs);
+        const double mad_thresh = method.step_innov_k * mad;
+        if (mad_thresh > threshold) {
+            threshold = mad_thresh;
+        }
+    }
+
+    if (std::fabs(innov) >= threshold) {
+        node_a.step_guard_innov_ok++;
+        node_b.step_guard_innov_ok++;
+    }
+    node_a.step_guard_all_ok++;
+    node_b.step_guard_all_ok++;
+
+    if (std::fabs(innov) >= threshold) {
+        node_a.step_streak++;
+    } else {
+        node_a.step_streak = 0;
+    }
+    node_b.step_streak = node_a.step_streak;
+
+    if (node_a.step_streak >= std::max(1, method.step_n_consec)) {
+        bool reset_ab = true;
+        bool reset_ba = true;
+        if (method.step_single_dir_reset) {
+            if (stale_ab != stale_ba) {
+                reset_ab = stale_ab;
+                reset_ba = stale_ba;
+            }
+        }
+        if (reset_ba) {
+            node_a.effective_min_us = p10_ba;
+            node_a.effective_min_time_us = now_us;
+            node_a.effective_min_valid = true;
+        }
+        if (reset_ab) {
+            node_b.effective_min_us = p10_ab;
+            node_b.effective_min_time_us = now_us;
+            node_b.effective_min_valid = true;
+        }
+        node_a.algo_offset_us = offset_fast_a;
+        node_b.algo_offset_us = offset_fast_b;
+        node_a.algo_offset_time_us = now_us;
+        node_b.algo_offset_time_us = now_us;
+        node_a.algo_offset_valid = true;
+        node_b.algo_offset_valid = true;
+        node_a.step_streak = 0;
+        node_b.step_streak = 0;
+        node_a.step_resets++;
+        node_b.step_resets++;
+        node_a.step_reset_dir = reset_ba;
+        node_b.step_reset_dir = reset_ab;
+    }
+}
+
+static void MaybeUpdateShortStats(
+    NodeState& node,
+    DirectionMetrics& dm,
+    uint64_t now_us,
+    double gnear_us)
+{
+    if (node.stats_short_window_us == 0) {
+        return;
+    }
+    if (node.next_short_stats_us == 0) {
+        node.next_short_stats_us = now_us + node.stats_short_window_us;
+        return;
+    }
+    if (now_us < node.next_short_stats_us) {
+        return;
+    }
+    node.next_short_stats_us = now_us + node.stats_short_window_us;
+
+    double min_long = 0.0;
+    uint64_t min_time = 0;
+    uint32_t long_count = 0;
+    if (node.long_bins.GetMin(now_us, min_long, min_time, long_count)) {
+        node.long_min_us = min_long;
+        node.long_min_time_us = min_time;
+        node.long_min_valid = true;
+    } else {
+        node.long_min_valid = false;
+    }
+
+    if (!node.long_min_valid) {
+        node.short_snapshot.valid = false;
+        return;
+    }
+
+    ShortStatsSnapshot snapshot;
+    if (node.short_stats.Compute(now_us, node.long_min_us, gnear_us, snapshot)) {
+        node.short_snapshot = snapshot;
+        if (snapshot.near_hits > 0) {
+            node.quantile_last_near_hit_us = now_us;
+        }
+        if (node.jitter_guard_use_ewma) {
+            const double jitter = std::max(0.0, snapshot.p10 - snapshot.p0);
+            const double alpha = (node.jitter_guard_alpha > 0.0) ? node.jitter_guard_alpha : 0.2;
+            if (!node.jitter_ewma_valid) {
+                node.jitter_ewma_us = jitter;
+                node.jitter_ewma_valid = true;
+            } else {
+                node.jitter_ewma_us = (1.0 - alpha) * node.jitter_ewma_us + alpha * jitter;
+            }
+        }
+        dm.short_p10_us.Add(snapshot.p10);
+        dm.short_iqr_us.Add(snapshot.iqr);
+        dm.short_near_hits.Add((double)snapshot.near_hits);
+    } else {
+        node.short_snapshot.valid = false;
+    }
+}
+
+static void UpdateQuantileSwap(NodeState& node, const MethodConfig& method)
+{
+    if (!node.short_snapshot.valid) {
+        return;
+    }
+    const double jitter = std::max(0.0, node.short_snapshot.p10 - node.short_snapshot.p0);
+    const double iqr = node.short_snapshot.iqr;
+    const bool enter = (jitter >= method.quantile_swap_jitter_enter_us) ||
+        (iqr >= method.quantile_swap_iqr_enter_us);
+    const bool exit = (jitter <= method.quantile_swap_jitter_exit_us) &&
+        (iqr <= method.quantile_swap_iqr_exit_us);
+
+    if (!node.quantile_swap_high && enter) {
+        node.quantile_swap_high = true;
+    } else if (node.quantile_swap_high && exit) {
+        node.quantile_swap_high = false;
+    }
+
+    double q = node.quantile_swap_high ? method.quantile_swap_high : method.quantile_swap_low;
+    if (q < 0.0) {
+        q = 0.0;
+    } else if (q > 1.0) {
+        q = 1.0;
+    }
+    node.timesync.SetMinQuantile(q);
+    node.timesync_short.SetMinQuantile(q);
+}
+
+static void UpdateQuantileAdaptive(NodeState& node, const MethodConfig& method, uint64_t now_us)
+{
+    if (!node.short_snapshot.valid) {
+        return;
+    }
+    if (method.quantile_adapt_min_samples > 0 &&
+        node.short_snapshot.count < method.quantile_adapt_min_samples) {
+        return;
+    }
+    const double iqr = node.short_snapshot.iqr;
+    double q = method.quantile_adapt_mid;
+    if (iqr <= method.quantile_adapt_iqr_low_us) {
+        q = method.quantile_adapt_low;
+    } else if (iqr >= method.quantile_adapt_iqr_high_us) {
+        q = method.quantile_adapt_high;
+    }
+    if (q < 0.0) {
+        q = 0.0;
+    } else if (q > 1.0) {
+        q = 1.0;
+    }
+    const uint64_t hold_us = method.quantile_adapt_hold_us;
+    if (node.quantile_adapt_last_q < 0.0) {
+        node.quantile_adapt_last_q = q;
+        node.quantile_adapt_hold_until_us = now_us + hold_us;
+    } else if (hold_us > 0 && now_us < node.quantile_adapt_hold_until_us) {
+        q = node.quantile_adapt_last_q;
+    } else if (q != node.quantile_adapt_last_q) {
+        node.quantile_adapt_last_q = q;
+        node.quantile_adapt_hold_until_us = now_us + hold_us;
+    }
+    node.timesync.SetMinQuantile(q);
+    node.timesync_short.SetMinQuantile(q);
+}
+
+static void UpdateQuantileNearHit(NodeState& node, const MethodConfig& method)
+{
+    if (!node.short_snapshot.valid) {
+        return;
+    }
+    if (node.short_snapshot.count < method.quantile_near_min_samples) {
+        return;
+    }
+    const double count = (node.short_snapshot.count > 0) ?
+        (double)node.short_snapshot.count : 1.0;
+    const double ratio = (double)node.short_snapshot.near_hits / count;
+    const bool enter = ratio <= method.quantile_near_enter_ratio;
+    const bool exit = ratio >= method.quantile_near_exit_ratio;
+
+    if (!node.quantile_near_high && enter) {
+        node.quantile_near_high = true;
+    } else if (node.quantile_near_high && exit) {
+        node.quantile_near_high = false;
+    }
+
+    double q = node.quantile_near_high ? method.quantile_near_high : method.quantile_near_low;
+    if (q < 0.0) {
+        q = 0.0;
+    } else if (q > 1.0) {
+        q = 1.0;
+    }
+    node.timesync.SetMinQuantile(q);
+    node.timesync_short.SetMinQuantile(q);
+}
+
+static void ResetQuantileState(NodeState& node, const MethodConfig& method)
+{
+    node.timesync.Reset();
+    node.timesync.SetMinQuantile(method.timesync_quantile);
+    const uint64_t window_us = (method.window_us > 0) ? method.window_us : 2000000ULL;
+    node.timesync.SetDriftWindowUsec(window_us);
+    if (method.quantile_use_short_high) {
+        node.timesync_short.Reset();
+        node.timesync_short.SetMinQuantile(method.quantile_short);
+        node.timesync_short.SetDriftWindowUsec(window_us);
+    }
+    node.ts_offset_valid = false;
+    node.last_timesync_offset_valid = false;
+}
+
+static void StartQuantileHold(NodeState& node, const MethodConfig& method, uint64_t now_us, bool use_short)
+{
+    if (method.quantile_flip_hold_us == 0) {
+        return;
+    }
+    node.quantile_hold_until_us = now_us + method.quantile_flip_hold_us;
+    node.quantile_hold_use_short = use_short;
+    node.quantile_hold_q = method.quantile_short;
+    if (!use_short) {
+        node.timesync.SetMinQuantile(node.quantile_hold_q);
+        if (method.quantile_use_short_high) {
+            node.timesync_short.SetMinQuantile(method.quantile_short);
+        }
+    }
+}
+
+static void UpdateQuantileHold(NodeState& node, const MethodConfig& method, uint64_t now_us)
+{
+    if (node.quantile_hold_until_us == 0) {
+        return;
+    }
+    if (now_us >= node.quantile_hold_until_us) {
+        node.quantile_hold_until_us = 0;
+        node.quantile_hold_use_short = false;
+        node.timesync.SetMinQuantile(method.timesync_quantile);
+        if (method.quantile_use_short_high) {
+            node.timesync_short.SetMinQuantile(method.quantile_short);
+        }
+    }
+}
+
+static bool DetectQuantileCseFlip(NodeState& node, const MethodConfig& method)
+{
+    if (!node.cse_skew_valid) {
+        return false;
+    }
+    const double skew = node.cse_skew_ppm;
+    if (std::fabs(skew) < method.quantile_flip_min_ppm) {
+        return false;
+    }
+    const int sign = (skew > 0.0) ? 1 : -1;
+    if (node.quantile_cse_sign == 0) {
+        node.quantile_cse_sign = sign;
+        return false;
+    }
+    if (sign != node.quantile_cse_sign) {
+        node.quantile_flip_streak++;
+    } else {
+        node.quantile_flip_streak = 0;
+    }
+    if (node.quantile_flip_streak >= std::max(1, method.quantile_flip_n_consec)) {
+        node.quantile_cse_sign = sign;
+        node.quantile_flip_streak = 0;
+        return true;
+    }
+    return false;
+}
+
+static bool DetectQuantileOffsetFlip(NodeState& node, const MethodConfig& method, uint64_t now_us)
+{
+    if (!node.ts_offset_valid) {
+        return false;
+    }
+    if (!node.quantile_prev_offset_valid) {
+        node.quantile_prev_offset_us = node.ts_offset_us;
+        node.quantile_prev_offset_time_us = now_us;
+        node.quantile_prev_offset_valid = true;
+        return false;
+    }
+    const uint64_t dt_us = (now_us > node.quantile_prev_offset_time_us)
+        ? (now_us - node.quantile_prev_offset_time_us)
+        : 0;
+    if (dt_us == 0) {
+        return false;
+    }
+    const double dt_s = (double)dt_us / 1000000.0;
+    const double slope = (node.ts_offset_us - node.quantile_prev_offset_us) / dt_s;
+    node.quantile_prev_offset_us = node.ts_offset_us;
+    node.quantile_prev_offset_time_us = now_us;
+    const double min_slope = method.quantile_offset_slope_min_us_s;
+    if (std::fabs(slope) < min_slope) {
+        return false;
+    }
+    const int sign = (slope > 0.0) ? 1 : -1;
+    if (node.quantile_offset_sign == 0) {
+        node.quantile_offset_sign = sign;
+        return false;
+    }
+    if (sign != node.quantile_offset_sign) {
+        node.quantile_offset_streak++;
+    } else {
+        node.quantile_offset_streak = 0;
+    }
+    if (node.quantile_offset_streak >= std::max(1, method.quantile_flip_n_consec)) {
+        node.quantile_offset_sign = sign;
+        node.quantile_offset_streak = 0;
+        return true;
+    }
+    return false;
+}
+
+static double PolicySkewPpm(const NodeState& node, const MethodConfig& method, bool& valid);
+
+static bool DetectQuantileNearStale(NodeState& node, const MethodConfig& method, uint64_t now_us)
+{
+    if (!node.short_snapshot.valid) {
+        return false;
+    }
+    if (method.quantile_near_cooldown_us > 0 &&
+        node.quantile_near_cooldown_until_us > 0 &&
+        now_us < node.quantile_near_cooldown_until_us) {
+        return false;
+    }
+    const double jitter = GuardJitter(node, method);
+    const double iqr_max = std::max(method.gsp_iqr_min_us, method.gsp_iqr_k * jitter);
+    const bool stable = node.short_snapshot.iqr <= iqr_max;
+    const bool enough = node.short_snapshot.count >= method.gsp_npkt_min;
+    bool no_near = node.short_snapshot.near_hits == 0;
+    if (method.quantile_near_stale_hold_us > 0) {
+        if (node.quantile_last_near_hit_us == 0) {
+            no_near = false;
+        } else {
+            const uint64_t since_hit = (now_us > node.quantile_last_near_hit_us)
+                ? (now_us - node.quantile_last_near_hit_us)
+                : 0;
+            if (since_hit < method.quantile_near_stale_hold_us) {
+                no_near = false;
+            }
+        }
+    }
+    if (stable && enough && no_near) {
+        node.quantile_near_stale_streak++;
+    } else {
+        node.quantile_near_stale_streak = 0;
+    }
+    if (node.quantile_near_stale_streak > 0 && node.long_min_valid) {
+        if (!AllowPromotionRate(node.long_min_us, node.long_min_time_us, node.short_snapshot.p10, now_us, method)) {
+            node.quantile_near_stale_streak = 0;
+        }
+    }
+    if (method.quantile_use_cse_gate && !node.cse_gate_ok) {
+        node.quantile_near_stale_streak = 0;
+    }
+    if (method.quantile_use_policy_skew_gate) {
+        bool skew_valid = false;
+        const double skew_ppm = PolicySkewPpm(node, method, skew_valid);
+        const double min_ppm = (method.quantile_policy_skew_min_ppm > 0.0)
+            ? method.quantile_policy_skew_min_ppm
+            : method.policy_skew_min_ppm;
+        if (!skew_valid || (min_ppm > 0.0 && std::fabs(skew_ppm) < min_ppm)) {
+            node.quantile_near_stale_streak = 0;
+        }
+    }
+    return node.quantile_near_stale_streak >= std::max(1, method.quantile_near_stale_n_consec);
+}
+
+static void ApplyQuantileFlipAction(NodeState& node, const MethodConfig& method, uint64_t now_us)
+{
+    if (method.quantile_flip_reset) {
+        ResetQuantileState(node, method);
+    }
+    if (method.quantile_flip_shrink && method.quantile_flip_window_us > 0) {
+        node.drift_window_us = method.quantile_flip_window_us;
+        node.timesync.SetDriftWindowUsec(node.drift_window_us);
+        node.drift_window_restore_us = now_us + method.quantile_flip_hold_us;
+    }
+    if (method.quantile_flip_hold) {
+        StartQuantileHold(node, method, now_us, false);
+    }
+    if (method.quantile_flip_use_short) {
+        StartQuantileHold(node, method, now_us, true);
+    }
+    if (method.quantile_near_cooldown_us > 0) {
+        node.quantile_near_cooldown_until_us = now_us + method.quantile_near_cooldown_us;
+    }
+    if (method.kind == MethodKind::TimeSyncPolicy &&
+        method.policy_force_multi_on_shrink &&
+        method.policy_force_multi_hold_us > 0) {
+        node.policy_mode = 0;
+        node.policy_pending_mode = 0;
+        node.policy_hold_until_us = now_us + method.policy_force_multi_hold_us;
+    }
+}
+
+static bool EvaluateRttGuard(
+    const ShortStatsSnapshot& ab_short,
+    const ShortStatsSnapshot& ba_short,
+    double ab_long_min,
+    double ba_long_min,
+    double delta_max_us,
+    double iqr_max_us,
+    double& out_rtt_short,
+    double& out_rtt_long,
+    double& out_rtt_iqr,
+    double& out_rtt_delta)
+{
+    if (!ab_short.valid || !ba_short.valid) {
+        return false;
+    }
+    out_rtt_short = ab_short.p10 + ba_short.p10;
+    out_rtt_long = ab_long_min + ba_long_min;
+    out_rtt_iqr = ab_short.iqr + ba_short.iqr;
+    out_rtt_delta = out_rtt_short - out_rtt_long;
+    if (delta_max_us <= 0.0 || iqr_max_us <= 0.0) {
+        return true;
+    }
+    return (std::fabs(out_rtt_delta) <= delta_max_us && out_rtt_iqr <= iqr_max_us);
+}
+
+static bool SlopedGateStable(const NodeState& node, const MethodConfig& method)
+{
+    if (method.sloped_gate_iqr_us <= 0.0 && method.sloped_gate_min_samples == 0) {
+        return true;
+    }
+    if (!node.short_snapshot.valid) {
+        return false;
+    }
+    if (method.sloped_gate_min_samples > 0 &&
+        node.short_snapshot.count < method.sloped_gate_min_samples) {
+        return false;
+    }
+    if (method.sloped_gate_iqr_us > 0.0 &&
+        node.short_snapshot.iqr > method.sloped_gate_iqr_us) {
+        return false;
+    }
+    return true;
+}
+
+static void PushSlopedSample(NodeState& node, uint64_t now_us, double min_delta_us, uint64_t max_window_us)
+{
+    SlopedSample sample;
+    sample.t_us = now_us;
+    sample.delta_us = min_delta_us;
+    node.sloped_samples.push_back(sample);
+    const uint64_t cutoff = (now_us > max_window_us) ? (now_us - max_window_us) : 0;
+    while (!node.sloped_samples.empty() && node.sloped_samples.front().t_us < cutoff) {
+        node.sloped_samples.pop_front();
+    }
+}
+
+static bool ComputeSlopedSkewWindow(
+    const std::deque<SlopedSample>& samples,
+    uint64_t now_us,
+    uint64_t window_us,
+    size_t min_samples,
+    double clamp_ppm,
+    double& out_skew_ppm)
+{
+    if (window_us == 0 || samples.empty()) {
+        return false;
+    }
+    const uint64_t cutoff = (now_us > window_us) ? (now_us - window_us) : 0;
+    bool have = false;
+    double t0 = 0.0;
+    double sum_t = 0.0;
+    double sum_d = 0.0;
+    double sum_tt = 0.0;
+    double sum_td = 0.0;
+    size_t count = 0;
+    for (const auto& s : samples) {
+        if (s.t_us < cutoff) {
+            continue;
+        }
+        if (!have) {
+            t0 = (double)s.t_us;
+            have = true;
+        }
+        const double t = ((double)s.t_us - t0) * 1e-6;
+        const double d = s.delta_us;
+        sum_t += t;
+        sum_d += d;
+        sum_tt += t * t;
+        sum_td += t * d;
+        ++count;
+    }
+    if (count < min_samples) {
+        return false;
+    }
+    const double n = (double)count;
+    const double denom = n * sum_tt - sum_t * sum_t;
+    if (std::fabs(denom) < 1e-9) {
+        return false;
+    }
+    const double slope = (n * sum_td - sum_t * sum_d) / denom; // us per second ~= ppm
+    double skew_ppm = slope;
+    if (clamp_ppm > 0.0) {
+        skew_ppm = std::max(-clamp_ppm, std::min(clamp_ppm, skew_ppm));
+    }
+    out_skew_ppm = skew_ppm;
+    return true;
+}
+
+static void UpdateSlopedSkewFromMethod(
+    NodeState& node,
+    const MethodConfig& method,
+    uint64_t now_us,
+    double min_delta_us)
+{
+    const uint64_t base_window_us = (method.sloped_window_us > 0)
+        ? method.sloped_window_us
+        : 5000000ULL;
+    const size_t min_samples = (method.sloped_min_samples > 0)
+        ? method.sloped_min_samples
+        : 5;
+    const double clamp_ppm = (method.sloped_clamp_ppm > 0.0)
+        ? method.sloped_clamp_ppm
+        : 200.0;
+
+    uint64_t window_us = base_window_us;
+    uint64_t max_window_us = base_window_us;
+    if (method.sloped_window_max_us > max_window_us) {
+        max_window_us = method.sloped_window_max_us;
+    }
+    if (method.sloped_window_min_us > max_window_us) {
+        max_window_us = method.sloped_window_min_us;
+    }
+    if (method.sloped_blend_fast_us > max_window_us) {
+        max_window_us = method.sloped_blend_fast_us;
+    }
+    if (method.sloped_blend_slow_us > max_window_us) {
+        max_window_us = method.sloped_blend_slow_us;
+    }
+
+    const bool stable = SlopedGateStable(node, method);
+    if (method.sloped_window_adaptive_grow) {
+        const uint64_t min_window = (method.sloped_window_min_us > 0)
+            ? method.sloped_window_min_us
+            : base_window_us;
+        const uint64_t max_window = (method.sloped_window_max_us > 0)
+            ? method.sloped_window_max_us
+            : base_window_us;
+        const uint64_t step_us = (method.sloped_window_step_us > 0)
+            ? method.sloped_window_step_us
+            : 1000000ULL;
+        if (node.sloped_window_us_current == 0) {
+            node.sloped_window_us_current = min_window;
+        }
+        if (stable && node.sloped_window_us_current < max_window) {
+            node.sloped_window_us_current =
+                std::min(max_window, node.sloped_window_us_current + step_us);
+        } else if (method.sloped_window_adaptive_shrink && !stable) {
+            node.sloped_window_us_current = min_window;
+        }
+        window_us = node.sloped_window_us_current;
+        if (max_window > max_window_us) {
+            max_window_us = max_window;
+        }
+    }
+
+    if (max_window_us == 0) {
+        max_window_us = window_us;
+    }
+
+    PushSlopedSample(node, now_us, min_delta_us, max_window_us);
+
+    const bool gate_enabled = (method.sloped_gate_iqr_us > 0.0) ||
+        (method.sloped_gate_min_samples > 0);
+    if (gate_enabled && !stable) {
+        return;
+    }
+
+    double skew_ppm = 0.0;
+    bool skew_valid = false;
+    if (method.sloped_blend_fast_us > 0 &&
+        method.sloped_blend_slow_us > 0 &&
+        method.sloped_blend_alpha > 0.0) {
+        double fast_ppm = 0.0;
+        double slow_ppm = 0.0;
+        const bool ok_fast = ComputeSlopedSkewWindow(
+            node.sloped_samples, now_us, method.sloped_blend_fast_us,
+            min_samples, clamp_ppm, fast_ppm);
+        const bool ok_slow = ComputeSlopedSkewWindow(
+            node.sloped_samples, now_us, method.sloped_blend_slow_us,
+            min_samples, clamp_ppm, slow_ppm);
+        if (ok_fast && ok_slow) {
+            const double alpha = std::min(1.0, std::max(0.0, method.sloped_blend_alpha));
+            skew_ppm = alpha * fast_ppm + (1.0 - alpha) * slow_ppm;
+            skew_valid = true;
+        } else if (ok_slow) {
+            skew_ppm = slow_ppm;
+            skew_valid = true;
+        } else if (ok_fast) {
+            skew_ppm = fast_ppm;
+            skew_valid = true;
+        }
+    } else {
+        skew_valid = ComputeSlopedSkewWindow(
+            node.sloped_samples, now_us, window_us, min_samples, clamp_ppm, skew_ppm);
+    }
+
+    if (skew_valid) {
+        node.sloped_skew_ppm = skew_ppm;
+        node.sloped_skew_valid = true;
+    } else {
+        node.sloped_skew_valid = false;
+    }
+}
+
+static void UpdateSampleWindow(
+    std::deque<SlopedSample>& samples,
+    uint64_t now_us,
+    double value_us,
+    uint64_t window_us)
+{
+    SlopedSample sample;
+    sample.t_us = now_us;
+    sample.delta_us = value_us;
+    samples.push_back(sample);
+    if (window_us == 0) {
+        return;
+    }
+    const uint64_t cutoff = (now_us > window_us) ? (now_us - window_us) : 0;
+    while (!samples.empty() && samples.front().t_us < cutoff) {
+        samples.pop_front();
+    }
+}
+
+static bool ComputeRegressionPrediction(
+    const std::deque<SlopedSample>& samples,
+    uint64_t now_us,
+    size_t min_samples,
+    double clamp_ppm,
+    double& out_pred_us)
+{
+    if (samples.size() < min_samples || samples.empty()) {
+        return false;
+    }
+    const double t0 = (double)samples.front().t_us;
+    double sum_t = 0.0;
+    double sum_d = 0.0;
+    double sum_tt = 0.0;
+    double sum_td = 0.0;
+    for (const auto& s : samples) {
+        const double t = ((double)s.t_us - t0) * 1e-6;
+        const double d = s.delta_us;
+        sum_t += t;
+        sum_d += d;
+        sum_tt += t * t;
+        sum_td += t * d;
+    }
+    const double n = (double)samples.size();
+    const double denom = n * sum_tt - sum_t * sum_t;
+    if (std::fabs(denom) < 1e-9) {
+        return false;
+    }
+    double slope = (n * sum_td - sum_t * sum_d) / denom;
+    if (clamp_ppm > 0.0) {
+        slope = std::max(-clamp_ppm, std::min(clamp_ppm, slope));
+    }
+    const double t_curr = ((double)now_us - t0) * 1e-6;
+    const double intercept = (sum_d - slope * sum_t) / n;
+    out_pred_us = intercept + slope * t_curr;
+    if (out_pred_us < 0.0) {
+        out_pred_us = 0.0;
+    }
+    return true;
+}
+
+static bool ComputeHuberPrediction(
+    const std::deque<SlopedSample>& samples,
+    uint64_t now_us,
+    size_t min_samples,
+    double clamp_ppm,
+    double huber_k,
+    double& out_pred_us)
+{
+    if (samples.size() < min_samples || samples.empty()) {
+        return false;
+    }
+    // Initial OLS fit.
+    double initial_pred = 0.0;
+    if (!ComputeRegressionPrediction(samples, now_us, min_samples, clamp_ppm, initial_pred)) {
+        return false;
+    }
+    const double t0 = (double)samples.front().t_us;
+    // Recompute slope/intercept for residuals.
+    double sum_t = 0.0;
+    double sum_d = 0.0;
+    double sum_tt = 0.0;
+    double sum_td = 0.0;
+    for (const auto& s : samples) {
+        const double t = ((double)s.t_us - t0) * 1e-6;
+        sum_t += t;
+        sum_d += s.delta_us;
+        sum_tt += t * t;
+        sum_td += t * s.delta_us;
+    }
+    const double n = (double)samples.size();
+    const double denom = n * sum_tt - sum_t * sum_t;
+    if (std::fabs(denom) < 1e-9) {
+        return false;
+    }
+    double slope = (n * sum_td - sum_t * sum_d) / denom;
+    if (clamp_ppm > 0.0) {
+        slope = std::max(-clamp_ppm, std::min(clamp_ppm, slope));
+    }
+    const double intercept = (sum_d - slope * sum_t) / n;
+
+    std::vector<double> residuals;
+    residuals.reserve(samples.size());
+    for (const auto& s : samples) {
+        const double t = ((double)s.t_us - t0) * 1e-6;
+        const double pred = intercept + slope * t;
+        residuals.push_back(s.delta_us - pred);
+    }
+    std::vector<double> abs_res;
+    abs_res.reserve(residuals.size());
+    for (double r : residuals) {
+        abs_res.push_back(std::fabs(r));
+    }
+    const double mad = MedianOfVector(abs_res);
+    const double sigma = 1.4826 * mad;
+    if (sigma <= 1e-6) {
+        out_pred_us = initial_pred;
+        return true;
+    }
+    const double k = (huber_k > 0.0) ? huber_k : 1.5;
+
+    double sum_w = 0.0;
+    double sum_wt = 0.0;
+    double sum_wd = 0.0;
+    double sum_wtt = 0.0;
+    double sum_wtd = 0.0;
+    for (size_t i = 0; i < samples.size(); ++i) {
+        const auto& s = samples[i];
+        const double t = ((double)s.t_us - t0) * 1e-6;
+        const double r = residuals[i];
+        const double abs_r = std::fabs(r);
+        double w = 1.0;
+        if (abs_r > k * sigma) {
+            w = (k * sigma) / abs_r;
+        }
+        sum_w += w;
+        sum_wt += w * t;
+        sum_wd += w * s.delta_us;
+        sum_wtt += w * t * t;
+        sum_wtd += w * t * s.delta_us;
+    }
+    const double denom_w = sum_w * sum_wtt - sum_wt * sum_wt;
+    if (std::fabs(denom_w) < 1e-9) {
+        return false;
+    }
+    double slope_w = (sum_w * sum_wtd - sum_wt * sum_wd) / denom_w;
+    if (clamp_ppm > 0.0) {
+        slope_w = std::max(-clamp_ppm, std::min(clamp_ppm, slope_w));
+    }
+    const double intercept_w = (sum_wd - slope_w * sum_wt) / sum_w;
+    const double t_curr = ((double)now_us - t0) * 1e-6;
+    out_pred_us = intercept_w + slope_w * t_curr;
+    if (out_pred_us < 0.0) {
+        out_pred_us = 0.0;
+    }
+    return true;
+}
+
+static bool ComputeTheilSenPrediction(
+    const std::deque<SlopedSample>& samples,
+    uint64_t now_us,
+    size_t min_samples,
+    double clamp_ppm,
+    double& out_pred_us)
+{
+    if (samples.size() < min_samples || samples.size() < 2) {
+        return false;
+    }
+    std::vector<double> slopes;
+    slopes.reserve(samples.size() * (samples.size() - 1) / 2);
+    for (size_t i = 0; i + 1 < samples.size(); ++i) {
+        for (size_t j = i + 1; j < samples.size(); ++j) {
+            const uint64_t dt_us = samples[j].t_us - samples[i].t_us;
+            if (dt_us == 0) {
+                continue;
+            }
+            const double slope_ppm = (samples[j].delta_us - samples[i].delta_us) * 1e6 / (double)dt_us;
+            slopes.push_back(slope_ppm);
+        }
+    }
+    if (slopes.empty()) {
+        return false;
+    }
+    double slope = MedianOfVector(slopes);
+    if (clamp_ppm > 0.0) {
+        slope = std::max(-clamp_ppm, std::min(clamp_ppm, slope));
+    }
+
+    const double t0 = (double)samples.front().t_us;
+    std::vector<double> intercepts;
+    intercepts.reserve(samples.size());
+    for (const auto& s : samples) {
+        const double t = ((double)s.t_us - t0) * 1e-6;
+        intercepts.push_back(s.delta_us - slope * t);
+    }
+    const double intercept = MedianOfVector(intercepts);
+    const double t_curr = ((double)now_us - t0) * 1e-6;
+    out_pred_us = intercept + slope * t_curr;
+    if (out_pred_us < 0.0) {
+        out_pred_us = 0.0;
+    }
+    return true;
+}
+
+static bool ComputeTheilSenSlope(
+    const std::deque<SlopedSample>& samples,
+    size_t min_samples,
+    double clamp_ppm,
+    double& out_slope_ppm)
+{
+    if (samples.size() < min_samples || samples.size() < 2) {
+        return false;
+    }
+    std::vector<double> slopes;
+    slopes.reserve(samples.size() * (samples.size() - 1) / 2);
+    for (size_t i = 0; i + 1 < samples.size(); ++i) {
+        for (size_t j = i + 1; j < samples.size(); ++j) {
+            const uint64_t dt_us = samples[j].t_us - samples[i].t_us;
+            if (dt_us == 0) {
+                continue;
+            }
+            const double slope_ppm = (samples[j].delta_us - samples[i].delta_us) * 1e6 / (double)dt_us;
+            slopes.push_back(slope_ppm);
+        }
+    }
+    if (slopes.empty()) {
+        return false;
+    }
+    double slope = MedianOfVector(slopes);
+    if (clamp_ppm > 0.0) {
+        slope = std::max(-clamp_ppm, std::min(clamp_ppm, slope));
+    }
+    out_slope_ppm = slope;
+    return true;
+}
+
+static bool ComputeTheilSenOffset(
+    const std::deque<OffsetSample>& samples,
+    uint64_t now_us,
+    double& out_offset_us,
+    double& out_skew_ppm)
+{
+    if (samples.size() < 2) {
+        return false;
+    }
+    std::vector<double> slopes;
+    slopes.reserve(samples.size() * (samples.size() - 1) / 2);
+    const double t0 = (double)samples.front().t_us;
+    for (size_t i = 0; i + 1 < samples.size(); ++i) {
+        const double ti = ((double)samples[i].t_us - t0) * 1e-6;
+        for (size_t j = i + 1; j < samples.size(); ++j) {
+            const double tj = ((double)samples[j].t_us - t0) * 1e-6;
+            const double dt = tj - ti;
+            if (dt <= 1e-9) {
+                continue;
+            }
+            const double slope = (samples[j].offset_us - samples[i].offset_us) / dt;
+            slopes.push_back(slope);
+        }
+    }
+    if (slopes.empty()) {
+        return false;
+    }
+    const double slope = MedianOfVector(slopes);
+    std::vector<double> intercepts;
+    intercepts.reserve(samples.size());
+    for (const auto& s : samples) {
+        const double t = ((double)s.t_us - t0) * 1e-6;
+        intercepts.push_back(s.offset_us - slope * t);
+    }
+    const double intercept = MedianOfVector(intercepts);
+    const double t_curr = ((double)now_us - t0) * 1e-6;
+    out_offset_us = intercept + slope * t_curr;
+    out_skew_ppm = slope;
+    return true;
+}
+
+static bool GetWindowMinFromBins(
+    const LongWindowBins& bins,
+    uint64_t now_us,
+    uint64_t window_us,
+    double& out_min_us,
+    uint64_t& out_time_us)
+{
+    if (bins.bins.empty()) {
+        return false;
+    }
+    const uint64_t max_window = (bins.window_us > 0) ? bins.window_us : bins.bin_us;
+    const uint64_t window = (window_us > 0) ? std::min(window_us, max_window) : max_window;
+    bool found = false;
+    double min_value = 0.0;
+    uint64_t min_time = 0;
+    for (const auto& b : bins.bins) {
+        if (!b.valid) {
+            continue;
+        }
+        if (now_us > b.min_time_us && (now_us - b.min_time_us) > window) {
+            continue;
+        }
+        if (!found || b.min_us < min_value) {
+            found = true;
+            min_value = b.min_us;
+            min_time = b.min_time_us;
+        }
+    }
+    if (!found) {
+        return false;
+    }
+    out_min_us = min_value;
+    out_time_us = min_time;
+    return true;
+}
+
+static bool GetWindowMinFromSamples(
+    const std::deque<SlopedSample>& samples,
+    uint64_t now_us,
+    uint64_t window_us,
+    double& out_min_us)
+{
+    if (samples.empty()) {
+        return false;
+    }
+    bool found = false;
+    double min_value = 0.0;
+    for (const auto& s : samples) {
+        if (window_us > 0 && now_us > s.t_us && (now_us - s.t_us) > window_us) {
+            continue;
+        }
+        if (!found || s.delta_us < min_value) {
+            found = true;
+            min_value = s.delta_us;
+        }
+    }
+    if (!found) {
+        return false;
+    }
+    out_min_us = min_value;
+    return true;
+}
+
+static bool ComputeConsensusSlope(
+    const std::deque<SlopeSample>& samples,
+    double bin_ppm,
+    double max_ppm,
+    double& out_slope_ppm)
+{
+    if (samples.size() < 2) {
+        return false;
+    }
+    const double max_ppm_use = (max_ppm > 0.0) ? max_ppm : 500.0;
+    const double bin_use = (bin_ppm > 0.0) ? bin_ppm : 2.0;
+    const int bins = (int)std::floor((2.0 * max_ppm_use) / bin_use) + 1;
+    if (bins <= 0) {
+        return false;
+    }
+
+    std::vector<uint32_t> hist((size_t)bins, 0);
+    std::vector<double> slopes;
+    slopes.reserve(samples.size() * (samples.size() - 1) / 2);
+
+    for (size_t i = 0; i + 1 < samples.size(); ++i) {
+        for (size_t j = i + 1; j < samples.size(); ++j) {
+            const uint64_t dt_us = samples[j].t_us - samples[i].t_us;
+            if (dt_us == 0) {
+                continue;
+            }
+            const double slope_ppm = (samples[j].value_us - samples[i].value_us) * 1e6 / (double)dt_us;
+            if (slope_ppm < -max_ppm_use || slope_ppm > max_ppm_use) {
+                continue;
+            }
+            const int idx = std::min(std::max(0, (int)std::floor((slope_ppm + max_ppm_use) / bin_use)), bins - 1);
+            hist[(size_t)idx]++;
+            slopes.push_back(slope_ppm);
+        }
+    }
+
+    if (slopes.empty()) {
+        return false;
+    }
+
+    int best_idx = 0;
+    for (int i = 1; i < bins; ++i) {
+        if (hist[(size_t)i] > hist[(size_t)best_idx]) {
+            best_idx = i;
+        }
+    }
+
+    double sum = 0.0;
+    size_t count = 0;
+    for (double slope_ppm : slopes) {
+        const int idx = std::min(std::max(0, (int)std::floor((slope_ppm + max_ppm_use) / bin_use)), bins - 1);
+        if (idx == best_idx) {
+            sum += slope_ppm;
+            count++;
+        }
+    }
+    if (count == 0) {
+        return false;
+    }
+    out_slope_ppm = sum / (double)count;
+    return true;
+}
+
+static void UpdateConsensusCandidates(
+    NodeState& node,
+    uint64_t now_us,
+    double delta_us,
+    const MethodConfig& method)
+{
+    if (!node.long_min_valid) {
+        return;
+    }
+    double baseline = node.long_min_us;
+    if (node.short_snapshot.valid) {
+        if (method.consensus_use_short_baseline) {
+            baseline = std::max(baseline, node.short_snapshot.p10);
+        } else {
+            baseline = std::max(baseline, node.short_snapshot.p0);
+        }
+    }
+    const double frac = (method.consensus_candidate_frac > 0.0) ? method.consensus_candidate_frac : 0.10;
+    const double floor_us = (method.consensus_candidate_floor_us > 0.0) ? method.consensus_candidate_floor_us : 25.0;
+    const double threshold = baseline + std::max(floor_us, frac * baseline);
+    if (delta_us <= threshold) {
+        SlopeSample s;
+        s.t_us = now_us;
+        s.value_us = delta_us;
+        node.consensus_samples.push_back(s);
+    }
+    const size_t max_samples = (method.consensus_buffer_size > 0) ? method.consensus_buffer_size : 64;
+    while (node.consensus_samples.size() > max_samples) {
+        node.consensus_samples.pop_front();
+    }
+}
+
+static void UpdateConsensusEstimate(
+    NodeState& node,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool rtt_guard_ok)
+{
+    if (method.consensus_use_rtt_guard && !rtt_guard_ok) {
+        return;
+    }
+    if (!node.long_min_valid) {
+        return;
+    }
+    const size_t min_samples = (method.consensus_min_samples > 0) ? method.consensus_min_samples : 8;
+    if (node.consensus_samples.size() < min_samples) {
+        return;
+    }
+    if (node.short_snapshot.valid) {
+        const double jitter = GuardJitter(node, method);
+        const double iqr_max = std::max(method.consensus_iqr_min_us, method.consensus_iqr_k * jitter);
+        if (node.short_snapshot.iqr > iqr_max) {
+            return;
+        }
+    }
+    double slope_ppm = 0.0;
+    if (!ComputeConsensusSlope(node.consensus_samples, method.consensus_slope_bin_ppm,
+        method.consensus_slope_max_ppm, slope_ppm)) {
+        return;
+    }
+    const double max_ppm = (method.consensus_slope_max_ppm > 0.0) ? method.consensus_slope_max_ppm : 500.0;
+    slope_ppm = std::max(-max_ppm, std::min(max_ppm, slope_ppm));
+    node.consensus_slope_ppm = slope_ppm;
+    node.consensus_slope_valid = true;
+
+    std::vector<double> projected;
+    projected.reserve(node.consensus_samples.size());
+    for (const auto& s : node.consensus_samples) {
+        const double dt_s = (now_us > s.t_us) ? ((double)(now_us - s.t_us) * 1e-6) : 0.0;
+        projected.push_back(s.value_us + slope_ppm * dt_s);
+    }
+    if (projected.empty()) {
+        return;
+    }
+    double q = method.consensus_percentile;
+    if (q <= 0.0) {
+        q = 0.05;
+    }
+    if (q > 1.0) {
+        q = 1.0;
+    }
+    size_t idx = (size_t)std::floor(q * (projected.size() - 1));
+    std::nth_element(projected.begin(), projected.begin() + idx, projected.end());
+    node.effective_min_us = projected[idx];
+    node.effective_min_time_us = now_us;
+    node.effective_min_valid = true;
+    node.consensus_updates++;
+}
+
+static void UpdateShadowSkew(
+    NodeState& node,
+    uint64_t now_us,
+    double offset_us,
+    const MethodConfig& method,
+    bool allow_update)
+{
+    if (!allow_update) {
+        return;
+    }
+    SlopedSample sample;
+    sample.t_us = now_us;
+    sample.delta_us = offset_us;
+    node.shadow_skew_samples.push_back(sample);
+
+    const uint64_t window_us = (method.shadow_skew_window_us > 0)
+        ? method.shadow_skew_window_us
+        : 30000000;
+    const uint64_t cutoff = (now_us > window_us) ? (now_us - window_us) : 0;
+    while (!node.shadow_skew_samples.empty() && node.shadow_skew_samples.front().t_us < cutoff) {
+        node.shadow_skew_samples.pop_front();
+    }
+
+    const size_t min_samples = (method.shadow_skew_min_samples > 0)
+        ? method.shadow_skew_min_samples
+        : 8;
+    if (node.shadow_skew_samples.size() < min_samples) {
+        node.shadow_skew_valid = false;
+        return;
+    }
+
+    const double t0 = (double)node.shadow_skew_samples.front().t_us;
+    double sum_t = 0.0;
+    double sum_d = 0.0;
+    double sum_tt = 0.0;
+    double sum_td = 0.0;
+    for (const auto& s : node.shadow_skew_samples) {
+        const double t = ((double)s.t_us - t0) * 1e-6;
+        const double d = s.delta_us;
+        sum_t += t;
+        sum_d += d;
+        sum_tt += t * t;
+        sum_td += t * d;
+    }
+    const double n = (double)node.shadow_skew_samples.size();
+    const double denom = n * sum_tt - sum_t * sum_t;
+    if (std::fabs(denom) < 1e-9) {
+        node.shadow_skew_valid = false;
+        return;
+    }
+    double slope_ppm = (n * sum_td - sum_t * sum_d) / denom;
+    const double clamp_ppm = (method.shadow_skew_clamp_ppm > 0.0)
+        ? method.shadow_skew_clamp_ppm
+        : 100.0;
+    slope_ppm = std::max(-clamp_ppm, std::min(clamp_ppm, slope_ppm));
+
+    const double alpha = (method.shadow_skew_alpha > 0.0)
+        ? method.shadow_skew_alpha
+        : 0.10;
+    if (!node.shadow_skew_valid) {
+        node.shadow_skew_ppm = slope_ppm;
+    } else {
+    node.shadow_skew_ppm = (1.0 - alpha) * node.shadow_skew_ppm + alpha * slope_ppm;
+    }
+    node.shadow_skew_valid = true;
+    node.shadow_skew_updates++;
+}
+
+static bool ComputeTheilSenSlope(const std::deque<SlopeSample>& samples, double& out_slope_ppm)
+{
+    if (samples.size() < 2) {
+        return false;
+    }
+    std::vector<double> slopes;
+    slopes.reserve(samples.size() * (samples.size() - 1) / 2);
+    for (size_t i = 0; i + 1 < samples.size(); ++i) {
+        for (size_t j = i + 1; j < samples.size(); ++j) {
+            const uint64_t dt_us = samples[j].t_us - samples[i].t_us;
+            if (dt_us == 0) {
+                continue;
+            }
+            const double slope_ppm = (samples[j].value_us - samples[i].value_us) * 1e6 / (double)dt_us;
+            slopes.push_back(slope_ppm);
+        }
+    }
+    if (slopes.empty()) {
+        return false;
+    }
+    out_slope_ppm = MedianOfVector(slopes);
+    return true;
+}
+
+static bool ComputeOlsSlope(const std::deque<SlopeSample>& samples, double& out_slope_ppm)
+{
+    if (samples.size() < 2) {
+        return false;
+    }
+    const double t0 = (double)samples.front().t_us;
+    double sum_t = 0.0;
+    double sum_d = 0.0;
+    double sum_tt = 0.0;
+    double sum_td = 0.0;
+    for (const auto& s : samples) {
+        const double t = ((double)s.t_us - t0) * 1e-6;
+        const double d = s.value_us;
+        sum_t += t;
+        sum_d += d;
+        sum_tt += t * t;
+        sum_td += t * d;
+    }
+    const double n = (double)samples.size();
+    const double denom = n * sum_tt - sum_t * sum_t;
+    if (std::fabs(denom) < 1e-9) {
+        return false;
+    }
+    out_slope_ppm = (n * sum_td - sum_t * sum_d) / denom;
+    return true;
+}
+
+static void UpdateCoupledSkew(
+    NodeState& node_a,
+    NodeState& node_b,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool rtt_guard_ok)
+{
+    node_a.cse_gate_ok = false;
+    node_b.cse_gate_ok = false;
+    if (method.cse_use_rtt_guard && !rtt_guard_ok) {
+        return;
+    }
+    if (node_a.short_snapshot.valid) {
+        SlopeSample s;
+        s.t_us = now_us;
+        s.value_us = node_a.short_snapshot.p10;
+        node_a.cse_samples.push_back(s);
+    }
+    if (node_b.short_snapshot.valid) {
+        SlopeSample s;
+        s.t_us = now_us;
+        s.value_us = node_b.short_snapshot.p10;
+        node_b.cse_samples.push_back(s);
+    }
+
+    const uint64_t window_us = (method.cse_window_us > 0)
+        ? method.cse_window_us
+        : 30000000;
+    const uint64_t cutoff = (now_us > window_us) ? (now_us - window_us) : 0;
+    while (!node_a.cse_samples.empty() && node_a.cse_samples.front().t_us < cutoff) {
+        node_a.cse_samples.pop_front();
+    }
+    while (!node_b.cse_samples.empty() && node_b.cse_samples.front().t_us < cutoff) {
+        node_b.cse_samples.pop_front();
+    }
+
+    const size_t min_samples = (method.cse_min_samples > 0) ? method.cse_min_samples : 8;
+    if (node_a.cse_samples.size() < min_samples || node_b.cse_samples.size() < min_samples) {
+        return;
+    }
+
+    auto stable = [&](const NodeState& node) -> bool {
+        if (!node.short_snapshot.valid) {
+            return false;
+        }
+        const double jitter = GuardJitter(node, method);
+        const double iqr_max = std::max(method.cse_iqr_min_us, method.cse_iqr_k * jitter);
+        return node.short_snapshot.iqr <= iqr_max;
+    };
+
+    if (!stable(node_a) || !stable(node_b)) {
+        return;
+    }
+
+    double slope_ab = 0.0;
+    double slope_ba = 0.0;
+    if (!ComputeTheilSenSlope(node_b.cse_samples, slope_ab) ||
+        !ComputeTheilSenSlope(node_a.cse_samples, slope_ba)) {
+        return;
+    }
+
+    const double skew_cand = 0.5 * (slope_ba - slope_ab);
+    const double net_cand = 0.5 * (slope_ba + slope_ab);
+    const double net_max = (method.cse_net_slope_max > 0.0) ? method.cse_net_slope_max : 5.0;
+    if (std::fabs(net_cand) > net_max) {
+        return;
+    }
+
+    const double beta = (method.cse_beta > 0.0) ? method.cse_beta : 0.05;
+    const double max_ppm = (method.cse_max_ppm > 0.0) ? method.cse_max_ppm : 500.0;
+    double skew = node_b.cse_skew_valid ? node_b.cse_skew_ppm : skew_cand;
+    skew = (1.0 - beta) * skew + beta * skew_cand;
+    skew = std::max(-max_ppm, std::min(max_ppm, skew));
+
+    node_b.cse_skew_ppm = skew;
+    node_b.cse_skew_valid = true;
+    node_a.cse_skew_ppm = -skew;
+    node_a.cse_skew_valid = true;
+    node_a.cse_updates++;
+    node_b.cse_updates++;
+    node_a.cse_gate_ok = true;
+    node_b.cse_gate_ok = true;
+}
+
+static void UpdateDualSlopeSkew(
+    NodeState& node_a,
+    NodeState& node_b,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool rtt_guard_ok)
+{
+    if (method.cse_use_rtt_guard && !rtt_guard_ok) {
+        return;
+    }
+    if (node_a.short_snapshot.valid) {
+        SlopeSample s;
+        s.t_us = now_us;
+        s.value_us = node_a.short_snapshot.p10;
+        node_a.cse_samples.push_back(s);
+    }
+    if (node_b.short_snapshot.valid) {
+        SlopeSample s;
+        s.t_us = now_us;
+        s.value_us = node_b.short_snapshot.p10;
+        node_b.cse_samples.push_back(s);
+    }
+
+    const uint64_t window_us = (method.cse_window_us > 0)
+        ? method.cse_window_us
+        : 30000000;
+    const uint64_t cutoff = (now_us > window_us) ? (now_us - window_us) : 0;
+    while (!node_a.cse_samples.empty() && node_a.cse_samples.front().t_us < cutoff) {
+        node_a.cse_samples.pop_front();
+    }
+    while (!node_b.cse_samples.empty() && node_b.cse_samples.front().t_us < cutoff) {
+        node_b.cse_samples.pop_front();
+    }
+
+    const size_t min_samples = (method.cse_min_samples > 0) ? method.cse_min_samples : 8;
+    if (node_a.cse_samples.size() < min_samples || node_b.cse_samples.size() < min_samples) {
+        return;
+    }
+
+    auto stable = [&](const NodeState& node) -> bool {
+        if (!node.short_snapshot.valid) {
+            return false;
+        }
+        const double jitter = GuardJitter(node, method);
+        const double iqr_max = std::max(method.cse_iqr_min_us, method.cse_iqr_k * jitter);
+        return node.short_snapshot.iqr <= iqr_max;
+    };
+
+    if (!stable(node_a) || !stable(node_b)) {
+        return;
+    }
+
+    double slope_ab = 0.0;
+    double slope_ba = 0.0;
+    if (!ComputeOlsSlope(node_b.cse_samples, slope_ab) ||
+        !ComputeOlsSlope(node_a.cse_samples, slope_ba)) {
+        return;
+    }
+
+    const double skew_cand = 0.5 * (slope_ba - slope_ab);
+    const double net_cand = 0.5 * (slope_ba + slope_ab);
+    const double net_max = (method.cse_net_slope_max > 0.0) ? method.cse_net_slope_max : 5.0;
+    if (std::fabs(net_cand) > net_max) {
+        return;
+    }
+
+    const double beta = (method.cse_beta > 0.0) ? method.cse_beta : 0.05;
+    const double max_ppm = (method.cse_max_ppm > 0.0) ? method.cse_max_ppm : 500.0;
+    double skew = node_b.cse_skew_valid ? node_b.cse_skew_ppm : skew_cand;
+    skew = (1.0 - beta) * skew + beta * skew_cand;
+    skew = std::max(-max_ppm, std::min(max_ppm, skew));
+
+    node_b.cse_skew_ppm = skew;
+    node_b.cse_skew_valid = true;
+    node_a.cse_skew_ppm = -skew;
+    node_a.cse_skew_valid = true;
+    node_a.cse_updates++;
+    node_b.cse_updates++;
+}
+
+static void UpdatePolicySkew(
+    NodeState& node_a,
+    NodeState& node_b,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool rtt_guard_ok)
+{
+    if (!method.policy_use_local_skew) {
+        return;
+    }
+    if (method.policy_skew_use_rtt_guard && !rtt_guard_ok) {
+        return;
+    }
+    if (node_a.short_snapshot.valid) {
+        SlopeSample s;
+        s.t_us = now_us;
+        s.value_us = node_a.short_snapshot.p10;
+        node_a.policy_skew_samples.push_back(s);
+    }
+    if (node_b.short_snapshot.valid) {
+        SlopeSample s;
+        s.t_us = now_us;
+        s.value_us = node_b.short_snapshot.p10;
+        node_b.policy_skew_samples.push_back(s);
+    }
+
+    const uint64_t window_us = (method.policy_skew_window_us > 0)
+        ? method.policy_skew_window_us
+        : 30000000;
+    const uint64_t cutoff = (now_us > window_us) ? (now_us - window_us) : 0;
+    while (!node_a.policy_skew_samples.empty() && node_a.policy_skew_samples.front().t_us < cutoff) {
+        node_a.policy_skew_samples.pop_front();
+    }
+    while (!node_b.policy_skew_samples.empty() && node_b.policy_skew_samples.front().t_us < cutoff) {
+        node_b.policy_skew_samples.pop_front();
+    }
+
+    const size_t min_samples = (method.policy_skew_min_samples > 0) ? method.policy_skew_min_samples : 4;
+    if (node_a.policy_skew_samples.size() < min_samples || node_b.policy_skew_samples.size() < min_samples) {
+        return;
+    }
+
+    auto stable = [&](const NodeState& node) -> bool {
+        if (!node.short_snapshot.valid) {
+            return false;
+        }
+        if (method.policy_skew_iqr_max_us > 0.0 &&
+            node.short_snapshot.iqr > method.policy_skew_iqr_max_us) {
+            return false;
+        }
+        return true;
+    };
+
+    if (!stable(node_a) || !stable(node_b)) {
+        return;
+    }
+
+    double slope_ab = 0.0;
+    double slope_ba = 0.0;
+    if (!ComputeTheilSenSlope(node_b.policy_skew_samples, slope_ab) ||
+        !ComputeTheilSenSlope(node_a.policy_skew_samples, slope_ba)) {
+        return;
+    }
+
+    const double skew_cand = 0.5 * (slope_ba - slope_ab);
+    const double net_cand = 0.5 * (slope_ba + slope_ab);
+    const double net_max = (method.policy_skew_net_max > 0.0) ? method.policy_skew_net_max : 50.0;
+    if (std::fabs(net_cand) > net_max) {
+        return;
+    }
+
+    const double beta = (method.policy_skew_beta > 0.0) ? method.policy_skew_beta : 0.05;
+    const double max_ppm = (method.policy_skew_max_ppm > 0.0) ? method.policy_skew_max_ppm : 500.0;
+    double skew = node_b.policy_skew_valid ? node_b.policy_skew_ppm : skew_cand;
+    skew = (1.0 - beta) * skew + beta * skew_cand;
+    skew = std::max(-max_ppm, std::min(max_ppm, skew));
+
+    node_b.policy_skew_ppm = skew;
+    node_b.policy_skew_valid = true;
+    node_a.policy_skew_ppm = -skew;
+    node_a.policy_skew_valid = true;
+    node_a.policy_skew_updates++;
+    node_b.policy_skew_updates++;
+}
+
+static void UpdateAgeCompMin(
+    NodeState& node,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool rtt_guard_ok)
+{
+    if (!node.long_min_valid) {
+        return;
+    }
+    node.age_comp_updates++;
+    double skew_ppm = node.cse_skew_valid ? node.cse_skew_ppm : 0.0;
+    if (method.age_comp_use_rtt_guard && !rtt_guard_ok) {
+        skew_ppm = 0.0;
+    }
+    if (method.age_comp_fixed_ppm > 0.0) {
+        skew_ppm = method.age_comp_fixed_ppm;
+    }
+    const double min_ppm = (method.age_comp_min_ppm > 0.0) ? method.age_comp_min_ppm : 0.0;
+    if (std::fabs(skew_ppm) < min_ppm) {
+        skew_ppm = 0.0;
+    }
+
+    double age_s = 0.0;
+    if (now_us > node.long_min_time_us) {
+        age_s = (double)(now_us - node.long_min_time_us) * 1e-6;
+    }
+    if (method.age_comp_max_age_us > 0) {
+        const double max_s = (double)method.age_comp_max_age_us * 1e-6;
+        if (age_s > max_s) {
+            age_s = max_s;
+        }
+    }
+
+    double min_us = node.long_min_us;
+    if (skew_ppm > 0.0) {
+        min_us += skew_ppm * age_s;
+        if (node.short_snapshot.valid) {
+            double clamp_margin = method.age_comp_clamp_margin_us;
+            if (method.age_comp_clamp_k > 0.0) {
+                clamp_margin = std::max(clamp_margin, method.age_comp_clamp_k * node.short_snapshot.iqr);
+            }
+            if (clamp_margin > 0.0) {
+                const double upper = node.short_snapshot.p10 + clamp_margin;
+                min_us = std::min(std::max(min_us, node.long_min_us), upper);
+            }
+        }
+    }
+    node.effective_min_us = min_us;
+    node.effective_min_time_us = now_us;
+    node.effective_min_valid = true;
+}
+
+static void ApplyLongBinStepReset(NodeState& node, uint64_t now_us, double seed_us);
+
+static void UpdateStateMachine(
+    NodeState& node_a,
+    NodeState& node_b,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool rtt_guard_ok)
+{
+    UpdateCoupledSkew(node_a, node_b, now_us, method, rtt_guard_ok);
+
+    auto decay_state = [&](NodeState& node) {
+        if (node.state_until_us > 0 && now_us >= node.state_until_us) {
+            node.state_mode = 0;
+            node.state_until_us = 0;
+        }
+    };
+    decay_state(node_a);
+    decay_state(node_b);
+
+    bool drift_detect = false;
+    if (EnsureEffectiveMin(node_a) && EnsureEffectiveMin(node_b) &&
+        node_a.short_snapshot.valid && node_b.short_snapshot.valid) {
+        const double jitter_ab = GuardJitter(node_b, method);
+        const double jitter_ba = GuardJitter(node_a, method);
+        const double gb_ab = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter_ab);
+        const double gb_ba = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter_ba);
+        const double iqr_max_ab = std::max(method.gsp_iqr_min_us, method.gsp_iqr_k * jitter_ab);
+        const double iqr_max_ba = std::max(method.gsp_iqr_min_us, method.gsp_iqr_k * jitter_ba);
+        const bool stable = (node_b.short_snapshot.iqr <= iqr_max_ab) &&
+            (node_a.short_snapshot.iqr <= iqr_max_ba);
+        const bool enough = (node_b.short_snapshot.count >= method.gsp_npkt_min) &&
+            (node_a.short_snapshot.count >= method.gsp_npkt_min);
+        const bool no_near = (node_b.short_snapshot.near_hits == 0) &&
+            (node_a.short_snapshot.near_hits == 0);
+        const bool stale_ab = (node_b.short_snapshot.p10 > node_b.effective_min_us + gb_ab);
+        const bool stale_ba = (node_a.short_snapshot.p10 > node_a.effective_min_us + gb_ba);
+        drift_detect = stable && enough && no_near && (stale_ab ^ stale_ba);
+    }
+
+    const uint64_t step_before = node_a.step_resets + node_b.step_resets;
+    UpdateStepGuard(node_a, node_b, now_us, method, rtt_guard_ok);
+    const bool step_triggered = (node_a.step_resets + node_b.step_resets) > step_before;
+
+    if (step_triggered) {
+        const uint64_t hold_us = (method.state_step_hold_us > 0) ? method.state_step_hold_us : 3000000ULL;
+        node_a.state_mode = 2;
+        node_b.state_mode = 2;
+        node_a.state_until_us = now_us + hold_us;
+        node_b.state_until_us = now_us + hold_us;
+        if (node_a.step_reset_dir && node_a.short_snapshot.valid) {
+            ApplyLongBinStepReset(node_a, now_us, node_a.short_snapshot.p10);
+        }
+        if (node_b.step_reset_dir && node_b.short_snapshot.valid) {
+            ApplyLongBinStepReset(node_b, now_us, node_b.short_snapshot.p10);
+        }
+    } else if (drift_detect) {
+        const uint64_t hold_us = (method.state_drift_hold_us > 0) ? method.state_drift_hold_us : 5000000ULL;
+        node_a.state_mode = 1;
+        node_b.state_mode = 1;
+        node_a.state_until_us = now_us + hold_us;
+        node_b.state_until_us = now_us + hold_us;
+    }
+
+    auto apply_state = [&](NodeState& node) {
+        if (node.state_mode == 1) {
+            UpdateAgeCompMin(node, now_us, method, rtt_guard_ok);
+        } else {
+            EnsureEffectiveMin(node);
+        }
+        UpdateAlgoOffset(node, now_us);
+    };
+    apply_state(node_a);
+    apply_state(node_b);
+}
+
+struct BinMinSample
+{
+    double value_us = 0.0;
+    uint64_t time_us = 0;
+};
+
+static bool GatherBinMins(const LongWindowBins& bins, uint64_t now_us, std::vector<BinMinSample>& out)
+{
+    out.clear();
+    if (bins.bins.empty()) {
+        return false;
+    }
+    const uint64_t now_sec = now_us / bins.bin_us;
+    for (const auto& b : bins.bins) {
+        if (!b.valid) {
+            continue;
+        }
+        if (now_sec >= b.sec && (now_sec - b.sec) >= bins.bins.size()) {
+            continue;
+        }
+        BinMinSample s;
+        s.value_us = b.min_us;
+        s.time_us = b.min_time_us;
+        out.push_back(s);
+    }
+    return !out.empty();
+}
+
+static void UpdateKMin(
+    NodeState& node,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool allow_k)
+{
+    std::vector<BinMinSample> mins;
+    if (!GatherBinMins(node.long_bins, now_us, mins)) {
+        return;
+    }
+    if (method.kmin_use_age_weight && method.kmin_age_weight_us_per_s > 0.0) {
+        const double weight = method.kmin_age_weight_us_per_s;
+        std::sort(mins.begin(), mins.end(), [&](const BinMinSample& a, const BinMinSample& b) {
+            const double age_a = (now_us > a.time_us) ? (double)(now_us - a.time_us) / 1e6 : 0.0;
+            const double age_b = (now_us > b.time_us) ? (double)(now_us - b.time_us) / 1e6 : 0.0;
+            const double score_a = a.value_us + weight * age_a;
+            const double score_b = b.value_us + weight * age_b;
+            return score_a < score_b;
+        });
+    } else {
+        std::sort(mins.begin(), mins.end(), [](const BinMinSample& a, const BinMinSample& b) {
+            return a.value_us < b.value_us;
+        });
+    }
+    size_t k = allow_k ? ((method.kmin_k > 0) ? method.kmin_k : 1) : 1;
+    if (k > mins.size()) {
+        k = mins.size();
+    }
+    const BinMinSample& pick = mins[k - 1];
+    node.effective_min_us = pick.value_us;
+    node.effective_min_time_us = pick.time_us;
+    node.effective_min_valid = true;
+    node.kmin_updates++;
+}
+
+static void UpdateKBest(
+    NodeState& node,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool rtt_guard_ok)
+{
+    std::vector<BinMinSample> mins;
+    if (!GatherBinMins(node.long_bins, now_us, mins)) {
+        return;
+    }
+    std::sort(mins.begin(), mins.end(), [](const BinMinSample& a, const BinMinSample& b) {
+        return a.value_us < b.value_us;
+    });
+    size_t max_k = (method.kbest_k > 0) ? method.kbest_k : 3;
+    if (max_k > mins.size()) {
+        max_k = mins.size();
+    }
+    if (max_k == 0) {
+        return;
+    }
+
+    const double min0 = mins.front().value_us;
+    if (node.kbest_offset >= max_k || min0 < node.kbest_last_min0) {
+        node.kbest_offset = 0;
+    }
+    node.kbest_last_min0 = min0;
+
+    bool stale = false;
+    if (node.short_snapshot.valid) {
+        const double p0 = node.short_snapshot.p0;
+        const double p10 = node.short_snapshot.p10;
+        const double iqr = node.short_snapshot.iqr;
+        const size_t count = node.short_snapshot.count;
+        const double jitter = GuardJitter(node, method);
+        const double gb = std::max(method.kbest_guard_min_us, method.kbest_guard_k * jitter);
+        const double iqr_max = std::max(method.kbest_iqr_min_us, method.kbest_iqr_k * jitter);
+        const double gnear = std::max(method.kbest_gnear_min_us, method.kbest_gnear_k * jitter);
+        const bool stable = (iqr <= iqr_max);
+        const bool enough = (count >= method.kbest_npkt_min);
+        const bool no_near = (p0 > min0 + gnear);
+        stale = (p10 > min0 + gb) && stable && enough && no_near;
+    }
+
+    if (method.kbest_use_rtt_guard && !rtt_guard_ok) {
+        stale = false;
+    }
+
+    if (stale) {
+        node.kbest_stale_streak++;
+    } else {
+        node.kbest_stale_streak = 0;
+    }
+
+    if (node.kbest_stale_streak >= std::max(1, method.kbest_n_consec)) {
+        if (node.kbest_offset + 1 < max_k) {
+            node.kbest_offset++;
+            node.kbest_advances++;
+        }
+        node.kbest_stale_streak = 0;
+    }
+
+    const size_t idx = std::min(node.kbest_offset, max_k - 1);
+    const BinMinSample& pick = mins[idx];
+    node.effective_min_us = pick.value_us;
+    node.effective_min_time_us = pick.time_us;
+    node.effective_min_valid = true;
+}
+
+static void UpdateMinReg(
+    NodeState& node,
+    uint64_t now_us,
+    const MethodConfig& method)
+{
+    const uint64_t window_us = (method.minreg_window_us > 0)
+        ? method.minreg_window_us
+        : (method.sloped_window_us > 0 ? method.sloped_window_us : 5000000ULL);
+    const size_t min_samples = (method.minreg_min_samples > 0)
+        ? method.minreg_min_samples
+        : (method.sloped_min_samples > 0 ? method.sloped_min_samples : 5);
+    const double clamp_ppm = (method.minreg_clamp_ppm > 0.0)
+        ? method.minreg_clamp_ppm
+        : method.sloped_clamp_ppm;
+
+    if (method.minreg_use_short_p10) {
+        if (!node.short_snapshot.valid) {
+            return;
+        }
+        UpdateSampleWindow(node.minreg_samples, now_us, node.short_snapshot.p10, window_us);
+    } else if (node.long_min_valid) {
+        UpdateSampleWindow(node.minreg_samples, now_us, node.long_min_us, window_us);
+    } else {
+        return;
+    }
+    {
+        if (method.minreg_use_cse_gate && !node.cse_gate_ok) {
+            node.effective_min_us = node.long_min_us;
+            node.effective_min_time_us = node.long_min_time_us;
+            node.effective_min_valid = true;
+            return;
+        }
+        double pred = 0.0;
+        const bool ok = method.minreg_use_huber
+            ? ComputeHuberPrediction(node.minreg_samples, now_us, min_samples,
+                clamp_ppm, method.minreg_huber_k, pred)
+            : (method.minreg_use_theilsen
+                ? ComputeTheilSenPrediction(node.minreg_samples, now_us, min_samples, clamp_ppm, pred)
+                : ComputeRegressionPrediction(node.minreg_samples, now_us, min_samples, clamp_ppm, pred));
+        if (ok) {
+            node.effective_min_us = pred;
+            node.effective_min_time_us = now_us;
+            node.effective_min_valid = true;
+            node.minreg_updates++;
+        } else {
+            node.effective_min_us = node.long_min_us;
+            node.effective_min_time_us = node.long_min_time_us;
+            node.effective_min_valid = true;
+        }
+    }
+
+    if (node.peer_min_raw_valid) {
+        UpdateSampleWindow(node.peer_min_samples, now_us, node.peer_min_raw_us, window_us);
+        if (method.minreg_use_cse_gate && !node.cse_gate_ok) {
+            node.peer_min_us = node.peer_min_raw_us;
+            node.peer_min_valid = true;
+            return;
+        }
+        double pred = 0.0;
+        const bool ok = method.minreg_use_huber
+            ? ComputeHuberPrediction(node.peer_min_samples, now_us, min_samples,
+                clamp_ppm, method.minreg_huber_k, pred)
+            : (method.minreg_use_theilsen
+                ? ComputeTheilSenPrediction(node.peer_min_samples, now_us, min_samples, clamp_ppm, pred)
+                : ComputeRegressionPrediction(node.peer_min_samples, now_us, min_samples, clamp_ppm, pred));
+        if (ok) {
+            node.peer_min_us = pred;
+            node.peer_min_valid = true;
+        } else {
+            node.peer_min_us = node.peer_min_raw_us;
+            node.peer_min_valid = true;
+        }
+    }
+}
+
+static void UpdateSlopeTheilSen(
+    NodeState& node,
+    uint64_t now_us,
+    const MethodConfig& method)
+{
+    const size_t min_samples = (method.sloped_min_samples > 0)
+        ? method.sloped_min_samples
+        : 20;
+    const double clamp_ppm = (method.sloped_clamp_ppm > 0.0)
+        ? method.sloped_clamp_ppm
+        : 200.0;
+
+    if (!SlopedGateStable(node, method)) {
+        node.sloped_skew_valid = false;
+        return;
+    }
+
+    double slope_ppm = 0.0;
+    if (ComputeTheilSenSlope(node.sloped_samples, min_samples, clamp_ppm, slope_ppm)) {
+        node.sloped_skew_ppm = slope_ppm;
+        node.sloped_skew_valid = true;
+    } else {
+        node.sloped_skew_valid = false;
+    }
+}
+
+static void UpdateMultiWindow(
+    NodeState& node,
+    uint64_t now_us,
+    const MethodConfig& method)
+{
+    if (method.multiwin_use_cse_gate && !node.cse_gate_ok) {
+        if (node.long_min_valid) {
+            node.effective_min_us = node.long_min_us;
+            node.effective_min_time_us = node.long_min_time_us;
+            node.effective_min_valid = true;
+        }
+        if (node.peer_min_raw_valid) {
+            node.peer_min_us = node.peer_min_raw_us;
+            node.peer_min_valid = true;
+        }
+        return;
+    }
+    uint64_t w_short = (method.multiwin_short_us > 0) ? method.multiwin_short_us : 2000000ULL;
+    uint64_t w_mid = (method.multiwin_mid_us > 0) ? method.multiwin_mid_us : 10000000ULL;
+    uint64_t w_long = (method.multiwin_long_us > 0) ? method.multiwin_long_us : 60000000ULL;
+    if (w_mid < w_short) w_mid = w_short;
+    if (w_long < w_mid) w_long = w_mid;
+
+    std::vector<double> mins;
+    double min_val = 0.0;
+    uint64_t min_time = 0;
+    if (GetWindowMinFromBins(node.long_bins, now_us, w_short, min_val, min_time)) {
+        mins.push_back(min_val);
+    }
+    if (GetWindowMinFromBins(node.long_bins, now_us, w_mid, min_val, min_time)) {
+        mins.push_back(min_val);
+    }
+    if (GetWindowMinFromBins(node.long_bins, now_us, w_long, min_val, min_time)) {
+        mins.push_back(min_val);
+    }
+    if (!mins.empty()) {
+        double median = MedianOfVector(mins);
+        node.effective_min_us = median;
+        node.effective_min_time_us = now_us;
+        node.effective_min_valid = true;
+        node.multiwin_updates++;
+    }
+
+    if (node.peer_min_raw_valid) {
+        UpdateSampleWindow(node.peer_min_samples, now_us, node.peer_min_raw_us, w_long);
+        std::vector<double> peer_mins;
+        double peer_min_val = 0.0;
+        if (GetWindowMinFromSamples(node.peer_min_samples, now_us, w_short, peer_min_val)) {
+            peer_mins.push_back(peer_min_val);
+        }
+        if (GetWindowMinFromSamples(node.peer_min_samples, now_us, w_mid, peer_min_val)) {
+            peer_mins.push_back(peer_min_val);
+        }
+        if (GetWindowMinFromSamples(node.peer_min_samples, now_us, w_long, peer_min_val)) {
+            peer_mins.push_back(peer_min_val);
+        }
+        if (!peer_mins.empty()) {
+            const double median = MedianOfVector(peer_mins);
+            node.peer_min_us = median;
+            node.peer_min_valid = true;
+        } else {
+            node.peer_min_us = node.peer_min_raw_us;
+            node.peer_min_valid = true;
+        }
+    }
+}
+
+static void UpdateEnvelopeDecay(
+    NodeState& node,
+    uint64_t now_us,
+    double delta_us,
+    const MethodConfig& method)
+{
+    double rate = method.decay_rate_us_per_s;
+    if (method.decay_use_near_ratio && node.short_snapshot.valid) {
+        const size_t count = node.short_snapshot.count;
+        const double near_ratio = (count > 0)
+            ? (double)node.short_snapshot.near_hits / (double)count
+            : 0.0;
+        double scale = 1.0 - std::min(1.0, near_ratio);
+        if (method.decay_near_ratio_floor > 0.0) {
+            scale = std::max(scale, method.decay_near_ratio_floor);
+        }
+        rate *= scale;
+    }
+    if (method.decay_use_cse && node.cse_skew_valid) {
+        const double scale = (method.decay_rate_scale > 0.0) ? method.decay_rate_scale : 1.0;
+        rate += scale * std::fabs(node.cse_skew_ppm);
+        if (method.decay_rate_min_us_per_s > 0.0) {
+            rate = std::max(rate, method.decay_rate_min_us_per_s);
+        }
+        if (method.decay_rate_max_us_per_s > 0.0) {
+            rate = std::min(rate, method.decay_rate_max_us_per_s);
+        }
+    }
+    if (!node.decay_valid) {
+        node.decay_min_us = delta_us;
+        node.decay_last_us = now_us;
+        node.decay_valid = true;
+        node.decay_updates++;
+    } else {
+        const double dt_s = (now_us > node.decay_last_us)
+            ? (double)(now_us - node.decay_last_us) * 1e-6
+            : 0.0;
+        const double decayed = node.decay_min_us + rate * dt_s;
+        const double next = std::min(decayed, delta_us);
+        node.decay_min_us = (next < 0.0) ? 0.0 : next;
+        node.decay_last_us = now_us;
+        node.decay_updates++;
+    }
+    node.effective_min_us = node.decay_min_us;
+    node.effective_min_time_us = now_us;
+    node.effective_min_valid = true;
+}
+
+static void UpdateSawtoothDetector(NodeState& node, uint64_t now_us, const MethodConfig& method);
+
+static const int kPolicyModeMulti = 0;
+static const int kPolicyModeQuantile = 1;
+static const int kPolicyModeTilted = 2;
+static const int kPolicyModeDecay = 3;
+
+struct PolicyCandidate
+{
+    bool valid = false;
+    double min_us = 0.0;
+    double peer_min_us = 0.0;
+};
+
+static int PolicyFallbackMode(const MethodConfig& method)
+{
+    if (method.policy_use_multiwin) {
+        return kPolicyModeMulti;
+    }
+    if (method.policy_use_decay) {
+        return kPolicyModeDecay;
+    }
+    if (method.policy_use_tilted) {
+        return kPolicyModeTilted;
+    }
+    if (method.policy_use_quantile) {
+        return kPolicyModeQuantile;
+    }
+    return kPolicyModeMulti;
+}
+
+static double PolicySkewPpm(const NodeState& node, const MethodConfig& method, bool& valid)
+{
+    valid = false;
+    if (method.policy_use_local_skew && node.policy_skew_valid) {
+        valid = true;
+        return node.policy_skew_ppm;
+    }
+    if (node.cse_skew_valid) {
+        valid = true;
+        return node.cse_skew_ppm;
+    }
+    return 0.0;
+}
+
+static int PolicySelectDesiredMode(
+    const NodeState& node,
+    const MethodConfig& method,
+    bool guard_ok,
+    bool rtt_ready,
+    double rtt_delta,
+    bool saw_active)
+{
+    const size_t min_samples = (method.policy_min_samples > 0) ? method.policy_min_samples : 20;
+    const bool stable = node.short_snapshot.valid && node.short_snapshot.count >= min_samples;
+    const double near_ratio = (node.short_snapshot.valid && node.short_snapshot.count > 0)
+        ? (double)node.short_snapshot.near_hits / (double)node.short_snapshot.count
+        : 1.0;
+    const bool rtt_jump = rtt_ready &&
+        method.policy_rtt_step_us > 0.0 &&
+        std::fabs(rtt_delta) >= method.policy_rtt_step_us;
+    const bool guard_required = method.policy_require_rtt_guard;
+    const bool guard_ready = guard_required ? guard_ok : true;
+    const bool high_iqr = node.short_snapshot.valid &&
+        method.policy_iqr_high_us > 0.0 &&
+        node.short_snapshot.iqr >= method.policy_iqr_high_us;
+    const bool low_near = method.policy_near_ratio_low > 0.0 &&
+        ((method.policy_near_ignore_stable && node.short_snapshot.valid && node.short_snapshot.count > 0) || stable) &&
+        near_ratio <= method.policy_near_ratio_low;
+    bool skew_valid = false;
+    const double skew_ppm = PolicySkewPpm(node, method, skew_valid);
+    const bool skew_ok = skew_valid &&
+        (method.policy_skew_min_ppm <= 0.0 || std::fabs(skew_ppm) >= method.policy_skew_min_ppm);
+
+    if (!guard_ready) {
+        return PolicyFallbackMode(method);
+    }
+    if (saw_active && method.policy_use_multiwin) {
+        return kPolicyModeMulti;
+    }
+    if (rtt_jump && method.policy_use_multiwin) {
+        return kPolicyModeMulti;
+    }
+    if (method.policy_prioritize_decay && high_iqr && method.policy_use_decay) {
+        return kPolicyModeDecay;
+    }
+
+    bool quantile_allowed = low_near && method.policy_use_quantile && !rtt_jump;
+    if (quantile_allowed && method.policy_quantile_requires_skew) {
+        quantile_allowed = skew_ok;
+    }
+    if (quantile_allowed && method.policy_quantile_block_high_iqr) {
+        quantile_allowed = !high_iqr;
+    }
+
+    if (method.policy_quantile_prefer_low_near) {
+        if (quantile_allowed) {
+            return kPolicyModeQuantile;
+        }
+    const bool tilt_allowed = method.policy_use_tilted &&
+        (!method.policy_tilted_requires_skew || skew_ok);
+    if (stable && tilt_allowed && skew_ok && !rtt_jump) {
+        return kPolicyModeTilted;
+    }
+    } else {
+        if (stable && method.policy_use_tilted && skew_ok && !rtt_jump) {
+            return kPolicyModeTilted;
+        }
+        if (quantile_allowed) {
+            return kPolicyModeQuantile;
+        }
+    }
+    if (high_iqr && method.policy_use_decay) {
+        return kPolicyModeDecay;
+    }
+    if (method.policy_tilted_requires_skew && !skew_ok) {
+        if (method.policy_use_quantile) {
+            return kPolicyModeQuantile;
+        }
+        if (method.policy_use_decay) {
+            return kPolicyModeDecay;
+        }
+        if (method.policy_use_multiwin) {
+            return kPolicyModeMulti;
+        }
+    }
+    return PolicyFallbackMode(method);
+}
+
+static int PolicyResolveMode(NodeState& node, int desired, uint64_t now_us, const MethodConfig& method)
+{
+    if (node.policy_mode == 0 && node.policy_pending_mode == 0) {
+        node.policy_mode = desired;
+        node.policy_pending_mode = desired;
+        return node.policy_mode;
+    }
+    if (node.policy_hold_until_us > 0 && now_us < node.policy_hold_until_us) {
+        return node.policy_mode;
+    }
+    if (desired == node.policy_mode) {
+        node.policy_pending_mode = desired;
+        node.policy_switch_streak = 0;
+        return node.policy_mode;
+    }
+    if (node.policy_pending_mode != desired) {
+        node.policy_pending_mode = desired;
+        node.policy_switch_streak = 1;
+    } else {
+        node.policy_switch_streak++;
+    }
+    const int switch_n = std::max(1, method.policy_switch_n);
+    if (node.policy_switch_streak >= switch_n) {
+        node.policy_mode = desired;
+        node.policy_pending_mode = desired;
+        node.policy_switch_streak = 0;
+        if (method.policy_hold_us > 0) {
+            node.policy_hold_until_us = now_us + method.policy_hold_us;
+        }
+        node.policy_switches++;
+    }
+    return node.policy_mode;
+}
+
+static PolicyCandidate PolicyQuantileCandidate(const NodeState& node)
+{
+    PolicyCandidate cand;
+    if (!node.peer_min_raw_valid) {
+        return cand;
+    }
+    const uint64_t ticks = node.timesync.GetMinDeltaTS24().ToUnsigned();
+    const double min_us = (double)(ticks << kTime23LostBits);
+    if (!node.long_min_valid && min_us <= 0.0) {
+        return cand;
+    }
+    cand.valid = true;
+    cand.min_us = (min_us < 0.0) ? 0.0 : min_us;
+    cand.peer_min_us = node.peer_min_raw_us;
+    return cand;
+}
+
+static PolicyCandidate PolicyDecayCandidate(const NodeState& node)
+{
+    PolicyCandidate cand;
+    if (!node.decay_valid || !node.peer_min_raw_valid) {
+        return cand;
+    }
+    cand.valid = true;
+    cand.min_us = node.decay_min_us;
+    cand.peer_min_us = node.peer_min_raw_us;
+    return cand;
+}
+
+static PolicyCandidate PolicyTiltedCandidate(const NodeState& node, const MethodConfig& method, uint64_t now_us)
+{
+    PolicyCandidate cand;
+    if (!node.tilted_min_valid || !node.peer_min_raw_valid) {
+        return cand;
+    }
+    bool skew_valid = false;
+    const double skew_ppm = PolicySkewPpm(node, method, skew_valid);
+    const double r_dir = -skew_ppm;
+    const double t_s = (double)now_us * 1e-6;
+    cand.valid = true;
+    cand.min_us = node.tilted_min_us + r_dir * t_s;
+    cand.peer_min_us = node.peer_min_raw_us;
+    return cand;
+}
+
+static PolicyCandidate PolicyMultiCandidate(const NodeState& node)
+{
+    PolicyCandidate cand;
+    if (!node.effective_min_valid || !node.peer_min_valid) {
+        return cand;
+    }
+    cand.valid = true;
+    cand.min_us = node.effective_min_us;
+    cand.peer_min_us = node.peer_min_us;
+    return cand;
+}
+
+static void ApplyPolicyCandidate(NodeState& node, const PolicyCandidate& cand, uint64_t now_us)
+{
+    if (!cand.valid) {
+        return;
+    }
+    node.effective_min_us = cand.min_us;
+    node.effective_min_time_us = now_us;
+    node.effective_min_valid = true;
+    node.peer_min_us = cand.peer_min_us;
+    node.peer_min_valid = true;
+}
+
+static void UpdatePolicyNode(
+    NodeState& node,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool guard_ok,
+    bool rtt_ready,
+    double rtt_delta,
+    const PolicyCandidate& cand_multi,
+    const PolicyCandidate& cand_quant,
+    const PolicyCandidate& cand_tilted,
+    const PolicyCandidate& cand_decay)
+{
+    const bool saw_active = method.saw_use && node.saw_hold_until_us > now_us;
+    const int desired = PolicySelectDesiredMode(node, method, guard_ok, rtt_ready, rtt_delta, saw_active);
+    const int mode = PolicyResolveMode(node, desired, now_us, method);
+
+    const PolicyCandidate* pick = nullptr;
+    if (mode == kPolicyModeMulti && cand_multi.valid) {
+        pick = &cand_multi;
+    } else if (mode == kPolicyModeQuantile && cand_quant.valid) {
+        pick = &cand_quant;
+    } else if (mode == kPolicyModeTilted && cand_tilted.valid) {
+        pick = &cand_tilted;
+    } else if (mode == kPolicyModeDecay && cand_decay.valid) {
+        pick = &cand_decay;
+    }
+
+    if (!pick) {
+        if (method.policy_use_multiwin && cand_multi.valid) {
+            pick = &cand_multi;
+        } else if (method.policy_use_decay && cand_decay.valid) {
+            pick = &cand_decay;
+        } else if (method.policy_use_tilted && cand_tilted.valid) {
+            pick = &cand_tilted;
+        } else if (method.policy_use_quantile && cand_quant.valid) {
+            pick = &cand_quant;
+        }
+    }
+
+    if (pick) {
+        ApplyPolicyCandidate(node, *pick, now_us);
+    }
+}
+
+static void UpdateTimeSyncPolicy(
+    NodeState& node_a,
+    NodeState& node_b,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool guard_ok,
+    bool rtt_ready,
+    double rtt_delta)
+{
+    UpdatePolicySkew(node_a, node_b, now_us, method, guard_ok);
+    if (method.policy_use_tilted) {
+        UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+    }
+
+    if (method.saw_use) {
+        UpdateSawtoothDetector(node_a, now_us, method);
+        UpdateSawtoothDetector(node_b, now_us, method);
+    }
+
+    if (method.policy_use_quantile) {
+        if (method.quantile_near_stale_reset) {
+            bool flip_a = DetectQuantileNearStale(node_a, method, now_us);
+            bool flip_b = DetectQuantileNearStale(node_b, method, now_us);
+            if (method.gsp_use_rtt_guard && !guard_ok) {
+                flip_a = false;
+                flip_b = false;
+            }
+            if (flip_a) {
+                ApplyQuantileFlipAction(node_a, method, now_us);
+            }
+            if (flip_b) {
+                ApplyQuantileFlipAction(node_b, method, now_us);
+            }
+        }
+        UpdateQuantileHold(node_a, method, now_us);
+        UpdateQuantileHold(node_b, method, now_us);
+    }
+
+    if (method.policy_use_multiwin) {
+        UpdateMultiWindow(node_a, now_us, method);
+        UpdateMultiWindow(node_b, now_us, method);
+    }
+
+    const PolicyCandidate multi_a = PolicyMultiCandidate(node_a);
+    const PolicyCandidate multi_b = PolicyMultiCandidate(node_b);
+    const PolicyCandidate quant_a = method.policy_use_quantile ? PolicyQuantileCandidate(node_a) : PolicyCandidate();
+    const PolicyCandidate quant_b = method.policy_use_quantile ? PolicyQuantileCandidate(node_b) : PolicyCandidate();
+    const PolicyCandidate tilted_a = method.policy_use_tilted ? PolicyTiltedCandidate(node_a, method, now_us) : PolicyCandidate();
+    const PolicyCandidate tilted_b = method.policy_use_tilted ? PolicyTiltedCandidate(node_b, method, now_us) : PolicyCandidate();
+    const PolicyCandidate decay_a = method.policy_use_decay ? PolicyDecayCandidate(node_a) : PolicyCandidate();
+    const PolicyCandidate decay_b = method.policy_use_decay ? PolicyDecayCandidate(node_b) : PolicyCandidate();
+
+    UpdatePolicyNode(node_a, now_us, method, guard_ok, rtt_ready, rtt_delta,
+        multi_a, quant_a, tilted_a, decay_a);
+    UpdatePolicyNode(node_b, now_us, method, guard_ok, rtt_ready, rtt_delta,
+        multi_b, quant_b, tilted_b, decay_b);
+}
+
+static void UpdateMoE(
+    NodeState& node_a,
+    NodeState& node_b,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool rtt_guard_ok)
+{
+    if (!node_a.short_snapshot.valid || !node_b.short_snapshot.valid) {
+        return;
+    }
+
+    const double p10_ab = node_b.short_snapshot.p10;
+    const double p0_ab = node_b.short_snapshot.p0;
+    const double iqr_ab = node_b.short_snapshot.iqr;
+    const size_t count_ab = node_b.short_snapshot.count;
+    const double near_ratio_ab = (count_ab > 0)
+        ? (double)node_b.short_snapshot.near_hits / (double)count_ab
+        : 0.0;
+    const double jitter_ab = std::max(0.0, p10_ab - p0_ab);
+
+    const double p10_ba = node_a.short_snapshot.p10;
+    const double p0_ba = node_a.short_snapshot.p0;
+    const double iqr_ba = node_a.short_snapshot.iqr;
+    const size_t count_ba = node_a.short_snapshot.count;
+    const double near_ratio_ba = (count_ba > 0)
+        ? (double)node_a.short_snapshot.near_hits / (double)count_ba
+        : 0.0;
+    const double jitter_ba = std::max(0.0, p10_ba - p0_ba);
+
+    const double iqr_max_ab = std::max(method.moe_iqr_min_us, method.moe_iqr_k * jitter_ab);
+    const double iqr_max_ba = std::max(method.moe_iqr_min_us, method.moe_iqr_k * jitter_ba);
+    const bool stable = (iqr_ab <= iqr_max_ab) && (iqr_ba <= iqr_max_ba);
+    const bool enough = (count_ab >= method.moe_npkt_min) && (count_ba >= method.moe_npkt_min);
+
+    bool gate_ok = stable && enough;
+    if (method.moe_use_rtt_guard && !rtt_guard_ok) {
+        gate_ok = false;
+    }
+    if (method.moe_use_near_ratio && method.moe_near_ratio_min > 0.0) {
+        if (near_ratio_ab < method.moe_near_ratio_min || near_ratio_ba < method.moe_near_ratio_min) {
+            gate_ok = false;
+        }
+    }
+
+    if (!gate_ok && method.moe_unstable_reset_us > 0) {
+        auto maybe_reset = [&](NodeState& node) {
+            if (node.moe_valid && now_us > node.moe_time_us + method.moe_unstable_reset_us) {
+                node.moe_valid = false;
+                node.moe_offset_us = 0.0;
+                node.moe_skew_ppm = 0.0;
+            }
+        };
+        maybe_reset(node_a);
+        maybe_reset(node_b);
+    }
+
+    bool xor_ok = true;
+    if (method.moe_use_xor_gate) {
+        bool stale_ab = false;
+        bool stale_ba = false;
+        if (node_b.effective_min_valid) {
+            const double gb = std::max(method.moe_guard_min_us, method.moe_guard_k * jitter_ab);
+            stale_ab = (p10_ab > node_b.effective_min_us + gb);
+        }
+        if (node_a.effective_min_valid) {
+            const double gb = std::max(method.moe_guard_min_us, method.moe_guard_k * jitter_ba);
+            stale_ba = (p10_ba > node_a.effective_min_us + gb);
+        }
+        xor_ok = (stale_ab ^ stale_ba);
+        if (!xor_ok) {
+            gate_ok = false;
+        }
+    }
+
+    const double offset_fast_a = 0.5 * (p10_ab - p10_ba);
+    const double offset_fast_b = -offset_fast_a;
+
+    auto update_tracker = [&](NodeState& node, double offset_fast) {
+        if (!gate_ok) {
+            return;
+        }
+        if (!node.moe_valid) {
+            node.moe_offset_us = offset_fast;
+            node.moe_skew_ppm = 0.0;
+            node.moe_time_us = now_us;
+            node.moe_valid = true;
+            node.moe_updates++;
+            return;
+        }
+        const double dt_s = (double)((now_us > node.moe_time_us)
+            ? (now_us - node.moe_time_us)
+            : 0ULL) / 1000000.0;
+        const double pred = node.moe_offset_us + node.moe_skew_ppm * dt_s;
+        double resid = offset_fast - pred;
+        if (method.moe_resid_max_us > 0.0) {
+            resid = std::max(-method.moe_resid_max_us, std::min(method.moe_resid_max_us, resid));
+        }
+        node.moe_offset_us += method.moe_kp * resid;
+        node.moe_skew_ppm += method.moe_ki * resid;
+        const double max_ppm = (method.moe_max_ppm > 0.0) ? method.moe_max_ppm : 200.0;
+        node.moe_skew_ppm = std::max(-max_ppm, std::min(max_ppm, node.moe_skew_ppm));
+        node.moe_time_us = now_us;
+        node.moe_valid = true;
+        node.moe_updates++;
+    };
+
+    update_tracker(node_a, offset_fast_a);
+    update_tracker(node_b, offset_fast_b);
+
+    auto clamp01 = [](double v) {
+        return std::max(0.0, std::min(1.0, v));
+    };
+    const double count_conf = clamp01((method.moe_npkt_min > 0)
+        ? std::min(count_ab, count_ba) / (double)method.moe_npkt_min
+        : 1.0);
+    double iqr_conf = 1.0;
+    if (iqr_max_ab > 0.0) {
+        iqr_conf = std::min(iqr_conf, clamp01(1.0 - (iqr_ab / iqr_max_ab)));
+    }
+    if (iqr_max_ba > 0.0) {
+        iqr_conf = std::min(iqr_conf, clamp01(1.0 - (iqr_ba / iqr_max_ba)));
+    }
+    double near_conf = 1.0;
+    if (method.moe_use_near_ratio && method.moe_near_ratio_min > 0.0) {
+        near_conf = clamp01(std::min(near_ratio_ab, near_ratio_ba) / method.moe_near_ratio_min);
+    }
+    double conf_metric = count_conf * iqr_conf * near_conf;
+    if (method.moe_use_rtt_guard && !rtt_guard_ok) {
+        conf_metric = 0.0;
+    }
+    if (method.moe_use_xor_gate && !xor_ok) {
+        conf_metric = 0.0;
+    }
+    node_a.moe_conf_sum += conf_metric;
+    node_b.moe_conf_sum += conf_metric;
+    node_a.moe_conf_count++;
+    node_b.moe_conf_count++;
+
+    double blend_conf = method.moe_use_confidence_blend ? conf_metric : 1.0;
+
+    auto blend_output = [&](NodeState& node) {
+        if (!node.algo_offset_valid) {
+            return;
+        }
+        if (!node.moe_valid) {
+            return;
+        }
+        const bool allow_blend = method.moe_use_confidence_blend ? (blend_conf > 0.0) : gate_ok;
+        if (!allow_blend) {
+            return;
+        }
+        const double dt_s = (double)((now_us > node.moe_time_us)
+            ? (now_us - node.moe_time_us)
+            : 0ULL) / 1000000.0;
+        const double tracker_pred = node.moe_offset_us + node.moe_skew_ppm * dt_s;
+        double w = std::min(1.0, std::max(0.0, method.moe_blend));
+        if (method.moe_use_confidence_blend) {
+            w *= blend_conf;
+        }
+        node.algo_offset_us = (1.0 - w) * node.algo_offset_us + w * tracker_pred;
+        node.algo_offset_time_us = now_us;
+        node.algo_offset_valid = true;
+        node.moe_blends++;
+    };
+
+    blend_output(node_a);
+    blend_output(node_b);
+}
+
+static void UpdateRttBins(NodeState& node, uint64_t now_us, const MethodConfig& method)
+{
+    if (!node.algo_offset_valid) {
+        return;
+    }
+    if (!node.rtt_short_valid) {
+        return;
+    }
+    const uint64_t bin_us = (method.rtt_bin_us > 0) ? method.rtt_bin_us : 10000;
+    const size_t bin_count = (method.rtt_bin_count > 0) ? method.rtt_bin_count : 8;
+    if (bin_count == 0) {
+        return;
+    }
+    if (node.rtt_bin_offsets.size() != bin_count) {
+        node.rtt_bin_offsets.assign(bin_count, 0.0);
+        node.rtt_bin_counts.assign(bin_count, 0);
+    }
+    const double rtt_short = node.rtt_short_last_us;
+    size_t idx = (size_t)(rtt_short / (double)bin_us);
+    if (idx >= bin_count) {
+        idx = bin_count - 1;
+    }
+    const double alpha = (method.rtt_bin_alpha > 0.0) ? method.rtt_bin_alpha : 0.2;
+    const uint32_t count = node.rtt_bin_counts[idx];
+    if (count == 0) {
+        node.rtt_bin_offsets[idx] = node.algo_offset_us;
+    } else {
+        node.rtt_bin_offsets[idx] = (1.0 - alpha) * node.rtt_bin_offsets[idx] + alpha * node.algo_offset_us;
+    }
+    node.rtt_bin_counts[idx] = count + 1;
+    if (node.rtt_bin_counts[idx] >= (uint32_t)method.rtt_bin_min_samples) {
+        node.algo_offset_us = node.rtt_bin_offsets[idx];
+        node.algo_offset_time_us = now_us;
+        node.algo_offset_valid = true;
+    }
+}
+
+static void UpdateSawtoothDetector(NodeState& node, uint64_t now_us, const MethodConfig& method)
+{
+    if (!method.saw_use) {
+        return;
+    }
+    if (node.saw_short_restore_us > 0 && now_us >= node.saw_short_restore_us) {
+        if (node.saw_short_base_us > 0) {
+            node.stats_short_window_us = node.saw_short_base_us;
+            node.short_stats.Reset(node.stats_short_window_us);
+            node.next_short_stats_us = now_us + node.stats_short_window_us;
+        }
+        node.saw_short_restore_us = 0;
+    }
+    if (!node.short_snapshot.valid) {
+        return;
+    }
+    const double value = node.short_snapshot.p10;
+    if (!node.saw_samples.empty()) {
+        const double delta = value - node.saw_samples.back().value_us;
+        if (std::fabs(delta) >= method.saw_slope_min_us) {
+            const int sign = (delta > 0.0) ? 1 : -1;
+            if (node.saw_last_sign == 0) {
+                node.saw_last_sign = sign;
+            } else if (sign != node.saw_last_sign) {
+                node.saw_last_sign = sign;
+                node.saw_flip_times.push_back(now_us);
+                while (node.saw_flip_times.size() > method.saw_min_flips) {
+                    node.saw_flip_times.pop_front();
+                }
+            }
+        }
+    }
+    SlopeSample sample;
+    sample.value_us = value;
+    sample.t_us = now_us;
+    node.saw_samples.push_back(sample);
+    while (node.saw_samples.size() > 100) {
+        node.saw_samples.pop_front();
+    }
+
+    if (node.saw_flip_times.size() >= method.saw_min_flips) {
+        double sum = 0.0;
+        std::vector<double> intervals;
+        for (size_t i = 1; i < node.saw_flip_times.size(); ++i) {
+            const double dt = (double)(node.saw_flip_times[i] - node.saw_flip_times[i - 1]);
+            intervals.push_back(dt);
+            sum += dt;
+        }
+        if (!intervals.empty()) {
+            const double avg = sum / intervals.size();
+            if (avg >= (double)method.saw_period_min_us &&
+                avg <= (double)method.saw_period_max_us) {
+                bool ok = true;
+                for (double dt : intervals) {
+                    if (avg <= 0.0) {
+                        ok = false;
+                        break;
+                    }
+                    if (std::fabs(dt - avg) / avg > method.saw_period_tol) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) {
+                    const uint64_t target = std::max<uint64_t>(method.saw_short_window_us,
+                        (uint64_t)(2.0 * avg));
+                    if (target > node.stats_short_window_us) {
+                        if (node.saw_short_base_us == 0) {
+                            node.saw_short_base_us = node.stats_short_window_us;
+                        }
+                        node.stats_short_window_us = target;
+                        node.short_stats.Reset(node.stats_short_window_us);
+                        node.next_short_stats_us = now_us + node.stats_short_window_us;
+                    }
+                    node.saw_hold_until_us = now_us + method.saw_hold_us;
+                    node.saw_short_restore_us = node.saw_hold_until_us;
+                }
+            }
+        }
+    }
+}
+
+static void ResetLongBins(LongWindowBins& bins, uint64_t now_us, double seed_us)
+{
+    for (auto& b : bins.bins) {
+        b.valid = false;
+        b.count = 0;
+    }
+    if (bins.bins.empty()) {
+        return;
+    }
+    const uint64_t sec = now_us / bins.bin_us;
+    const size_t idx = (size_t)(sec % bins.bins.size());
+    auto& bin = bins.bins[idx];
+    bin.valid = true;
+    bin.sec = sec;
+    bin.count = 1;
+    bin.min_us = seed_us;
+    bin.min_time_us = now_us;
+}
+
+static void ApplyLongBinStepReset(NodeState& node, uint64_t now_us, double seed_us)
+{
+    ResetLongBins(node.long_bins, now_us, seed_us);
+    node.long_min_us = seed_us;
+    node.long_min_time_us = now_us;
+    node.long_min_valid = true;
+}
+
+static void ApplyTiltedStepReset(NodeState& node, uint64_t now_us, double seed_us, double skew_ppm)
+{
+    ApplyLongBinStepReset(node, now_us, seed_us);
+    if (node.tilted_bins.window_us > 0) {
+        const double r_dir = -skew_ppm;
+        const double t_s = (double)now_us * 1e-6;
+        const double tilted_seed = seed_us - r_dir * t_s;
+        ResetLongBins(node.tilted_bins, now_us, tilted_seed);
+        node.tilted_min_us = tilted_seed;
+        node.tilted_min_time_us = now_us;
+        node.tilted_min_valid = true;
+    }
+    node.effective_min_us = seed_us;
+    node.effective_min_time_us = now_us;
+    node.effective_min_valid = true;
+}
+
+static void UpdateDDAC(
+    NodeState& node,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool rtt_guard_ok)
+{
+    if (!node.long_min_valid || !node.short_snapshot.valid || !node.ddac_peer_valid) {
+        return;
+    }
+
+    const double p10_in = node.short_snapshot.p10;
+    const double p0_in = node.short_snapshot.p0;
+    const double iqr_in = node.short_snapshot.iqr;
+    const size_t count_in = node.short_snapshot.count;
+    const double jitter_in = std::max(0.0, p10_in - p0_in);
+
+    const double p10_out = node.ddac_peer_p10_us;
+    const double p0_out = node.ddac_peer_p0_us;
+    const double iqr_out = node.ddac_peer_iqr_us;
+    const size_t count_out = node.ddac_peer_count;
+    const double jitter_out = std::max(0.0, p10_out - p0_out);
+
+    const double iqr_max_in = std::max(method.ddac_iqr_min_us, method.ddac_iqr_k * jitter_in);
+    const double iqr_max_out = std::max(method.ddac_iqr_min_us, method.ddac_iqr_k * jitter_out);
+    const bool enough_in = (count_in >= method.ddac_npkt_min);
+    const bool enough_out = (count_out >= method.ddac_npkt_min);
+    const bool stable_in = enough_in && (iqr_in <= iqr_max_in);
+    const bool stable_out = enough_out && (iqr_out <= iqr_max_out);
+
+    if (now_us >= node.ddac_holdoff_until_us &&
+        stable_in && stable_out &&
+        (!method.ddac_use_rtt_guard || rtt_guard_ok)) {
+        if (node.ddac_prev_valid && node.ddac_peer_seq > node.ddac_prev_seq) {
+            const double dt = (double)(node.ddac_peer_seq - node.ddac_prev_seq);
+            const double slope_in = (p10_in - node.ddac_prev_p10_in) / dt;
+            const double slope_out = (p10_out - node.ddac_prev_p10_out) / dt;
+            const double skew_cand = 0.5 * (slope_in - slope_out);
+            const double net_cand = 0.5 * (slope_in + slope_out);
+            if (std::fabs(net_cand) <= method.ddac_net_slope_max) {
+                const double beta = (method.ddac_beta > 0.0) ? method.ddac_beta : 0.05;
+                const double max_ppm = (method.ddac_max_ppm > 0.0) ? method.ddac_max_ppm : 200.0;
+                double skew = node.ddac_skew_valid ? node.ddac_skew_ppm : skew_cand;
+                skew = (1.0 - beta) * skew + beta * skew_cand;
+                skew = std::max(-max_ppm, std::min(max_ppm, skew));
+                node.ddac_skew_ppm = skew;
+                node.ddac_skew_valid = true;
+                node.ddac_skew_updates++;
+            }
+        }
+    }
+
+    node.ddac_prev_p10_in = p10_in;
+    node.ddac_prev_p10_out = p10_out;
+    node.ddac_prev_seq = node.ddac_peer_seq;
+    node.ddac_prev_valid = true;
+
+    double skew_ppm = node.ddac_skew_valid ? node.ddac_skew_ppm : 0.0;
+    if (std::fabs(skew_ppm) < method.ddac_min_ppm) {
+        skew_ppm = 0.0;
+    }
+
+    const uint64_t age_in_us = (now_us > node.long_min_time_us) ? (now_us - node.long_min_time_us) : 0;
+    uint64_t age_out_us = node.ddac_peer_age_us;
+    if (method.ddac_use_peer_age_elapsed && now_us > node.ddac_peer_rx_us) {
+        age_out_us += (now_us - node.ddac_peer_rx_us);
+    }
+
+    const double gap_in = p10_in - node.long_min_us;
+    const double gap_out = p10_out - node.ddac_peer_min_long_us;
+    node.ddac_gap_in_us.Add(gap_in);
+    node.ddac_gap_out_us.Add(gap_out);
+
+    bool sticky_in = (skew_ppm > 0.0);
+    bool sticky_out = (skew_ppm < 0.0);
+    if (method.ddac_use_age_gap) {
+        sticky_in = sticky_in && (age_in_us > age_out_us + method.ddac_age_gap_us);
+        sticky_out = sticky_out && (age_out_us > age_in_us + method.ddac_age_gap_us);
+    }
+
+    double clamp_in = method.ddac_clamp_margin_us;
+    double clamp_out = method.ddac_clamp_margin_us;
+    if (method.ddac_clamp_k > 0.0) {
+        clamp_in = std::max(clamp_in, method.ddac_clamp_k * iqr_in);
+        clamp_out = std::max(clamp_out, method.ddac_clamp_k * iqr_out);
+    }
+
+    double min_in_use = node.long_min_us;
+    double min_out_use = node.ddac_peer_min_long_us;
+
+    if (sticky_in) {
+        const double age_s = (double)age_in_us * 1e-6;
+        const double min_adj = node.long_min_us + skew_ppm * age_s;
+        const double upper = p10_in + clamp_in;
+        const double clamped = std::min(std::max(min_adj, node.long_min_us), upper);
+        if (min_adj > upper || min_adj < node.long_min_us) {
+            node.ddac_clamp_hits++;
+        }
+        min_in_use = clamped;
+        node.ddac_age_comp++;
+    } else if (sticky_out) {
+        const double age_s = (double)age_out_us * 1e-6;
+        const double min_adj = node.ddac_peer_min_long_us + (-skew_ppm) * age_s;
+        const double upper = p10_out + clamp_out;
+        const double clamped = std::min(std::max(min_adj, node.ddac_peer_min_long_us), upper);
+        if (min_adj > upper || min_adj < node.ddac_peer_min_long_us) {
+            node.ddac_clamp_hits++;
+        }
+        min_out_use = clamped;
+        node.ddac_age_comp++;
+    }
+
+    node.effective_min_us = min_in_use;
+    node.effective_min_time_us = now_us;
+    node.effective_min_valid = true;
+    node.peer_min_us = min_out_use;
+    node.peer_min_valid = true;
+
+    bool step_rtt_ok = rtt_guard_ok;
+    if (method.ddac_use_rtt_guard && method.ddac_step_rtt_guard_us > 0.0) {
+        ShortStatsSnapshot peer_short;
+        peer_short.valid = (count_out > 0);
+        peer_short.p10 = p10_out;
+        peer_short.iqr = iqr_out;
+        double rtt_short = 0.0;
+        double rtt_long = 0.0;
+        double rtt_iqr = 0.0;
+        double rtt_delta = 0.0;
+        const double delta_max = method.ddac_step_rtt_guard_us;
+        const double iqr_max = (method.rtt_guard_iqr_us > 0.0)
+            ? method.rtt_guard_iqr_us
+            : method.ddac_step_rtt_guard_us;
+        step_rtt_ok = EvaluateRttGuard(peer_short,
+            node.short_snapshot,
+            node.ddac_peer_min_long_us,
+            node.long_min_us,
+            delta_max,
+            iqr_max,
+            rtt_short,
+            rtt_long,
+            rtt_iqr,
+            rtt_delta);
+    }
+
+    bool step_gate_ok = (!method.ddac_use_rtt_guard || step_rtt_ok);
+    if (method.ddac_step_require_stable) {
+        step_gate_ok = step_gate_ok && stable_in && stable_out;
+    } else {
+        step_gate_ok = step_gate_ok && enough_in && enough_out;
+    }
+
+    if (method.ddac_enable_step && step_gate_ok) {
+        const bool step_in = gap_in > method.ddac_step_gb_us;
+        const bool step_out = gap_out > method.ddac_step_gb_us;
+        if (step_in) {
+            node.ddac_step_in_hits++;
+        }
+        if (step_out) {
+            node.ddac_step_out_hits++;
+        }
+        if ((step_in ^ step_out)) {
+            node.ddac_step_streak++;
+            node.ddac_step_xor_hits++;
+        } else {
+            node.ddac_step_streak = 0;
+        }
+        if (node.ddac_step_streak > node.ddac_step_streak_max) {
+            node.ddac_step_streak_max = node.ddac_step_streak;
+        }
+        if (node.ddac_step_streak >= std::max(1, method.ddac_step_n_consec)) {
+            if (step_in) {
+                ResetLongBins(node.long_bins, now_us, p10_in);
+            }
+            node.ddac_holdoff_until_us = now_us + method.ddac_step_holdoff_us;
+            node.ddac_step_streak = 0;
+            node.ddac_step_resets++;
+        }
+    }
+
+    UpdateAlgoOffset(node, now_us);
+}
+
+static void UpdateDDACBlend(
+    NodeState& node,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool rtt_guard_ok)
+{
+    if (!node.long_min_valid || !node.short_snapshot.valid || !node.ddac_peer_valid) {
+        return;
+    }
+
+    const double p10_in = node.short_snapshot.p10;
+    const double p0_in = node.short_snapshot.p0;
+    const double iqr_in = node.short_snapshot.iqr;
+    const size_t count_in = node.short_snapshot.count;
+    const double jitter_in = std::max(0.0, p10_in - p0_in);
+
+    const double p10_out = node.ddac_peer_p10_us;
+    const double p0_out = node.ddac_peer_p0_us;
+    const double iqr_out = node.ddac_peer_iqr_us;
+    const size_t count_out = node.ddac_peer_count;
+    const double jitter_out = std::max(0.0, p10_out - p0_out);
+
+    const double iqr_max_in = std::max(method.ddac_iqr_min_us, method.ddac_iqr_k * jitter_in);
+    const double iqr_max_out = std::max(method.ddac_iqr_min_us, method.ddac_iqr_k * jitter_out);
+    const bool enough_in = (count_in >= method.ddac_npkt_min);
+    const bool enough_out = (count_out >= method.ddac_npkt_min);
+    const bool stable_in = enough_in && (iqr_in <= iqr_max_in);
+    const bool stable_out = enough_out && (iqr_out <= iqr_max_out);
+
+    if (now_us >= node.ddac_holdoff_until_us &&
+        stable_in && stable_out &&
+        (!method.ddac_use_rtt_guard || rtt_guard_ok)) {
+        if (node.ddac_prev_valid && node.ddac_peer_seq > node.ddac_prev_seq) {
+            const double dt = (double)(node.ddac_peer_seq - node.ddac_prev_seq);
+            const double slope_in = (p10_in - node.ddac_prev_p10_in) / dt;
+            const double slope_out = (p10_out - node.ddac_prev_p10_out) / dt;
+            const double skew_cand = 0.5 * (slope_in - slope_out);
+            const double net_cand = 0.5 * (slope_in + slope_out);
+            if (std::fabs(net_cand) <= method.ddac_net_slope_max) {
+                const double beta = (method.ddac_beta > 0.0) ? method.ddac_beta : 0.05;
+                const double max_ppm = (method.ddac_max_ppm > 0.0) ? method.ddac_max_ppm : 200.0;
+                double skew = node.ddac_skew_valid ? node.ddac_skew_ppm : skew_cand;
+                skew = (1.0 - beta) * skew + beta * skew_cand;
+                skew = std::max(-max_ppm, std::min(max_ppm, skew));
+                node.ddac_skew_ppm = skew;
+                node.ddac_skew_valid = true;
+                node.ddac_skew_updates++;
+            }
+        }
+    }
+
+    node.ddac_prev_p10_in = p10_in;
+    node.ddac_prev_p10_out = p10_out;
+    node.ddac_prev_seq = node.ddac_peer_seq;
+    node.ddac_prev_valid = true;
+
+    double skew_ppm = node.ddac_skew_valid ? node.ddac_skew_ppm : 0.0;
+    if (std::fabs(skew_ppm) < method.ddac_min_ppm) {
+        skew_ppm = 0.0;
+    }
+
+    const uint64_t age_in_us = (now_us > node.long_min_time_us) ? (now_us - node.long_min_time_us) : 0;
+    uint64_t age_out_us = node.ddac_peer_age_us;
+    if (method.ddac_use_peer_age_elapsed && now_us > node.ddac_peer_rx_us) {
+        age_out_us += (now_us - node.ddac_peer_rx_us);
+    }
+
+    const double gap_in = p10_in - node.long_min_us;
+    const double gap_out = p10_out - node.ddac_peer_min_long_us;
+    node.ddac_gap_in_us.Add(gap_in);
+    node.ddac_gap_out_us.Add(gap_out);
+
+    bool sticky_in = (skew_ppm > 0.0);
+    bool sticky_out = (skew_ppm < 0.0);
+    if (method.ddac_use_age_gap) {
+        sticky_in = sticky_in && (age_in_us > age_out_us + method.ddac_age_gap_us);
+        sticky_out = sticky_out && (age_out_us > age_in_us + method.ddac_age_gap_us);
+    }
+
+    double clamp_in = method.ddac_clamp_margin_us;
+    double clamp_out = method.ddac_clamp_margin_us;
+    if (method.ddac_clamp_k > 0.0) {
+        clamp_in = std::max(clamp_in, method.ddac_clamp_k * iqr_in);
+        clamp_out = std::max(clamp_out, method.ddac_clamp_k * iqr_out);
+    }
+
+    double min_in_ddac = node.long_min_us;
+    double min_out_ddac = node.ddac_peer_min_long_us;
+
+    if (sticky_in) {
+        const double age_s = (double)age_in_us * 1e-6;
+        const double min_adj = node.long_min_us + skew_ppm * age_s;
+        const double upper = p10_in + clamp_in;
+        const double clamped = std::min(std::max(min_adj, node.long_min_us), upper);
+        if (min_adj > upper || min_adj < node.long_min_us) {
+            node.ddac_clamp_hits++;
+        }
+        min_in_ddac = clamped;
+        node.ddac_age_comp++;
+    } else if (sticky_out) {
+        const double age_s = (double)age_out_us * 1e-6;
+        const double min_adj = node.ddac_peer_min_long_us + (-skew_ppm) * age_s;
+        const double upper = p10_out + clamp_out;
+        const double clamped = std::min(std::max(min_adj, node.ddac_peer_min_long_us), upper);
+        if (min_adj > upper || min_adj < node.ddac_peer_min_long_us) {
+            node.ddac_clamp_hits++;
+        }
+        min_out_ddac = clamped;
+        node.ddac_age_comp++;
+    }
+
+    double weight = 0.0;
+    if (stable_in && stable_out && (!method.ddac_use_rtt_guard || rtt_guard_ok)) {
+        const double denom = (method.ddac_blend_skew_ppm > 0.0) ? method.ddac_blend_skew_ppm : 50.0;
+        weight = std::min(1.0, std::fabs(skew_ppm) / denom);
+    }
+
+    const double min_in_use = node.long_min_us * (1.0 - weight) + min_in_ddac * weight;
+    const double min_out_use = node.ddac_peer_min_long_us * (1.0 - weight) + min_out_ddac * weight;
+
+    node.effective_min_us = min_in_use;
+    node.effective_min_time_us = now_us;
+    node.effective_min_valid = true;
+    node.peer_min_us = min_out_use;
+    node.peer_min_valid = true;
+
+    bool step_rtt_ok = rtt_guard_ok;
+    if (method.ddac_use_rtt_guard && method.ddac_step_rtt_guard_us > 0.0) {
+        ShortStatsSnapshot peer_short;
+        peer_short.valid = (count_out > 0);
+        peer_short.p10 = p10_out;
+        peer_short.iqr = iqr_out;
+        double rtt_short = 0.0;
+        double rtt_long = 0.0;
+        double rtt_iqr = 0.0;
+        double rtt_delta = 0.0;
+        const double delta_max = method.ddac_step_rtt_guard_us;
+        const double iqr_max = (method.rtt_guard_iqr_us > 0.0)
+            ? method.rtt_guard_iqr_us
+            : method.ddac_step_rtt_guard_us;
+        step_rtt_ok = EvaluateRttGuard(peer_short,
+            node.short_snapshot,
+            node.ddac_peer_min_long_us,
+            node.long_min_us,
+            delta_max,
+            iqr_max,
+            rtt_short,
+            rtt_long,
+            rtt_iqr,
+            rtt_delta);
+    }
+
+    bool step_gate_ok = (!method.ddac_use_rtt_guard || step_rtt_ok);
+    if (method.ddac_step_require_stable) {
+        step_gate_ok = step_gate_ok && stable_in && stable_out;
+    } else {
+        step_gate_ok = step_gate_ok && enough_in && enough_out;
+    }
+
+    if (method.ddac_enable_step && step_gate_ok) {
+        const bool step_in = gap_in > method.ddac_step_gb_us;
+        const bool step_out = gap_out > method.ddac_step_gb_us;
+        if (step_in) {
+            node.ddac_step_in_hits++;
+        }
+        if (step_out) {
+            node.ddac_step_out_hits++;
+        }
+        if ((step_in ^ step_out)) {
+            node.ddac_step_streak++;
+            node.ddac_step_xor_hits++;
+        } else {
+            node.ddac_step_streak = 0;
+        }
+        if (node.ddac_step_streak > node.ddac_step_streak_max) {
+            node.ddac_step_streak_max = node.ddac_step_streak;
+        }
+        if (node.ddac_step_streak >= std::max(1, method.ddac_step_n_consec)) {
+            if (step_in) {
+                ResetLongBins(node.long_bins, now_us, p10_in);
+            }
+            node.ddac_holdoff_until_us = now_us + method.ddac_step_holdoff_us;
+            node.ddac_step_streak = 0;
+            node.ddac_step_resets++;
+        }
+    }
+
+    UpdateAlgoOffset(node, now_us);
+}
+
+static void UpdateTiltedMin(
+    NodeState& node,
+    uint64_t now_us,
+    double delta_us,
+    double skew_ppm)
+{
+    if (node.tilted_bins.window_us == 0) {
+        return;
+    }
+    const double r_dir = -skew_ppm;
+    const double t_s = (double)now_us * 1e-6;
+    const double tilted = delta_us - r_dir * t_s;
+    node.tilted_bins.Update(now_us, tilted);
+
+    double min_tilted = 0.0;
+    uint64_t min_time = 0;
+    uint32_t count = 0;
+    if (node.tilted_bins.GetMin(now_us, min_tilted, min_time, count)) {
+        node.tilted_min_us = min_tilted;
+        node.tilted_min_time_us = min_time;
+        node.tilted_min_valid = true;
+        node.effective_min_us = min_tilted + r_dir * t_s;
+        node.effective_min_time_us = now_us;
+        node.effective_min_valid = true;
+        node.tilted_updates++;
+    }
+}
+
+static void UpdateHybridSelector(
+    NodeState& node,
+    uint64_t now_us,
+    double delta_signal_us,
+    double trigger_us,
+    double var_threshold_us2,
+    size_t window_size,
+    int sign_count_req,
+    uint64_t hold_us)
+{
+    if (node.last_timesync_offset_valid) {
+        const double delta = delta_signal_us - node.last_timesync_offset_us;
+        if (!AcceptRobustDelta(node, delta)) {
+            return;
+        }
+        const double delta_mag = std::fabs(delta);
+        node.hybrid_delta_window.push_back(delta_mag);
+        while (node.hybrid_delta_window.size() > window_size) {
+            node.hybrid_delta_window.pop_front();
+        }
+        double mean = 0.0;
+        for (double v : node.hybrid_delta_window) {
+            mean += v;
+        }
+        mean = (node.hybrid_delta_window.empty() ? 0.0 : mean / node.hybrid_delta_window.size());
+        double var = 0.0;
+        for (double v : node.hybrid_delta_window) {
+            const double d = v - mean;
+            var += d * d;
+        }
+        var = (node.hybrid_delta_window.empty() ? 0.0 : var / node.hybrid_delta_window.size());
+
+        if (delta_mag >= trigger_us) {
+            const int sign = (delta > 0.0) ? 1 : -1;
+            if (node.hybrid_sign == sign) {
+                node.hybrid_trigger_count++;
+            } else {
+                node.hybrid_sign = sign;
+                node.hybrid_trigger_count = 1;
+            }
+        } else {
+            node.hybrid_sign = 0;
+            node.hybrid_trigger_count = 0;
+        }
+
+        if (node.hybrid_trigger_count >= sign_count_req && var <= var_threshold_us2) {
+            node.hybrid_use_fast = true;
+            node.hybrid_hold_until_us = now_us + hold_us;
+            node.hybrid_trigger_count = 0;
+            node.hybrid_sign = 0;
+        } else if (node.hybrid_use_fast && node.hybrid_hold_until_us > 0 && now_us >= node.hybrid_hold_until_us) {
+            node.hybrid_use_fast = false;
+        }
+    }
+    node.last_timesync_offset_us = delta_signal_us;
+    node.last_timesync_offset_valid = true;
+}
+
+static void UpdateAdaptiveDriftWindow(
+    NodeState& node,
+    uint64_t now_us,
+    double offset_us,
+    uint64_t min_window_us,
+    uint64_t max_window_us,
+    double trigger_us,
+    double stationary_var_max_us2,
+    double stationary_delta_max_us,
+    size_t stationary_window_size,
+    bool force_trigger,
+    int trigger_count_req,
+    double shrink_ratio,
+    double expand_ratio)
+{
+    if (min_window_us == 0) {
+        min_window_us = 100000;
+    }
+    if (max_window_us == 0) {
+        max_window_us = 1000000;
+    }
+    if (node.drift_window_us == 0) {
+        node.drift_window_us = max_window_us;
+        node.timesync.SetDriftWindowUsec(node.drift_window_us);
+    }
+    if (node.last_timesync_offset_valid) {
+        const double delta_signed = offset_us - node.last_timesync_offset_us;
+        const double delta = std::fabs(delta_signed);
+        if (!AcceptRobustDelta(node, delta_signed)) {
+            return;
+        }
+        bool allow_shrink = true;
+        if (stationary_var_max_us2 > 0.0) {
+            const size_t window_size = (stationary_window_size > 0) ? stationary_window_size : 20;
+            node.offset_delta_window.push_back(delta);
+            while (node.offset_delta_window.size() > window_size) {
+                node.offset_delta_window.pop_front();
+            }
+            double mean = 0.0;
+            for (double v : node.offset_delta_window) {
+                mean += v;
+            }
+            mean = (node.offset_delta_window.empty() ? 0.0 : mean / node.offset_delta_window.size());
+            double var = 0.0;
+            for (double v : node.offset_delta_window) {
+                const double d = v - mean;
+                var += d * d;
+            }
+            var = (node.offset_delta_window.empty() ? 0.0 : var / node.offset_delta_window.size());
+            const bool stationary = (var <= stationary_var_max_us2) &&
+                (stationary_delta_max_us <= 0.0 || delta <= stationary_delta_max_us);
+            if (stationary) {
+                allow_shrink = false;
+            }
+        }
+        const bool triggered = force_trigger || (allow_shrink && delta >= trigger_us);
+        const int required = (trigger_count_req > 0) ? trigger_count_req : 1;
+        if (triggered) {
+            node.adaptive_trigger_count++;
+        } else {
+            node.adaptive_trigger_count = 0;
+        }
+        if (node.adaptive_trigger_count >= required) {
+            uint64_t new_window = min_window_us;
+            if (shrink_ratio > 0.0 && shrink_ratio < 1.0) {
+                new_window = std::max<uint64_t>(min_window_us,
+                    (uint64_t)std::max<double>(1.0, node.drift_window_us * shrink_ratio));
+            }
+            if (node.drift_window_us != new_window) {
+                node.drift_window_us = new_window;
+                node.timesync.SetDriftWindowUsec(node.drift_window_us);
+            }
+            node.drift_window_restore_us = now_us + max_window_us;
+            node.adaptive_trigger_count = 0;
+        } else if (node.drift_window_restore_us > 0 && now_us >= node.drift_window_restore_us) {
+            if (node.drift_window_us < max_window_us) {
+                const double grow = (expand_ratio > 0.0) ? expand_ratio : 2.0;
+                node.drift_window_us = std::min(max_window_us,
+                    (uint64_t)std::max<double>(1.0, node.drift_window_us * grow));
+                node.timesync.SetDriftWindowUsec(node.drift_window_us);
+                node.drift_window_restore_us = now_us + max_window_us;
+            }
+        }
+    }
+    node.last_timesync_offset_us = offset_us;
+    node.last_timesync_offset_valid = true;
+}
+
+static void UpdateStepResetWindow(
+    NodeState& node,
+    uint64_t now_us,
+    double offset_us,
+    const MethodConfig& method,
+    uint64_t min_window_us,
+    uint64_t max_window_us,
+    double step_threshold_us,
+    uint64_t hold_us)
+{
+    if (min_window_us == 0) {
+        min_window_us = 100000;
+    }
+    if (max_window_us == 0) {
+        max_window_us = 1000000;
+    }
+    if (node.drift_window_us == 0) {
+        node.drift_window_us = max_window_us;
+        node.timesync.SetDriftWindowUsec(node.drift_window_us);
+    }
+    if (node.last_timesync_offset_valid) {
+        if (method.stepreset_use_rtt_guard && !node.stepreset_guard_ok) {
+            node.last_timesync_offset_us = offset_us;
+            node.last_timesync_offset_valid = true;
+            return;
+        }
+        if (method.stepreset_use_xor_gate && !node.stepreset_xor_ok) {
+            node.last_timesync_offset_us = offset_us;
+            node.last_timesync_offset_valid = true;
+            return;
+        }
+        if (method.stepreset_use_sticky_gate && !node.stepreset_dir_ok) {
+            node.last_timesync_offset_us = offset_us;
+            node.last_timesync_offset_valid = true;
+            return;
+        }
+        const double delta_signed = offset_us - node.last_timesync_offset_us;
+        const double delta = std::fabs(delta_signed);
+        if (!AcceptRobustDelta(node, delta_signed)) {
+            return;
+        }
+        if (delta >= step_threshold_us) {
+            node.drift_window_us = min_window_us;
+            node.timesync.SetDriftWindowUsec(node.drift_window_us);
+            node.drift_window_restore_us = now_us + hold_us;
+        } else if (node.drift_window_restore_us > 0 && now_us >= node.drift_window_restore_us) {
+            if (node.drift_window_us != max_window_us) {
+                node.drift_window_us = max_window_us;
+                node.timesync.SetDriftWindowUsec(node.drift_window_us);
+            }
+        }
+    }
+    node.last_timesync_offset_us = offset_us;
+    node.last_timesync_offset_valid = true;
+}
+
+static bool UpdateTimeSyncOffsetSample(NodeState& node, uint64_t local_time_us, double& out_offset_us)
+{
+    uint64_t remote_est_us = 0;
+    if (!node.timesync.GetRemoteTimeUsec(local_time_us, remote_est_us)) {
+        return false;
+    }
+    out_offset_us = (double)remote_est_us - (double)local_time_us;
+    node.ts_offset_us = out_offset_us;
+    node.ts_offset_time_us = local_time_us;
+    node.ts_offset_valid = true;
+    return true;
+}
+
+static bool UpdateTimeSyncShortOffsetSample(
+    NodeState& node,
+    uint64_t local_time_us,
+    double& out_offset_us)
+{
+    uint64_t remote_est_us = 0;
+    if (!node.timesync_short.GetRemoteTimeUsec(local_time_us, remote_est_us)) {
+        return false;
+    }
+    out_offset_us = (double)remote_est_us - (double)local_time_us;
+    return true;
+}
+
+static bool ComputeEnsembleOffset(
+    const MethodConfig& method,
+    NodeState& node,
+    uint64_t local_time_us,
+    double& out_offset_us)
+{
+    uint64_t remote_slow = 0;
+    uint64_t remote_fast = 0;
+    const bool slow_ok = node.timesync.GetRemoteTimeUsec(local_time_us, remote_slow);
+    const bool fast_ok = node.timesync_short.GetRemoteTimeUsec(local_time_us, remote_fast);
+    if (!slow_ok && !fast_ok) {
+        return false;
+    }
+    const double slow_offset = slow_ok ? ((double)remote_slow - (double)local_time_us) : 0.0;
+    const double fast_offset = fast_ok ? ((double)remote_fast - (double)local_time_us) : 0.0;
+    if (!slow_ok) {
+        out_offset_us = fast_offset;
+        return true;
+    }
+    if (!fast_ok) {
+        out_offset_us = slow_offset;
+        return true;
+    }
+
+    double w = std::min(1.0, std::max(0.0, method.ensemble_blend));
+    if (method.ensemble_use_confidence) {
+        auto clamp01 = [](double v) {
+            return std::max(0.0, std::min(1.0, v));
+        };
+        if (!node.short_snapshot.valid) {
+            w = 0.0;
+        } else {
+            const double count = (node.short_snapshot.count > 0)
+                ? (double)node.short_snapshot.count : 1.0;
+            const double jitter = std::max(0.0, node.short_snapshot.p10 - node.short_snapshot.p0);
+            const double iqr_max = std::max(method.ensemble_iqr_min_us, method.ensemble_iqr_k * jitter);
+            double conf = 1.0;
+            if (method.ensemble_npkt_min > 0) {
+                conf *= clamp01(count / (double)method.ensemble_npkt_min);
+            }
+            if (iqr_max > 0.0) {
+                conf *= clamp01(1.0 - (node.short_snapshot.iqr / iqr_max));
+            }
+            w *= conf;
+        }
+    }
+    out_offset_us = slow_offset * (1.0 - w) + fast_offset * w;
+    return true;
+}
+
+static bool UpdateHysteresisGspTrigger(
+    NodeState& node,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool rtt_guard_ok)
+{
+    if (!method.hyst_use_gsp) {
+        return false;
+    }
+    if (!EnsureEffectiveMin(node) || !node.short_snapshot.valid) {
+        node.gsp_stale_streak = 0;
+        return false;
+    }
+    if (method.gsp_use_rtt_guard && !rtt_guard_ok) {
+        node.gsp_stale_streak = 0;
+        return false;
+    }
+    const double jitter = GuardJitter(node, method);
+    const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+    const double iqr_max = std::max(method.gsp_iqr_min_us, method.gsp_iqr_k * jitter);
+    const bool stable = node.short_snapshot.iqr <= iqr_max;
+    const bool enough = node.short_snapshot.count >= method.gsp_npkt_min;
+    const bool no_near = node.short_snapshot.near_hits == 0;
+    const bool stale = node.short_snapshot.p10 > node.effective_min_us + gb;
+    const bool age_ok = (method.gsp_age_ok_us == 0 ||
+        (now_us - node.effective_min_time_us >= method.gsp_age_ok_us));
+
+    if (stale && stable && enough && no_near && age_ok) {
+        node.gsp_stale_streak++;
+    } else {
+        node.gsp_stale_streak = 0;
+    }
+    return node.gsp_stale_streak >= std::max(1, method.gsp_n_consec);
+}
+
+static void UpdateAdaptiveTriggers(
+    NodeState& node,
+    uint64_t now_us,
+    const MethodConfig& method,
+    bool rtt_ready,
+    double rtt_delta,
+    double rtt_iqr)
+{
+    bool force = false;
+
+    if (method.adaptive_use_rtt_delta && rtt_ready && method.adaptive_rtt_delta_us > 0.0) {
+        if (rtt_delta >= method.adaptive_rtt_delta_us) {
+            force = true;
+        }
+    }
+    if (method.adaptive_use_rtt_iqr && rtt_ready && method.adaptive_rtt_iqr_us > 0.0) {
+        double threshold = method.adaptive_rtt_iqr_us;
+        if (method.adaptive_trigger_use_jitter && node.short_snapshot.valid) {
+            const double jitter = GuardJitter(node, method);
+            const double scaled = method.adaptive_trigger_jitter_min_us +
+                method.adaptive_trigger_jitter_k * jitter;
+            if (scaled > threshold) {
+                threshold = scaled;
+            }
+        }
+        if (rtt_iqr >= threshold) {
+            force = true;
+        }
+    }
+    if (method.adaptive_use_gsp_trigger) {
+        if (EnsureEffectiveMin(node) && node.short_snapshot.valid) {
+            const double jitter = GuardJitter(node, method);
+            const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+            const double iqr_max = std::max(method.gsp_iqr_min_us, method.gsp_iqr_k * jitter);
+            const bool stable = node.short_snapshot.iqr <= iqr_max;
+            const bool enough = node.short_snapshot.count >= method.gsp_npkt_min;
+            const bool no_near = node.short_snapshot.near_hits == 0;
+            const bool stale = node.short_snapshot.p10 > node.effective_min_us + gb;
+            const bool age_ok = (method.gsp_age_ok_us == 0 ||
+                (now_us - node.effective_min_time_us >= method.gsp_age_ok_us));
+            if (stale && stable && enough && no_near && age_ok) {
+                node.gsp_stale_streak++;
+            } else {
+                node.gsp_stale_streak = 0;
+            }
+            if (node.gsp_stale_streak >= std::max(1, method.gsp_n_consec)) {
+                node.gsp_stale_streak = 0;
+                force = true;
+            }
+        } else {
+            node.gsp_stale_streak = 0;
+        }
+    }
+    if (method.adaptive_use_cse_trigger && node.cse_skew_valid &&
+        method.adaptive_skew_trigger_ppm > 0.0 && method.adaptive_age_trigger_us > 0) {
+        const double skew = std::fabs(node.cse_skew_ppm);
+        if (skew >= method.adaptive_skew_trigger_ppm && node.long_min_valid) {
+            const uint64_t age_us = (now_us > node.long_min_time_us)
+                ? (now_us - node.long_min_time_us)
+                : 0ULL;
+            if (age_us >= method.adaptive_age_trigger_us) {
+                force = true;
+            }
+        }
+    }
+
+    if (force) {
+        node.adaptive_force_trigger = true;
+    }
+}
+
+static void UpdateHysteresisWindow(
+    NodeState& node,
+    uint64_t now_us,
+    double offset_us,
+    uint64_t min_window_us,
+    uint64_t max_window_us,
+    double trigger_us,
+    int trigger_count_req,
+    uint64_t hold_us,
+    bool force_trigger)
+{
+    if (min_window_us == 0) {
+        min_window_us = 100000;
+    }
+    if (max_window_us == 0) {
+        max_window_us = 1000000;
+    }
+    if (node.drift_window_us == 0) {
+        node.drift_window_us = max_window_us;
+        node.timesync.SetDriftWindowUsec(node.drift_window_us);
+    }
+    if (node.last_timesync_offset_valid) {
+        if (force_trigger) {
+            node.adaptive_trigger_count++;
+        } else {
+            const double delta_signed = offset_us - node.last_timesync_offset_us;
+            const double delta = std::fabs(delta_signed);
+            if (!AcceptRobustDelta(node, delta_signed)) {
+                return;
+            }
+            if (delta >= trigger_us) {
+                node.adaptive_trigger_count++;
+            } else {
+                node.adaptive_trigger_count = 0;
+            }
+        }
+        if (node.adaptive_trigger_count >= trigger_count_req) {
+            node.drift_window_us = min_window_us;
+            node.timesync.SetDriftWindowUsec(node.drift_window_us);
+            node.adaptive_hold_until_us = now_us + hold_us;
+            node.adaptive_trigger_count = 0;
+        } else if (node.adaptive_hold_until_us > 0 && now_us >= node.adaptive_hold_until_us) {
+            if (node.drift_window_us < max_window_us) {
+                node.drift_window_us = std::min(max_window_us, node.drift_window_us * 2);
+                node.timesync.SetDriftWindowUsec(node.drift_window_us);
+                node.adaptive_hold_until_us = now_us + hold_us;
+            }
+        }
+    }
+    node.last_timesync_offset_us = offset_us;
+    node.last_timesync_offset_valid = true;
+}
+
+static void UpdateVarianceGateWindow(
+    NodeState& node,
+    uint64_t now_us,
+    double offset_us,
+    uint64_t min_window_us,
+    uint64_t max_window_us,
+    double trigger_us,
+    double var_threshold_us2,
+    size_t window_size,
+    uint64_t hold_us,
+    double stationary_var_max_us2,
+    double stationary_delta_max_us,
+    size_t stationary_window_size)
+{
+    if (min_window_us == 0) {
+        min_window_us = 100000;
+    }
+    if (max_window_us == 0) {
+        max_window_us = 1000000;
+    }
+    if (node.drift_window_us == 0) {
+        node.drift_window_us = max_window_us;
+        node.timesync.SetDriftWindowUsec(node.drift_window_us);
+    }
+    if (node.last_timesync_offset_valid) {
+        const double delta_signed = offset_us - node.last_timesync_offset_us;
+        const double delta = std::fabs(delta_signed);
+        if (!AcceptRobustDelta(node, delta_signed)) {
+            return;
+        }
+        const size_t var_window = (stationary_window_size > 0) ? stationary_window_size : window_size;
+        node.offset_delta_window.push_back(delta);
+        while (node.offset_delta_window.size() > var_window) {
+            node.offset_delta_window.pop_front();
+        }
+        double mean = 0.0;
+        for (double v : node.offset_delta_window) {
+            mean += v;
+        }
+        mean = (node.offset_delta_window.empty() ? 0.0 : mean / node.offset_delta_window.size());
+        double var = 0.0;
+        for (double v : node.offset_delta_window) {
+            const double d = v - mean;
+            var += d * d;
+        }
+        var = (node.offset_delta_window.empty() ? 0.0 : var / node.offset_delta_window.size());
+
+        bool allow_shrink = true;
+        if (stationary_var_max_us2 > 0.0) {
+            const bool stationary = (var <= stationary_var_max_us2) &&
+                (stationary_delta_max_us <= 0.0 || delta <= stationary_delta_max_us);
+            if (stationary) {
+                allow_shrink = false;
+            }
+        }
+        if (allow_shrink && delta >= trigger_us && var <= var_threshold_us2) {
+            node.drift_window_us = min_window_us;
+            node.timesync.SetDriftWindowUsec(node.drift_window_us);
+            node.drift_window_restore_us = now_us + hold_us;
+        } else if (node.drift_window_restore_us > 0 && now_us >= node.drift_window_restore_us) {
+            if (node.drift_window_us < max_window_us) {
+                node.drift_window_us = std::min(max_window_us, node.drift_window_us * 2);
+                node.timesync.SetDriftWindowUsec(node.drift_window_us);
+                node.drift_window_restore_us = now_us + hold_us;
+            }
+        }
+    }
+    node.last_timesync_offset_us = offset_us;
+    node.last_timesync_offset_valid = true;
+}
+
+static void UpdateAdaptiveGuardWindow(
+    NodeState& node,
+    uint64_t now_us,
+    double offset_us,
+    uint64_t min_window_us,
+    uint64_t max_window_us,
+    double trigger_us,
+    double var_threshold_us2,
+    size_t window_size,
+    int sign_count_req,
+    uint64_t hold_us)
+{
+    if (min_window_us == 0) {
+        min_window_us = 100000;
+    }
+    if (max_window_us == 0) {
+        max_window_us = 1000000;
+    }
+    if (node.drift_window_us == 0) {
+        node.drift_window_us = max_window_us;
+        node.timesync.SetDriftWindowUsec(node.drift_window_us);
+    }
+    if (node.last_timesync_offset_valid) {
+        const double delta = offset_us - node.last_timesync_offset_us;
+        if (!AcceptRobustDelta(node, delta)) {
+            return;
+        }
+        const double delta_mag = std::fabs(delta);
+        node.offset_delta_window.push_back(delta_mag);
+        while (node.offset_delta_window.size() > window_size) {
+            node.offset_delta_window.pop_front();
+        }
+        double mean = 0.0;
+        for (double v : node.offset_delta_window) {
+            mean += v;
+        }
+        mean = (node.offset_delta_window.empty() ? 0.0 : mean / node.offset_delta_window.size());
+        double var = 0.0;
+        for (double v : node.offset_delta_window) {
+            const double d = v - mean;
+            var += d * d;
+        }
+        var = (node.offset_delta_window.empty() ? 0.0 : var / node.offset_delta_window.size());
+
+        if (delta_mag >= trigger_us) {
+            const int sign = (delta > 0.0) ? 1 : -1;
+            if (node.adaptive_sign == sign) {
+                node.adaptive_trigger_count++;
+            } else {
+                node.adaptive_sign = sign;
+                node.adaptive_trigger_count = 1;
+            }
+        } else {
+            node.adaptive_sign = 0;
+            node.adaptive_trigger_count = 0;
+        }
+
+        if (node.adaptive_trigger_count >= sign_count_req && var <= var_threshold_us2) {
+            node.drift_window_us = min_window_us;
+            node.timesync.SetDriftWindowUsec(node.drift_window_us);
+            node.drift_window_restore_us = now_us + hold_us;
+            node.adaptive_trigger_count = 0;
+            node.adaptive_sign = 0;
+        } else if (node.drift_window_restore_us > 0 && now_us >= node.drift_window_restore_us) {
+            if (node.drift_window_us < max_window_us) {
+                node.drift_window_us = std::min(max_window_us, node.drift_window_us * 2);
+                node.timesync.SetDriftWindowUsec(node.drift_window_us);
+                node.drift_window_restore_us = now_us + hold_us;
+            }
+        }
+    }
+    node.last_timesync_offset_us = offset_us;
+    node.last_timesync_offset_valid = true;
+}
+
+static void UpdateCusumWindow(
+    NodeState& node,
+    uint64_t now_us,
+    double offset_us,
+    uint64_t min_window_us,
+    uint64_t max_window_us,
+    double k_us,
+    double h_us,
+    uint64_t hold_us)
+{
+    if (min_window_us == 0) {
+        min_window_us = 100000;
+    }
+    if (max_window_us == 0) {
+        max_window_us = 1000000;
+    }
+    if (node.drift_window_us == 0) {
+        node.drift_window_us = max_window_us;
+        node.timesync.SetDriftWindowUsec(node.drift_window_us);
+    }
+    if (node.last_timesync_offset_valid) {
+        const double residual = offset_us - node.last_timesync_offset_us;
+        if (!AcceptRobustDelta(node, residual)) {
+            return;
+        }
+        node.cusum_pos = std::max(0.0, node.cusum_pos + residual - k_us);
+        node.cusum_neg = std::max(0.0, node.cusum_neg - residual - k_us);
+        if (node.cusum_pos >= h_us || node.cusum_neg >= h_us) {
+            node.drift_window_us = min_window_us;
+            node.timesync.SetDriftWindowUsec(node.drift_window_us);
+            node.drift_window_restore_us = now_us + hold_us;
+            node.cusum_pos = 0.0;
+            node.cusum_neg = 0.0;
+        } else if (node.drift_window_restore_us > 0 && now_us >= node.drift_window_restore_us) {
+            if (node.drift_window_us < max_window_us) {
+                node.drift_window_us = std::min(max_window_us, node.drift_window_us * 2);
+                node.timesync.SetDriftWindowUsec(node.drift_window_us);
+                node.drift_window_restore_us = now_us + hold_us;
+            }
+        }
+    }
+    node.last_timesync_offset_us = offset_us;
+    node.last_timesync_offset_valid = true;
+}
+
+static void UpdateCusumGate(
+    NodeState& node,
+    uint64_t now_us,
+    double residual_us,
+    double k_us,
+    double h_us,
+    uint64_t hold_us)
+{
+    if (!AcceptRobustDelta(node, residual_us)) {
+        return;
+    }
+    node.cusum_pos = std::max(0.0, node.cusum_pos + residual_us - k_us);
+    node.cusum_neg = std::max(0.0, node.cusum_neg - residual_us - k_us);
+    if (node.cusum_pos >= h_us || node.cusum_neg >= h_us) {
+        node.cusum_pos = 0.0;
+        node.cusum_neg = 0.0;
+        if (hold_us > 0) {
+            node.cusum_hold_until_us = now_us + hold_us;
+        }
+    }
+}
+
 //------------------------------------------------------------------------------
 // Core simulation (standard scenarios)
 
@@ -1042,60 +6988,240 @@ static void ApplyBudget(MethodConfig& method, const ScenarioConfig& scenario)
     }
     const double budget = scenario.overhead_budget_bps;
     const double stamp_bytes = method.timestamp_data ? 3.0 : 0.0;
-    const double min_delta_bytes = (method.kind == MethodKind::TimeSync || method.kind == MethodKind::Piggyback) ? 3.0 : 0.0;
+    const double min_delta_bytes = UsesMinDeltaExchange(method.kind)
+        ? (3.0 + method.extra_mindelta_bytes)
+        : 0.0;
     const double probe_bytes = (method.kind == MethodKind::Cristian) ? 16.0 : 24.0;
+    const bool uses_mindelta = UsesMinDeltaExchange(method.kind);
+    const bool uses_probes = MethodUsesProbes(method);
 
-    const double base_stamp = 2.0 * (scenario.send_rate_hz / std::max(1, method.sample_stride)) * stamp_bytes;
-    const double base_min_delta = 2.0 * (1.0e6 / std::max<uint64_t>(method.mindelta_interval_us, 1ULL)) * min_delta_bytes;
-
-    if (method.kind == MethodKind::TimeSync || method.kind == MethodKind::Piggyback) {
-        double remaining = budget - base_min_delta;
+    double remaining = budget;
+    if (uses_mindelta) {
+        const double base_min_delta = 2.0 * (1.0e6 / std::max<uint64_t>(method.mindelta_interval_us, 1ULL)) * min_delta_bytes;
+        remaining -= base_min_delta;
         if (remaining < 0.0) {
             remaining = 0.0;
         }
         if (stamp_bytes > 0.0) {
-            double max_stamp_rate = remaining / (2.0 * stamp_bytes);
+            const double max_stamp_rate = remaining / (2.0 * stamp_bytes);
             if (max_stamp_rate < scenario.send_rate_hz) {
                 int stride = (int)std::ceil(scenario.send_rate_hz / std::max(max_stamp_rate, 1.0));
                 if (stride < 1) stride = 1;
                 method.sample_stride = stride;
             }
         }
-        return;
     }
 
-    // Probe-based methods: adjust probe rate
-    double remaining = budget - base_stamp;
+    const double base_stamp = 2.0 * (scenario.send_rate_hz / std::max(1, method.sample_stride)) * stamp_bytes;
+    remaining -= base_stamp;
     if (remaining < 0.0) {
         remaining = 0.0;
     }
-    const double max_probe_rate = remaining / (2.0 * probe_bytes);
-    method.probe_rate_hz = std::max(0.0, max_probe_rate);
+    if (uses_probes) {
+        const double max_probe_rate = remaining / (2.0 * probe_bytes);
+        method.probe_rate_hz = std::max(0.0, max_probe_rate);
+    }
 }
 
 static double EstimateOverheadBps(const MethodConfig& method, const ScenarioConfig& scenario)
 {
     const double stamp_bytes = method.timestamp_data ? 3.0 : 0.0;
-    const double min_delta_bytes = (method.kind == MethodKind::TimeSync || method.kind == MethodKind::Piggyback) ? 3.0 : 0.0;
+    const double min_delta_bytes = UsesMinDeltaExchange(method.kind)
+        ? (3.0 + method.extra_mindelta_bytes)
+        : 0.0;
     const double probe_bytes = (method.kind == MethodKind::Cristian) ? 16.0 : 24.0;
 
     double total = 0.0;
     total += 2.0 * (scenario.send_rate_hz / std::max(1, method.sample_stride)) * stamp_bytes;
-    if (method.kind == MethodKind::TimeSync || method.kind == MethodKind::Piggyback) {
+    if (UsesMinDeltaExchange(method.kind)) {
         total += 2.0 * (1.0e6 / std::max<uint64_t>(method.mindelta_interval_us, 1ULL)) * min_delta_bytes;
-    } else {
+    }
+    if (MethodUsesProbes(method)) {
         total += 2.0 * method.probe_rate_hz * probe_bytes;
     }
     return total;
 }
 
+static void ApplyScenarioOverrides(MethodConfig& method, const ScenarioConfig& scenario)
+{
+    if (scenario.probe_rate_hz > 0.0) {
+        method.probe_rate_hz = scenario.probe_rate_hz;
+    }
+    if (scenario.mindelta_interval_us > 0) {
+        method.mindelta_interval_us = scenario.mindelta_interval_us;
+    }
+}
+
+static bool ScenarioHasExplicitDrift(const ScenarioConfig& scenario)
+{
+    if (scenario.drift_ppm_a != 0.0 || scenario.drift_ppm_b != 0.0) {
+        return true;
+    }
+    if (scenario.drift_sine_amp_ppm != 0.0 ||
+        scenario.drift_sine_amp_ppm_a != 0.0 ||
+        scenario.drift_sine_amp_ppm_b != 0.0) {
+        return true;
+    }
+    if (scenario.drift_rw_step_ppm != 0.0) {
+        return true;
+    }
+    if (scenario.drift_step_enabled ||
+        scenario.drift_step_delta_ppm_a != 0.0 ||
+        scenario.drift_step_delta_ppm_b != 0.0) {
+        return true;
+    }
+    if (scenario.drift_ramp_ppm_per_s_a != 0.0 ||
+        scenario.drift_ramp_ppm_per_s_b != 0.0 ||
+        scenario.drift_ramp_max_ppm != 0.0) {
+        return true;
+    }
+    return false;
+}
+
 static bool EstimateRemoteTimeUsec(const MethodConfig& method, NodeState& node, uint64_t local_now_us, uint64_t& remote_est_us)
 {
-    if (method.kind == MethodKind::TimeSync) {
+    if (UsesCustomTimeSync(method.kind)) {
+        if (method.kind == MethodKind::TimeSyncShadowSkew) {
+            if (node.algo_offset_valid) {
+                double offset = node.algo_offset_us;
+                double skew_ppm = 0.0;
+                bool skew_valid = false;
+                if (method.shadow_use_cse && node.cse_skew_valid) {
+                    skew_ppm = node.cse_skew_ppm;
+                    skew_valid = true;
+                } else if (node.shadow_skew_valid) {
+                    skew_ppm = node.shadow_skew_ppm;
+                    skew_valid = true;
+                }
+                if (skew_valid) {
+                    const double dt_s = (double)((local_now_us > node.algo_offset_time_us)
+                        ? (local_now_us - node.algo_offset_time_us)
+                        : 0ULL) / 1000000.0;
+                    offset += skew_ppm * dt_s;
+                }
+                const double est = (double)local_now_us + offset;
+                if (est <= 0.0) {
+                    return false;
+                }
+                remote_est_us = (uint64_t)std::llround(est);
+                return true;
+            }
+            return node.timesync.GetRemoteTimeUsec(local_now_us, remote_est_us);
+        }
+        if (node.algo_offset_valid) {
+            const double est = (double)local_now_us + node.algo_offset_us;
+            if (est <= 0.0) {
+                return false;
+            }
+            remote_est_us = (uint64_t)std::llround(est);
+            return true;
+        }
         return node.timesync.GetRemoteTimeUsec(local_now_us, remote_est_us);
     }
-    if (method.kind == MethodKind::Piggyback || method.kind == MethodKind::Cristian ||
-        method.kind == MethodKind::Ntp || method.kind == MethodKind::Ptp) {
+    if (IsTimeSyncQuantileFamily(method.kind)) {
+        if (node.quantile_hold_use_short && node.timesync_short.IsSynchronized()) {
+            return node.timesync_short.GetRemoteTimeUsec(local_now_us, remote_est_us);
+        }
+        if (method.quantile_use_cse && node.ts_offset_valid && node.cse_skew_valid) {
+            const double dt_s = (double)((local_now_us > node.ts_offset_time_us)
+                ? (local_now_us - node.ts_offset_time_us)
+                : 0ULL) / 1000000.0;
+            const double skew_offset = node.ts_offset_us + node.cse_skew_ppm * dt_s;
+            const double blend = std::min(1.0, std::max(0.0, method.quantile_cse_blend));
+            const double offset = node.ts_offset_us * (1.0 - blend) + skew_offset * blend;
+            const double est = (double)local_now_us + offset;
+            if (est <= 0.0) {
+                return false;
+            }
+            remote_est_us = (uint64_t)std::llround(est);
+            return true;
+        }
+    }
+    if (method.kind == MethodKind::TimeSyncSloped) {
+        if (!node.ts_offset_valid || !node.sloped_skew_valid) {
+            return node.timesync.GetRemoteTimeUsec(local_now_us, remote_est_us);
+        }
+        const double dt_s = (double)((local_now_us > node.ts_offset_time_us)
+            ? (local_now_us - node.ts_offset_time_us)
+            : 0ULL) / 1000000.0;
+        const double offset = node.ts_offset_us + node.sloped_skew_ppm * dt_s;
+        const double est = (double)local_now_us + offset;
+        if (est <= 0.0) {
+            return false;
+        }
+        remote_est_us = (uint64_t)std::llround(est);
+        return true;
+    }
+    if (UsesSkewCorrection(method.kind)) {
+        if (!node.ts_offset_valid) {
+            return node.timesync.GetRemoteTimeUsec(local_now_us, remote_est_us);
+        }
+        if (method.kind != MethodKind::TimeSyncPerDirSkew && !node.estimator.Ready()) {
+            return node.timesync.GetRemoteTimeUsec(local_now_us, remote_est_us);
+        }
+        double skew_used = node.estimator.skew_est_ppm;
+        if (method.kind == MethodKind::TimeSyncPerDirSkew) {
+            const double gate_ppm = (method.perdir_skew_gate_ppm > 0.0)
+                ? method.perdir_skew_gate_ppm
+                : 200.0;
+            if (node.peer_skew_valid) {
+                if (!node.estimator.Ready()) {
+                    skew_used = node.peer_skew_est_ppm;
+                } else {
+                    const double diff = std::fabs(node.estimator.skew_est_ppm - node.peer_skew_est_ppm);
+                    if (diff > gate_ppm) {
+                        return node.timesync.GetRemoteTimeUsec(local_now_us, remote_est_us);
+                    }
+                    const double blend = std::min(1.0, std::max(0.0, method.perdir_skew_blend));
+                    skew_used = node.estimator.skew_est_ppm * (1.0 - blend) + node.peer_skew_est_ppm * blend;
+                }
+            } else if (!node.estimator.Ready()) {
+                return node.timesync.GetRemoteTimeUsec(local_now_us, remote_est_us);
+            }
+        }
+        const double dt_s = (double)((local_now_us > node.ts_offset_time_us)
+            ? (local_now_us - node.ts_offset_time_us)
+            : 0ULL) / 1000000.0;
+        const double offset = node.ts_offset_us + skew_used * dt_s;
+        const double est = (double)local_now_us + offset;
+        if (est <= 0.0) {
+            return false;
+        }
+        remote_est_us = (uint64_t)std::llround(est);
+        return true;
+    }
+    if (method.kind == MethodKind::TimeSync ||
+        method.kind == MethodKind::TimeSyncQuantile ||
+        method.kind == MethodKind::TimeSyncQuantileNearHit ||
+        method.kind == MethodKind::TimeSyncQuantileAdaptive ||
+        method.kind == MethodKind::TimeSyncAdaptive ||
+        method.kind == MethodKind::TimeSyncAdaptiveGuard ||
+        method.kind == MethodKind::TimeSyncHysteresis ||
+        method.kind == MethodKind::TimeSyncCUSUM ||
+        method.kind == MethodKind::TimeSyncVarGate ||
+        method.kind == MethodKind::TimeSyncStepReset ||
+        method.kind == MethodKind::TimeSyncDualWindow ||
+        method.kind == MethodKind::TimeSyncHybrid ||
+        method.kind == MethodKind::TimeSyncEnsemble) {
+        if (method.kind == MethodKind::TimeSyncEnsemble) {
+            double offset_us = 0.0;
+            if (ComputeEnsembleOffset(method, node, local_now_us, offset_us)) {
+                const double est = (double)local_now_us + offset_us;
+                if (est <= 0.0) {
+                    return false;
+                }
+                remote_est_us = (uint64_t)std::llround(est);
+                return true;
+            }
+        }
+        if (method.kind == MethodKind::TimeSyncHybrid &&
+            node.hybrid_use_fast &&
+            node.timesync_short.IsSynchronized()) {
+            return node.timesync_short.GetRemoteTimeUsec(local_now_us, remote_est_us);
+        }
+        return node.timesync.GetRemoteTimeUsec(local_now_us, remote_est_us);
+    }
+    if (UsesEstimatorRemote(method.kind)) {
         if (!node.estimator.Ready()) {
             return false;
         }
@@ -1127,9 +7253,111 @@ static void AddSkewError(DirectionMetrics& dm, double err_ppm)
     dm.skew_err_ppm.Add(AbsDouble(err_ppm));
 }
 
-static void AddPollTimeError(DirectionMetrics& dm, double err_us)
+static void AddPollTimeError(DirectionMetrics& dm, double err_us, uint64_t now_us,
+    bool step_enabled, uint64_t step_time_us)
 {
-    dm.poll_time_err_us.Add(AbsDouble(err_us));
+    const double abs_err = AbsDouble(err_us);
+    dm.poll_time_err_us.Add(abs_err);
+    if (abs_err > 5000.0) {
+        dm.poll_over_5ms++;
+    }
+    if (abs_err > 10000.0) {
+        dm.poll_over_10ms++;
+    }
+    if (abs_err > 20000.0) {
+        dm.poll_over_20ms++;
+    }
+    if (abs_err > 50000.0) {
+        dm.poll_over_50ms++;
+    }
+    auto update_recovery = [&](double threshold,
+        bool& recovered,
+        uint64_t& recover_time_us,
+        bool& recover_cons,
+        uint64_t& recover_cons_time_us,
+        uint32_t& recover_cons_count) {
+        if (step_enabled && !recovered && now_us >= step_time_us) {
+            if (std::fabs(err_us) <= threshold) {
+                recovered = true;
+                recover_time_us = now_us;
+            }
+        }
+
+        if (step_enabled) {
+            if (now_us < step_time_us) {
+                recover_cons_count = 0;
+            } else if (!recover_cons) {
+                const uint32_t target = 3;
+                if (std::fabs(err_us) <= threshold) {
+                    recover_cons_count++;
+                } else {
+                    recover_cons_count = 0;
+                }
+                if (recover_cons_count >= target) {
+                    recover_cons = true;
+                    recover_cons_time_us = now_us;
+                }
+            }
+        }
+    };
+
+    update_recovery(1000.0,
+        dm.step_recovered,
+        dm.step_recover_time_us,
+        dm.step_recover_cons,
+        dm.step_recover_cons_time_us,
+        dm.step_recover_cons_count);
+    update_recovery(5000.0,
+        dm.step_recovered_5ms,
+        dm.step_recover_time_5ms,
+        dm.step_recover_cons_5ms,
+        dm.step_recover_cons_time_5ms,
+        dm.step_recover_cons_count_5ms);
+    update_recovery(10000.0,
+        dm.step_recovered_10ms,
+        dm.step_recover_time_10ms,
+        dm.step_recover_cons_10ms,
+        dm.step_recover_cons_time_10ms,
+        dm.step_recover_cons_count_10ms);
+    update_recovery(20000.0,
+        dm.step_recovered_20ms,
+        dm.step_recover_time_20ms,
+        dm.step_recover_cons_20ms,
+        dm.step_recover_cons_time_20ms,
+        dm.step_recover_cons_count_20ms);
+    update_recovery(50000.0,
+        dm.step_recovered_50ms,
+        dm.step_recover_time_50ms,
+        dm.step_recover_cons_50ms,
+        dm.step_recover_cons_time_50ms,
+        dm.step_recover_cons_count_50ms);
+    update_recovery(100000.0,
+        dm.step_recovered_100ms,
+        dm.step_recover_time_100ms,
+        dm.step_recover_cons_100ms,
+        dm.step_recover_cons_time_100ms,
+        dm.step_recover_cons_count_100ms);
+    update_recovery(500000.0,
+        dm.step_recovered_500ms,
+        dm.step_recover_time_500ms,
+        dm.step_recover_cons_500ms,
+        dm.step_recover_cons_time_500ms,
+        dm.step_recover_cons_count_500ms);
+
+    if (step_enabled) {
+        if (now_us < step_time_us) {
+            dm.step_last_poll_us = 0;
+        } else {
+            dm.step_peak_err_us = std::max(dm.step_peak_err_us, abs_err);
+            if (dm.step_last_poll_us == 0) {
+                dm.step_last_poll_us = now_us;
+            } else if (now_us > dm.step_last_poll_us) {
+                const double dt_s = (double)(now_us - dm.step_last_poll_us) / 1000000.0;
+                dm.step_auc_err_us_s += abs_err * dt_s;
+                dm.step_last_poll_us = now_us;
+            }
+        }
+    }
 }
 
 static void AddOwdError(DirectionMetrics& dm, double err_us)
@@ -1192,50 +7420,156 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
     ScenarioConfig scenario = scenario_in;
     MethodConfig method = method_in;
 
+    ApplyScenarioOverrides(method, scenario);
     ApplyBudget(method, scenario);
 
     PCGRandom rng;
     rng.Seed(seed, 0xBADC0FFEULL);
+
+    if (scenario.clock_step_random) {
+        scenario.clock_step_enabled = true;
+        uint64_t tmin = scenario.clock_step_time_min_us;
+        uint64_t tmax = scenario.clock_step_time_max_us;
+        if (tmax < tmin) {
+            std::swap(tmin, tmax);
+        }
+        scenario.clock_step_time_us = RandRangeU64(rng, tmin, tmax);
+        int64_t smin = scenario.clock_step_min_us;
+        int64_t smax = scenario.clock_step_max_us;
+        if (smax < smin) {
+            std::swap(smin, smax);
+        }
+        const int64_t step_us = RandRangeInt64(rng, smin, smax);
+        scenario.clock_step_a_us = 0;
+        scenario.clock_step_b_us = 0;
+        if (scenario.clock_step_random_side) {
+            if (rng.NextDouble01() < 0.5) {
+                scenario.clock_step_a_us = step_us;
+            } else {
+                scenario.clock_step_b_us = step_us;
+            }
+        } else {
+            scenario.clock_step_b_us = step_us;
+        }
+    }
 
     BenchmarkMetrics metrics;
     metrics.overhead_bps = EstimateOverheadBps(method, scenario);
 
     NodeState node_a;
     NodeState node_b;
+    TraceWriter trace;
+    trace.Open(g_trace, scenario, method, seed);
+    TraceRttSnapshot rtt_trace;
 
+    const bool has_sine_ab = (scenario.drift_sine_amp_ppm_a != 0.0 || scenario.drift_sine_amp_ppm_b != 0.0);
     node_a.clock.drift_ppm_base = scenario.drift_ppm_a;
-    node_a.clock.drift_sine_amp_ppm = scenario.drift_sine_amp_ppm;
+    node_a.clock.drift_sine_amp_ppm = has_sine_ab ? scenario.drift_sine_amp_ppm_a : scenario.drift_sine_amp_ppm;
     node_a.clock.drift_sine_period_us = scenario.drift_sine_period_us;
     node_a.clock.drift_rw_step_ppm = scenario.drift_rw_step_ppm;
     node_a.clock.drift_rw_step_interval_us = scenario.drift_rw_step_interval_us;
     node_a.clock.drift_step_enabled = scenario.drift_step_enabled;
     node_a.clock.drift_step_time_us = scenario.drift_step_time_us;
     node_a.clock.drift_step_delta_ppm = scenario.drift_step_delta_ppm_a;
+    node_a.clock.drift_ramp_ppm_per_s = scenario.drift_ramp_ppm_per_s_a;
+    node_a.clock.drift_ramp_max_ppm = scenario.drift_ramp_max_ppm;
+    node_a.clock.drift_ramp_start_us = scenario.drift_ramp_start_us;
+    const uint32_t recv_noise_a = scenario.recv_noise_us_a ? scenario.recv_noise_us_a : scenario.recv_noise_us;
+    const uint32_t recv_noise_b = scenario.recv_noise_us_b ? scenario.recv_noise_us_b : scenario.recv_noise_us;
     node_a.clock.offset_us = scenario.offset_a_us;
     node_a.clock.quantize_us = scenario.quantize_us;
-    node_a.clock.recv_noise_us = scenario.recv_noise_us;
+    node_a.clock.recv_noise_us = recv_noise_a;
     node_a.clock.recv_noise_mode = scenario.recv_noise_mode;
     node_a.clock.recv_noise_sigma = scenario.recv_noise_sigma;
     node_a.clock.clock_step_enabled = scenario.clock_step_enabled;
     node_a.clock.clock_step_time_us = scenario.clock_step_time_us;
     node_a.clock.clock_step_us = scenario.clock_step_a_us;
+    node_a.clock.clock_freeze_enabled = scenario.clock_freeze_a;
+    node_a.clock.clock_freeze_start_us = scenario.clock_freeze_a_start_us;
+    node_a.clock.clock_freeze_end_us = scenario.clock_freeze_a_end_us;
 
     node_b.clock = node_a.clock;
     node_b.clock.drift_ppm_base = scenario.drift_ppm_b;
+    if (has_sine_ab) {
+        node_b.clock.drift_sine_amp_ppm = scenario.drift_sine_amp_ppm_b;
+    }
     node_b.clock.drift_step_delta_ppm = scenario.drift_step_delta_ppm_b;
+    node_b.clock.drift_ramp_ppm_per_s = scenario.drift_ramp_ppm_per_s_b;
     node_b.clock.offset_us = scenario.offset_b_us;
+    node_b.clock.recv_noise_us = recv_noise_b;
     node_b.clock.clock_step_us = scenario.clock_step_b_us;
+    node_b.clock.clock_freeze_enabled = scenario.clock_freeze_b;
+    node_b.clock.clock_freeze_start_us = scenario.clock_freeze_b_start_us;
+    node_b.clock.clock_freeze_end_us = scenario.clock_freeze_b_end_us;
 
     node_a.estimator.estimator = method.estimator;
     node_a.estimator.discipline = method.discipline;
     node_a.estimator.quantile = method.quantile;
     node_a.estimator.window_us = method.window_us;
+    node_a.estimator.kalman_q_offset_us2 = method.kalman_q_offset_us2;
+    node_a.estimator.kalman_q_skew_ppm2 = method.kalman_q_skew_ppm2;
+    node_a.estimator.kalman_r_us2 = method.kalman_r_us2;
     node_b.estimator = node_a.estimator;
+
+    node_a.robust_delta_window_size = method.robust_delta_window_size;
+    node_a.robust_delta_z = (method.robust_delta_z > 0.0) ? method.robust_delta_z : 3.0;
+    node_a.robust_delta_floor_us = (method.robust_delta_floor_us > 0.0) ? method.robust_delta_floor_us : 50.0;
+    node_b.robust_delta_window_size = node_a.robust_delta_window_size;
+    node_b.robust_delta_z = node_a.robust_delta_z;
+    node_b.robust_delta_floor_us = node_a.robust_delta_floor_us;
+    node_a.jitter_guard_use_ewma = method.jitter_guard_use_ewma;
+    node_b.jitter_guard_use_ewma = method.jitter_guard_use_ewma;
+    node_a.jitter_guard_alpha = (method.jitter_guard_alpha > 0.0) ? method.jitter_guard_alpha : 0.2;
+    node_b.jitter_guard_alpha = node_a.jitter_guard_alpha;
+    node_a.jitter_guard_min_us = (method.jitter_guard_min_us > 0.0) ? method.jitter_guard_min_us : 25.0;
+    node_b.jitter_guard_min_us = node_a.jitter_guard_min_us;
 
     node_a.local_env.estimator = method.estimator;
     node_a.local_env.quantile = method.quantile;
     node_a.local_env.window_us = method.window_us;
     node_b.local_env = node_a.local_env;
+
+    node_a.timesync.SetMinQuantile(method.timesync_quantile);
+    node_b.timesync.SetMinQuantile(method.timesync_quantile);
+    node_a.timesync_short.SetMinQuantile(method.timesync_quantile);
+    node_b.timesync_short.SetMinQuantile(method.timesync_quantile);
+    if (IsTimeSyncQuantileFamily(method.kind) && method.quantile_use_short_high) {
+        node_a.timesync_short.SetMinQuantile(method.quantile_short);
+        node_b.timesync_short.SetMinQuantile(method.quantile_short);
+    }
+
+    if (method.kind == MethodKind::TimeSyncDualWindow ||
+        method.kind == MethodKind::TimeSyncHybrid ||
+        method.kind == MethodKind::TimeSyncEnsemble) {
+        const uint64_t short_window_us = (method.short_window_us > 0)
+            ? method.short_window_us
+            : 200000;
+        node_a.timesync_short.SetDriftWindowUsec(short_window_us);
+        node_b.timesync_short.SetDriftWindowUsec(short_window_us);
+    }
+
+    if (UsesTimeSyncCore(method.kind)) {
+        const uint64_t long_window_us = (method.stats_long_window_us > 0)
+            ? method.stats_long_window_us
+            : node_a.timesync.GetDriftWindowUsec();
+        const uint64_t short_window_us = (method.stats_short_window_us > 0)
+            ? method.stats_short_window_us
+            : 2000000;
+        node_a.stats_long_window_us = long_window_us;
+        node_b.stats_long_window_us = long_window_us;
+        node_a.stats_short_window_us = short_window_us;
+        node_b.stats_short_window_us = short_window_us;
+        node_a.long_bins.Reset(long_window_us);
+        node_b.long_bins.Reset(long_window_us);
+        node_a.short_stats.Reset(short_window_us);
+        node_b.short_stats.Reset(short_window_us);
+        if (method.kind == MethodKind::TimeSyncTilted ||
+            method.kind == MethodKind::TimeSyncSlope ||
+            method.kind == MethodKind::TimeSyncPolicy) {
+            node_a.tilted_bins.Reset(long_window_us);
+            node_b.tilted_bins.Reset(long_window_us);
+        }
+    }
 
     DelayModel delay_ab = scenario.delay_ab;
     DelayModel delay_ba = scenario.delay_ba;
@@ -1245,9 +7579,7 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
     const uint64_t data_interval_us = (scenario.send_rate_hz > 0.0)
         ? (uint64_t)std::llround(1000000.0 / scenario.send_rate_hz)
         : 0;
-    const bool uses_probes = (method.kind == MethodKind::Cristian ||
-        method.kind == MethodKind::Ntp ||
-        method.kind == MethodKind::Ptp);
+    const bool uses_probes = MethodUsesProbes(method);
     const uint64_t probe_interval_us = (uses_probes && method.probe_rate_hz > 0.0)
         ? (uint64_t)std::llround(1000000.0 / method.probe_rate_hz)
         : 0;
@@ -1261,7 +7593,7 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
     uint64_t next_probe_ba = probe_interval_us ? 0 : UINT64_MAX;
     uint64_t next_poll_ab = poll_interval_us ? 0 : UINT64_MAX;
     uint64_t next_poll_ba = poll_interval_us ? 0 : UINT64_MAX;
-    const bool uses_mindelta = (method.kind == MethodKind::TimeSync || method.kind == MethodKind::Piggyback);
+    const bool uses_mindelta = UsesMinDeltaExchange(method.kind);
     uint64_t next_mindelta_ab = (uses_mindelta && method.mindelta_interval_us)
         ? 0
         : UINT64_MAX;
@@ -1279,7 +7611,20 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
 
     uint64_t metrics_start_us = ClampMetricsWarmup(scenario.metrics_warmup_us, scenario.duration_us);
 
-    const double deadline_us = 50000.0; // 50ms default
+    const double base_max = std::max(delay_ab.base_delay_us, delay_ba.base_delay_us);
+    const double jitter_max = std::max(delay_ab.jitter_us, delay_ba.jitter_us);
+    const double queue_max = std::max(delay_ab.queue_amp_us, delay_ba.queue_amp_us);
+    const double spike_max = std::max(delay_ab.spike_delay_us, delay_ba.spike_delay_us);
+    const double step_max = std::max(0.0, std::max(
+        std::max((double)delay_ab.step_delta_us, (double)delay_ab.step2_delta_us),
+        std::max((double)delay_ba.step_delta_us, (double)delay_ba.step2_delta_us)));
+    const double deadline_us = std::max(50000.0,
+        base_max + queue_max + spike_max + 2.0 * jitter_max + step_max);
+    uint64_t next_rtt_guard_us = 0;
+    SlidingMin rtt_min_guard;
+    if (method.rtt_guard_strict && method.rtt_guard_min_window_us > 0) {
+        rtt_min_guard.Reset(method.rtt_guard_min_window_us);
+    }
 
     while (now_us <= scenario.duration_us) {
         uint64_t next_arrival = arrivals.empty() ? UINT64_MAX : arrivals.top().deliver_true_us;
@@ -1309,31 +7654,341 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
             DelayModel& dmodel = to_b ? delay_ab : delay_ba;
 
             const uint64_t local_recv = ComputeLocalTimeUsec(now_us, recv_node.clock, rng, true);
-            const uint64_t true_remote_local = ev.msg.true_remote_local_at_send;
-            const double true_offset = (double)ev.msg.send_local_us - (double)true_remote_local; // remote - local
+            const uint64_t true_local_now = ComputeLocalTimeUsec(now_us, recv_node.clock, rng, false);
+            const uint64_t true_remote_now = ComputeLocalTimeUsec(now_us, send_node.clock, rng, false);
+            const uint64_t true_remote_local_at_send = ev.msg.true_remote_local_at_send;
+            const double true_offset = (double)true_remote_now - (double)true_local_now; // remote - local (receive time)
             const double true_skew_ppm = TrueSkewPpm(recv_node.clock, send_node.clock);
 
             dm.received++;
 
             if (ev.msg.kind == MsgKind::Data || ev.msg.kind == MsgKind::TeleopState || ev.msg.kind == MsgKind::TeleopCmd) {
-                if (method.kind == MethodKind::TimeSync) {
+                if (UsesTimeSyncCore(method.kind)) {
                     if (!ev.msg.stamped) {
                         continue;
                     }
-                    const unsigned owd_est = recv_node.timesync.OnAuthenticatedDatagramTimestamp(ev.msg.ts24, local_recv);
-                    if (recv_node.timesync.IsSynchronized()) {
-                        MaybeSetSyncTime(true, now_us, recv_node.synced, recv_node.sync_time_us);
+                    double delta_us = 0.0;
+                    Counter24 delta_ts24 = 0;
+                    if (!ComputeTs24DeltaSample(recv_node, method, ev.msg.ts24, local_recv, delta_us, delta_ts24)) {
+                        dm.ts24_drops++;
+                        continue;
                     }
-                    if (now_us >= metrics_start_us && owd_est > 0) {
-                        const double owd_err = (double)owd_est - (double)ev.true_delay_us;
-                        AddOwdError(dm, owd_err);
-                        UpdateDeadlineMetrics(dm, ev.true_delay_us, (double)owd_est, deadline_us);
+                    if (recv_node.stats_long_window_us > 0) {
+                        recv_node.long_bins.Update(local_recv, delta_us);
+                        double min_long = 0.0;
+                        uint64_t min_time = 0;
+                        uint32_t long_count = 0;
+                        if (recv_node.long_bins.GetMin(local_recv, min_long, min_time, long_count)) {
+                            recv_node.long_min_us = min_long;
+                            recv_node.long_min_time_us = min_time;
+                            recv_node.long_min_valid = true;
+                        }
                     }
-                    if (now_us >= metrics_start_us && recv_node.timesync.IsSynchronized()) {
-                        if (ev.msg.app_ts23 != 0) {
-                            const uint64_t est_local = recv_node.timesync.FromLocalTime23(local_recv, ev.msg.app_ts23);
-                            const double err = (double)est_local - (double)true_remote_local;
-                            AddOffsetError(dm, err, now_us);
+                    if (recv_node.stats_short_window_us > 0) {
+                        recv_node.short_stats.Add(local_recv, delta_us);
+                        MaybeUpdateShortStats(recv_node, dm, local_recv, method.stats_gnear_us);
+                        if (method.kind == MethodKind::TimeSyncQuantileSwap ||
+                            method.hyst_use_quantile_swap ||
+                            method.adaptive_use_quantile_swap) {
+                            UpdateQuantileSwap(recv_node, method);
+                        } else if (method.kind == MethodKind::TimeSyncQuantileAdaptive) {
+                            UpdateQuantileAdaptive(recv_node, method, now_us);
+                        } else if (method.kind == MethodKind::TimeSyncQuantileNearHit) {
+                            UpdateQuantileNearHit(recv_node, method);
+                        }
+                    }
+
+                    if (UsesCustomTimeSync(method.kind)) {
+                        if (method.kind == MethodKind::TimeSyncMinReg ||
+                            method.kind == MethodKind::TimeSyncMultiWindow ||
+                            method.kind == MethodKind::TimeSyncBlockQuantile) {
+                            // Defer effective min updates to the 1 Hz tick.
+                        } else if (method.kind == MethodKind::TimeSyncEnvelopeDecay) {
+                            UpdateEnvelopeDecay(recv_node, local_recv, delta_us, method);
+                        } else if (method.kind == MethodKind::TimeSyncConsensus) {
+                            if (EnsureEffectiveMin(recv_node) && delta_us < recv_node.effective_min_us) {
+                                recv_node.effective_min_us = delta_us;
+                                recv_node.effective_min_time_us = now_us;
+                                recv_node.effective_min_valid = true;
+                            }
+                            UpdateConsensusCandidates(recv_node, local_recv, delta_us, method);
+                        } else if (method.kind == MethodKind::TimeSyncSlope) {
+                            const uint64_t window_us = (method.sloped_window_us > 0)
+                                ? method.sloped_window_us
+                                : 10000000ULL;
+                            UpdateSampleWindow(recv_node.sloped_samples, local_recv, delta_us, window_us);
+                            const double skew_ppm = recv_node.sloped_skew_valid ? recv_node.sloped_skew_ppm : 0.0;
+                            UpdateTiltedMin(recv_node, local_recv, delta_us, skew_ppm);
+                        } else if (method.kind == MethodKind::TimeSyncTilted) {
+                            const double skew_ppm = recv_node.cse_skew_valid ? recv_node.cse_skew_ppm : 0.0;
+                            UpdateTiltedMin(recv_node, local_recv, delta_us, skew_ppm);
+                        } else if (method.kind == MethodKind::TimeSyncPolicy) {
+                            const double prev_min = recv_node.effective_min_us;
+                            const uint64_t prev_time = recv_node.effective_min_time_us;
+                            const bool prev_valid = recv_node.effective_min_valid;
+                            const double prev_peer = recv_node.peer_min_us;
+                            const bool prev_peer_valid = recv_node.peer_min_valid;
+                            recv_node.timesync.OnAuthenticatedDatagramTimestamp(ev.msg.ts24, local_recv);
+                            if (method.quantile_use_short_high) {
+                                recv_node.timesync_short.OnAuthenticatedDatagramTimestamp(ev.msg.ts24, local_recv);
+                            }
+                            if (method.policy_use_decay) {
+                                UpdateEnvelopeDecay(recv_node, local_recv, delta_us, method);
+                            }
+                            if (method.policy_use_tilted) {
+                                bool skew_valid = false;
+                                const double skew_ppm = PolicySkewPpm(recv_node, method, skew_valid);
+                                UpdateTiltedMin(recv_node, local_recv, delta_us, skew_ppm);
+                            }
+                            recv_node.effective_min_us = prev_min;
+                            recv_node.effective_min_time_us = prev_time;
+                            recv_node.effective_min_valid = prev_valid;
+                            recv_node.peer_min_us = prev_peer;
+                            recv_node.peer_min_valid = prev_peer_valid;
+                        } else if (method.kind == MethodKind::TimeSyncDDAC) {
+                            // DD-AC updates effective mins on the 1 Hz tick.
+                        } else if (EnsureEffectiveMin(recv_node) && delta_us < recv_node.effective_min_us) {
+                            recv_node.effective_min_us = delta_us;
+                            recv_node.effective_min_time_us = now_us;
+                            recv_node.effective_min_valid = true;
+                        }
+                        UpdateAlgoOffset(recv_node, now_us);
+                        if (recv_node.algo_offset_valid) {
+                            MaybeSetSyncTime(true, now_us, recv_node.synced, recv_node.sync_time_us);
+                        }
+                        if (now_us >= metrics_start_us) {
+                            double owd_est = 0.0;
+                            if (ComputeAlgoOwd(recv_node, delta_ts24, owd_est)) {
+                                const double owd_err = owd_est - (double)ev.true_delay_us;
+                                AddOwdError(dm, owd_err);
+                                UpdateDeadlineMetrics(dm, ev.true_delay_us, owd_est, deadline_us);
+                            }
+                            if (recv_node.algo_offset_valid) {
+                                double offset_est = recv_node.algo_offset_us;
+                                if (method.kind == MethodKind::TimeSyncShadowSkew && recv_node.shadow_skew_valid) {
+                                    const double dt_s = (double)((local_recv > recv_node.algo_offset_time_us)
+                                        ? (local_recv - recv_node.algo_offset_time_us)
+                                        : 0ULL) / 1000000.0;
+                                    offset_est += recv_node.shadow_skew_ppm * dt_s;
+                                    AddSkewError(dm, recv_node.shadow_skew_ppm - true_skew_ppm);
+                                } else if ((method.kind == MethodKind::TimeSyncTilted ||
+                                            method.kind == MethodKind::TimeSyncPolicy) &&
+                                           recv_node.cse_skew_valid) {
+                                    AddSkewError(dm, recv_node.cse_skew_ppm - true_skew_ppm);
+                                } else if (method.kind == MethodKind::TimeSyncSlope && recv_node.sloped_skew_valid) {
+                                    AddSkewError(dm, recv_node.sloped_skew_ppm - true_skew_ppm);
+                                } else if (method.kind == MethodKind::TimeSyncMoE && recv_node.moe_valid) {
+                                    AddSkewError(dm, recv_node.moe_skew_ppm - true_skew_ppm);
+                                } else if (method.kind == MethodKind::TimeSyncDDAC && recv_node.ddac_skew_valid) {
+                                    AddSkewError(dm, recv_node.ddac_skew_ppm - true_skew_ppm);
+                                }
+                                AddOffsetError(dm, offset_est - true_offset, now_us);
+                            }
+                        }
+                    } else {
+                        const unsigned owd_est = recv_node.timesync.OnAuthenticatedDatagramTimestamp(ev.msg.ts24, local_recv);
+                        if (method.kind == MethodKind::TimeSyncDualWindow ||
+                            method.kind == MethodKind::TimeSyncHybrid ||
+                            method.kind == MethodKind::TimeSyncEnsemble ||
+                            (IsTimeSyncQuantileFamily(method.kind) && method.quantile_use_short_high)) {
+                            recv_node.timesync_short.OnAuthenticatedDatagramTimestamp(ev.msg.ts24, local_recv);
+                        }
+                        const bool synced = recv_node.timesync.IsSynchronized();
+                        if (synced) {
+                            MaybeSetSyncTime(true, now_us, recv_node.synced, recv_node.sync_time_us);
+                        }
+                        if (now_us >= metrics_start_us && owd_est > 0) {
+                            const double owd_err = (double)owd_est - (double)ev.true_delay_us;
+                            AddOwdError(dm, owd_err);
+                            UpdateDeadlineMetrics(dm, ev.true_delay_us, (double)owd_est, deadline_us);
+                        }
+                        double offset_sample = 0.0;
+                        const bool have_offset_sample = synced && UpdateTimeSyncOffsetSample(recv_node, local_recv, offset_sample);
+                        if (have_offset_sample) {
+                            if (method.kind == MethodKind::TimeSyncSkew ||
+                                method.kind == MethodKind::TimeSyncSkewReg ||
+                                method.kind == MethodKind::TimeSyncSkewCorrected ||
+                                method.kind == MethodKind::TimeSyncPerDirSkew) {
+                                if (!(method.probe_skew_only && method.kind == MethodKind::TimeSyncSkewCorrected)) {
+                                    recv_node.estimator.AddSample(now_us, offset_sample);
+                                    MaybeSetSyncTime(recv_node.estimator.Ready(), now_us, recv_node.synced, recv_node.sync_time_us);
+                                }
+                            } else if (method.kind == MethodKind::TimeSyncAdaptive) {
+                                const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                if (method.min_window_floor_us > 0) {
+                                    min_window_us = std::max<uint64_t>(min_window_us, method.min_window_floor_us);
+                                }
+                                double trigger_us = (method.adaptive_trigger_us > 0.0)
+                                    ? method.adaptive_trigger_us
+                                    : 100.0;
+                                if (method.adaptive_trigger_use_jitter && recv_node.short_snapshot.valid) {
+                                    const double jitter = GuardJitter(recv_node, method);
+                                    const double k = (method.adaptive_trigger_jitter_k > 0.0)
+                                        ? method.adaptive_trigger_jitter_k
+                                        : 1.0;
+                                    const double min_trigger = (method.adaptive_trigger_jitter_min_us > 0.0)
+                                        ? method.adaptive_trigger_jitter_min_us
+                                        : 0.0;
+                                    trigger_us = std::max(min_trigger, k * jitter);
+                                }
+                                UpdateAdaptiveDriftWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us, trigger_us,
+                                    method.stationary_var_max_us2, method.stationary_delta_max_us, method.stationary_window_size,
+                                    recv_node.adaptive_force_trigger,
+                                    method.adaptive_trigger_count_req,
+                                    method.adaptive_shrink_ratio,
+                                    method.adaptive_expand_ratio);
+                                recv_node.adaptive_force_trigger = false;
+                            } else if (method.kind == MethodKind::TimeSyncAdaptiveGuard) {
+                                const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                const uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                const double trigger_us = (method.adaptive_trigger_us > 0.0)
+                                    ? method.adaptive_trigger_us
+                                    : 100.0;
+                                const double var_threshold_us2 = (method.adaptive_guard_var_threshold_us2 > 0.0)
+                                    ? method.adaptive_guard_var_threshold_us2
+                                    : 10000.0;
+                                const size_t window_size = (method.adaptive_guard_window_size > 0)
+                                    ? method.adaptive_guard_window_size
+                                    : 20;
+                                const int sign_count = (method.adaptive_guard_sign_count > 0)
+                                    ? method.adaptive_guard_sign_count
+                                    : 3;
+                                const uint64_t hold_us = (method.adaptive_guard_hold_us > 0)
+                                    ? method.adaptive_guard_hold_us
+                                    : max_window_us;
+                                UpdateAdaptiveGuardWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us,
+                                    trigger_us, var_threshold_us2, window_size, sign_count, hold_us);
+                            } else if (method.kind == MethodKind::TimeSyncHybrid) {
+                                const double trigger_us = (method.hybrid_trigger_us > 0.0)
+                                    ? method.hybrid_trigger_us
+                                    : 100.0;
+                                const double var_threshold_us2 = (method.hybrid_var_threshold_us2 > 0.0)
+                                    ? method.hybrid_var_threshold_us2
+                                    : 10000.0;
+                                const size_t window_size = (method.hybrid_window_size > 0)
+                                    ? method.hybrid_window_size
+                                    : 20;
+                                const int sign_count = (method.hybrid_sign_count > 0)
+                                    ? method.hybrid_sign_count
+                                    : 3;
+                                const uint64_t hold_us = (method.hybrid_hold_us > 0)
+                                    ? method.hybrid_hold_us
+                                    : std::max<uint64_t>(method.window_us, 200000);
+                                double offset_short = 0.0;
+                                if (recv_node.timesync_short.IsSynchronized() &&
+                                    UpdateTimeSyncShortOffsetSample(recv_node, local_recv, offset_short)) {
+                                    const double diff = offset_short - offset_sample;
+                                    UpdateHybridSelector(recv_node, now_us, diff,
+                                        trigger_us, var_threshold_us2, window_size, sign_count, hold_us);
+                                }
+                            } else if (method.kind == MethodKind::TimeSyncHysteresis) {
+                                const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                const uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                const double trigger_us = (method.hysteresis_trigger_us > 0.0)
+                                    ? method.hysteresis_trigger_us
+                                    : 100.0;
+                                const int trigger_count = (method.hysteresis_trigger_count > 0)
+                                    ? method.hysteresis_trigger_count
+                                    : 3;
+                                const uint64_t hold_us = (method.hysteresis_hold_us > 0)
+                                    ? method.hysteresis_hold_us
+                                    : max_window_us;
+                                UpdateHysteresisWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us,
+                                    trigger_us, trigger_count, hold_us, recv_node.hyst_force_trigger);
+                                recv_node.hyst_force_trigger = false;
+                            } else if (method.kind == MethodKind::TimeSyncCUSUM) {
+                                const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                const uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                const double k_us = (method.cusum_k_us > 0.0) ? method.cusum_k_us : 50.0;
+                                const double h_us = (method.cusum_h_us > 0.0) ? method.cusum_h_us : 500.0;
+                                const uint64_t hold_us = (method.cusum_hold_us > 0) ? method.cusum_hold_us : max_window_us;
+                                UpdateCusumWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us,
+                                    k_us, h_us, hold_us);
+                            } else if (method.kind == MethodKind::TimeSyncVarGate) {
+                                const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                if (method.min_window_floor_us > 0) {
+                                    min_window_us = std::max<uint64_t>(min_window_us, method.min_window_floor_us);
+                                }
+                                const double trigger_us = (method.vargate_trigger_us > 0.0) ? method.vargate_trigger_us : 100.0;
+                                const double var_threshold_us2 = (method.vargate_var_threshold_us2 > 0.0)
+                                    ? method.vargate_var_threshold_us2
+                                    : 10000.0;
+                                const size_t window_size = (method.vargate_window_size > 0)
+                                    ? method.vargate_window_size
+                                    : 20;
+                                const uint64_t hold_us = (method.vargate_hold_us > 0) ? method.vargate_hold_us : max_window_us;
+                                UpdateVarianceGateWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us,
+                                    trigger_us, var_threshold_us2, window_size, hold_us,
+                                    method.stationary_var_max_us2, method.stationary_delta_max_us, method.stationary_window_size);
+                            } else if (method.kind == MethodKind::TimeSyncStepReset) {
+                                const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                const uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                const uint64_t hold_us = (method.stepreset_hold_us > 0)
+                                    ? method.stepreset_hold_us
+                                    : max_window_us;
+                                UpdateStepResetWindow(recv_node, now_us, offset_sample, method, min_window_us,
+                                    max_window_us, 2000.0, hold_us);
+                            } else if (method.kind == MethodKind::TimeSyncDualWindow) {
+                                double offset_short = 0.0;
+                                if (recv_node.timesync_short.IsSynchronized() &&
+                                    UpdateTimeSyncShortOffsetSample(recv_node, local_recv, offset_short)) {
+                                    recv_node.estimator.AddSample(now_us, offset_short);
+                                    MaybeSetSyncTime(recv_node.estimator.Ready(), now_us, recv_node.synced, recv_node.sync_time_us);
+                                }
+                            }
+                        }
+                        if (now_us >= metrics_start_us) {
+                            if (method.kind == MethodKind::TimeSyncSloped &&
+                                recv_node.ts_offset_valid &&
+                                recv_node.sloped_skew_valid) {
+                                const double dt_s = (double)((local_recv > recv_node.ts_offset_time_us)
+                                    ? (local_recv - recv_node.ts_offset_time_us)
+                                    : 0ULL) / 1000000.0;
+                                const double offset_est = recv_node.ts_offset_us + recv_node.sloped_skew_ppm * dt_s;
+                                AddOffsetError(dm, offset_est - true_offset, now_us);
+                                AddSkewError(dm, recv_node.sloped_skew_ppm - true_skew_ppm);
+                            } else if (UsesSkewCorrection(method.kind) && recv_node.ts_offset_valid && recv_node.estimator.Ready()) {
+                                const double dt_s = (double)((local_recv > recv_node.ts_offset_time_us)
+                                    ? (local_recv - recv_node.ts_offset_time_us)
+                                    : 0ULL) / 1000000.0;
+                                const double offset_est = recv_node.ts_offset_us + recv_node.estimator.skew_est_ppm * dt_s;
+                                AddOffsetError(dm, offset_est - true_offset, now_us);
+                                AddSkewError(dm, recv_node.estimator.skew_est_ppm - true_skew_ppm);
+                            } else if (method.kind == MethodKind::TimeSyncQuantile &&
+                                method.quantile_use_cse &&
+                                recv_node.ts_offset_valid &&
+                                recv_node.cse_skew_valid) {
+                                const double dt_s = (double)((local_recv > recv_node.ts_offset_time_us)
+                                    ? (local_recv - recv_node.ts_offset_time_us)
+                                    : 0ULL) / 1000000.0;
+                                const double skew_offset = recv_node.ts_offset_us + recv_node.cse_skew_ppm * dt_s;
+                                const double blend = std::min(1.0, std::max(0.0, method.quantile_cse_blend));
+                                const double offset_est = recv_node.ts_offset_us * (1.0 - blend) + skew_offset * blend;
+                                AddOffsetError(dm, offset_est - true_offset, now_us);
+                                AddSkewError(dm, recv_node.cse_skew_ppm - true_skew_ppm);
+                            } else if (UsesEstimatorRemote(method.kind) && recv_node.estimator.Ready()) {
+                                const double offset_est = recv_node.estimator.offset_est;
+                                AddOffsetError(dm, offset_est - true_offset, now_us);
+                                AddSkewError(dm, recv_node.estimator.skew_est_ppm - true_skew_ppm);
+                            } else if (method.kind == MethodKind::TimeSyncEnsemble) {
+                                double offset_est = 0.0;
+                                if (ComputeEnsembleOffset(method, recv_node, local_recv, offset_est)) {
+                                    AddOffsetError(dm, offset_est - true_offset, now_us);
+                                }
+                            } else if (synced && ev.msg.app_ts23 != 0) {
+                                uint64_t est_local = 0;
+                                if (method.kind == MethodKind::TimeSyncHybrid &&
+                                    recv_node.hybrid_use_fast &&
+                                    recv_node.timesync_short.IsSynchronized()) {
+                                    est_local = recv_node.timesync_short.FromLocalTime23(local_recv, ev.msg.app_ts23);
+                                } else {
+                                    est_local = recv_node.timesync.FromLocalTime23(local_recv, ev.msg.app_ts23);
+                                }
+                                const double err = (double)est_local - (double)true_remote_local_at_send;
+                                AddOffsetError(dm, err, now_us);
+                            }
                         }
                     }
                 } else if (method.kind == MethodKind::Piggyback) {
@@ -1409,14 +8064,755 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
                 recv_node.estimator.AddSample(now_us, offset_sample);
                 MaybeSetSyncTime(recv_node.estimator.Ready(), now_us, recv_node.synced, recv_node.sync_time_us);
             } else if (ev.msg.kind == MsgKind::MinDelta) {
-                if (method.kind == MethodKind::TimeSync) {
+                if (UsesTimeSyncCore(method.kind)) {
+                    if (UsesCustomTimeSync(method.kind)) {
+                        if (method.kind == MethodKind::TimeSyncDDAC) {
+                            if (ev.msg.ddac_valid && ev.msg.ddac_seq >= recv_node.ddac_peer_seq) {
+                                recv_node.ddac_peer_valid = true;
+                                recv_node.ddac_peer_seq = ev.msg.ddac_seq;
+                                recv_node.ddac_peer_min_long_us = ev.msg.ddac_min_long_us;
+                                recv_node.ddac_peer_age_us = ev.msg.ddac_age_us;
+                                recv_node.ddac_peer_p10_us = ev.msg.ddac_p10_us;
+                                recv_node.ddac_peer_iqr_us = ev.msg.ddac_iqr_us;
+                                recv_node.ddac_peer_count = ev.msg.ddac_count;
+                                recv_node.ddac_peer_p0_us = ev.msg.ddac_p0_us;
+                                recv_node.ddac_peer_rx_us = now_us;
+                            }
+                            continue;
+                        }
+                        const uint64_t min_delta_ticks = ev.msg.min_delta.ToUnsigned();
+                        const double peer_min_raw = (double)(min_delta_ticks << kTime23LostBits);
+                        recv_node.peer_min_raw_us = peer_min_raw;
+                        recv_node.peer_min_raw_valid = true;
+                        recv_node.peer_min_us = peer_min_raw;
+                        recv_node.peer_min_valid = true;
+                        UpdateAlgoOffset(recv_node, now_us);
+                        if (recv_node.algo_offset_valid) {
+                            MaybeSetSyncTime(true, now_us, recv_node.synced, recv_node.sync_time_us);
+                        }
+                        continue;
+                    }
                     recv_node.timesync.OnPeerMinDeltaTS24(ev.msg.min_delta);
-                    if (recv_node.timesync.IsSynchronized()) {
+                    if (method.kind == MethodKind::TimeSyncDualWindow ||
+                        method.kind == MethodKind::TimeSyncHybrid ||
+                        method.kind == MethodKind::TimeSyncEnsemble ||
+                        (IsTimeSyncQuantileFamily(method.kind) && method.quantile_use_short_high)) {
+                        recv_node.timesync_short.OnPeerMinDeltaTS24(ev.msg.min_delta);
+                    }
+                    if (method.kind == MethodKind::TimeSyncPerDirSkew) {
+                        recv_node.peer_skew_valid = ev.msg.skew_valid;
+                        recv_node.peer_skew_est_ppm = -ev.msg.skew_est_ppm;
+                    }
+                    const bool synced = recv_node.timesync.IsSynchronized();
+                    if (synced) {
                         MaybeSetSyncTime(true, now_us, recv_node.synced, recv_node.sync_time_us);
+                    }
+                    if (synced && method.kind == MethodKind::TimeSyncSloped) {
+                        const uint64_t min_delta_ticks = recv_node.timesync.GetMinDeltaTS24().ToUnsigned();
+                        const double min_delta_us = (double)(min_delta_ticks << kTime23LostBits);
+                        UpdateSlopedSkewFromMethod(recv_node, method, now_us, min_delta_us);
+                    }
+                    if (synced && (method.kind == MethodKind::TimeSyncSkewReg ||
+                        method.kind == MethodKind::TimeSyncSkewCorrected ||
+                        method.kind == MethodKind::TimeSyncPerDirSkew ||
+                        method.kind == MethodKind::TimeSyncAdaptive ||
+                        method.kind == MethodKind::TimeSyncAdaptiveGuard ||
+                        method.kind == MethodKind::TimeSyncHybrid ||
+                        method.kind == MethodKind::TimeSyncHysteresis ||
+                        method.kind == MethodKind::TimeSyncCUSUM ||
+                        method.kind == MethodKind::TimeSyncVarGate ||
+                        method.kind == MethodKind::TimeSyncStepReset ||
+                        method.kind == MethodKind::TimeSyncDualWindow)) {
+                        if (method.kind == MethodKind::TimeSyncDualWindow) {
+                            double offset_short = 0.0;
+                            if (recv_node.timesync_short.IsSynchronized() &&
+                                UpdateTimeSyncShortOffsetSample(recv_node, local_recv, offset_short)) {
+                                recv_node.estimator.AddSample(now_us, offset_short);
+                                MaybeSetSyncTime(recv_node.estimator.Ready(), now_us, recv_node.synced, recv_node.sync_time_us);
+                            }
+                        } else {
+                            uint64_t remote_est_us = 0;
+                            if (recv_node.timesync.GetRemoteTimeUsec(local_recv, remote_est_us)) {
+                                const double offset_sample = (double)remote_est_us - (double)local_recv;
+                                if (method.kind == MethodKind::TimeSyncSkewReg ||
+                                    method.kind == MethodKind::TimeSyncSkewCorrected ||
+                                    method.kind == MethodKind::TimeSyncPerDirSkew) {
+                                    if (!(method.probe_skew_only && method.kind == MethodKind::TimeSyncSkewCorrected)) {
+                                        recv_node.estimator.AddSample(now_us, offset_sample);
+                                        MaybeSetSyncTime(recv_node.estimator.Ready(), now_us, recv_node.synced, recv_node.sync_time_us);
+                                    }
+                                } else if (method.kind == MethodKind::TimeSyncAdaptive) {
+                                    const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                    uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                    if (method.min_window_floor_us > 0) {
+                                        min_window_us = std::max<uint64_t>(min_window_us, method.min_window_floor_us);
+                                    }
+                                    double trigger_us = (method.adaptive_trigger_us > 0.0)
+                                        ? method.adaptive_trigger_us
+                                        : 100.0;
+                                    if (method.adaptive_trigger_use_jitter && recv_node.short_snapshot.valid) {
+                                        const double jitter = GuardJitter(recv_node, method);
+                                        const double k = (method.adaptive_trigger_jitter_k > 0.0)
+                                            ? method.adaptive_trigger_jitter_k
+                                            : 1.0;
+                                        const double min_trigger = (method.adaptive_trigger_jitter_min_us > 0.0)
+                                            ? method.adaptive_trigger_jitter_min_us
+                                            : 0.0;
+                                        trigger_us = std::max(min_trigger, k * jitter);
+                                    }
+                                    UpdateAdaptiveDriftWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us, trigger_us,
+                                        method.stationary_var_max_us2, method.stationary_delta_max_us, method.stationary_window_size,
+                                        recv_node.adaptive_force_trigger,
+                                        method.adaptive_trigger_count_req,
+                                        method.adaptive_shrink_ratio,
+                                        method.adaptive_expand_ratio);
+                                    recv_node.adaptive_force_trigger = false;
+                                } else if (method.kind == MethodKind::TimeSyncAdaptiveGuard) {
+                                    const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                    const uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                    const double trigger_us = (method.adaptive_trigger_us > 0.0)
+                                        ? method.adaptive_trigger_us
+                                        : 100.0;
+                                    const double var_threshold_us2 = (method.adaptive_guard_var_threshold_us2 > 0.0)
+                                        ? method.adaptive_guard_var_threshold_us2
+                                        : 10000.0;
+                                    const size_t window_size = (method.adaptive_guard_window_size > 0)
+                                        ? method.adaptive_guard_window_size
+                                        : 20;
+                                    const int sign_count = (method.adaptive_guard_sign_count > 0)
+                                        ? method.adaptive_guard_sign_count
+                                        : 3;
+                                    const uint64_t hold_us = (method.adaptive_guard_hold_us > 0)
+                                        ? method.adaptive_guard_hold_us
+                                        : max_window_us;
+                                    UpdateAdaptiveGuardWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us,
+                                        trigger_us, var_threshold_us2, window_size, sign_count, hold_us);
+                                } else if (method.kind == MethodKind::TimeSyncHybrid) {
+                                    const double trigger_us = (method.hybrid_trigger_us > 0.0)
+                                        ? method.hybrid_trigger_us
+                                        : 100.0;
+                                    const double var_threshold_us2 = (method.hybrid_var_threshold_us2 > 0.0)
+                                        ? method.hybrid_var_threshold_us2
+                                        : 10000.0;
+                                    const size_t window_size = (method.hybrid_window_size > 0)
+                                        ? method.hybrid_window_size
+                                        : 20;
+                                    const int sign_count = (method.hybrid_sign_count > 0)
+                                        ? method.hybrid_sign_count
+                                        : 3;
+                                    const uint64_t hold_us = (method.hybrid_hold_us > 0)
+                                        ? method.hybrid_hold_us
+                                        : std::max<uint64_t>(method.window_us, 200000);
+                                    double offset_short = 0.0;
+                                    if (recv_node.timesync_short.IsSynchronized() &&
+                                        UpdateTimeSyncShortOffsetSample(recv_node, local_recv, offset_short)) {
+                                        const double diff = offset_short - offset_sample;
+                                        UpdateHybridSelector(recv_node, now_us, diff,
+                                            trigger_us, var_threshold_us2, window_size, sign_count, hold_us);
+                                    }
+                                } else if (method.kind == MethodKind::TimeSyncHysteresis) {
+                                    const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                    const uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                    const double trigger_us = (method.hysteresis_trigger_us > 0.0)
+                                        ? method.hysteresis_trigger_us
+                                        : 100.0;
+                                    const int trigger_count = (method.hysteresis_trigger_count > 0)
+                                        ? method.hysteresis_trigger_count
+                                        : 3;
+                                    const uint64_t hold_us = (method.hysteresis_hold_us > 0)
+                                        ? method.hysteresis_hold_us
+                                        : max_window_us;
+                                    UpdateHysteresisWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us,
+                                        trigger_us, trigger_count, hold_us, recv_node.hyst_force_trigger);
+                                    recv_node.hyst_force_trigger = false;
+                                } else if (method.kind == MethodKind::TimeSyncCUSUM) {
+                                    const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                    const uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                    const double k_us = (method.cusum_k_us > 0.0) ? method.cusum_k_us : 50.0;
+                                    const double h_us = (method.cusum_h_us > 0.0) ? method.cusum_h_us : 500.0;
+                                    const uint64_t hold_us = (method.cusum_hold_us > 0) ? method.cusum_hold_us : max_window_us;
+                                    UpdateCusumWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us,
+                                        k_us, h_us, hold_us);
+                                } else if (method.kind == MethodKind::TimeSyncVarGate) {
+                                    const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                    uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                    if (method.min_window_floor_us > 0) {
+                                        min_window_us = std::max<uint64_t>(min_window_us, method.min_window_floor_us);
+                                    }
+                                    const double trigger_us = (method.vargate_trigger_us > 0.0) ? method.vargate_trigger_us : 100.0;
+                                    const double var_threshold_us2 = (method.vargate_var_threshold_us2 > 0.0)
+                                        ? method.vargate_var_threshold_us2
+                                        : 10000.0;
+                                    const size_t window_size = (method.vargate_window_size > 0)
+                                        ? method.vargate_window_size
+                                        : 20;
+                                    const uint64_t hold_us = (method.vargate_hold_us > 0) ? method.vargate_hold_us : max_window_us;
+                                    UpdateVarianceGateWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us,
+                                        trigger_us, var_threshold_us2, window_size, hold_us,
+                                        method.stationary_var_max_us2, method.stationary_delta_max_us, method.stationary_window_size);
+                                } else if (method.kind == MethodKind::TimeSyncStepReset) {
+                                    const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                    const uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                    UpdateStepResetWindow(recv_node, now_us, offset_sample, method, min_window_us,
+                                        max_window_us, 2000.0, max_window_us);
+                                }
+                            }
+                        }
                     }
                 } else if (method.kind == MethodKind::Piggyback) {
                     recv_node.peer_env_value = (double)ev.msg.env_delta_us;
                     recv_node.peer_env_valid = true;
+                }
+            }
+        }
+
+        if (UsesTimeSyncCore(method.kind) && node_a.stats_short_window_us > 0) {
+            if (next_rtt_guard_us == 0) {
+                next_rtt_guard_us = now_us + node_a.stats_short_window_us;
+            }
+            if (now_us >= next_rtt_guard_us) {
+                next_rtt_guard_us = now_us + node_a.stats_short_window_us;
+                bool guard_ok = false;
+                bool rtt_ready = false;
+                double rtt_short = 0.0;
+                double rtt_long = 0.0;
+                double rtt_iqr = 0.0;
+                double rtt_delta = 0.0;
+                rtt_trace.valid = false;
+                if (node_a.long_min_valid && node_b.long_min_valid &&
+                    node_a.short_snapshot.valid && node_b.short_snapshot.valid) {
+                    guard_ok = EvaluateRttGuard(
+                        node_b.short_snapshot,
+                        node_a.short_snapshot,
+                        node_b.long_min_us,
+                        node_a.long_min_us,
+                        method.rtt_guard_delta_us,
+                        method.rtt_guard_iqr_us,
+                        rtt_short,
+                        rtt_long,
+                        rtt_iqr,
+                        rtt_delta);
+                    rtt_ready = true;
+                    if (method.rtt_guard_strict && rtt_min_guard.window_us > 0) {
+                        rtt_min_guard.Push(now_us, rtt_short);
+                        if (rtt_min_guard.Ready()) {
+                            const double min_rtt = rtt_min_guard.Min();
+                            const double delta = (method.rtt_guard_min_delta_us > 0.0)
+                                ? method.rtt_guard_min_delta_us
+                                : method.rtt_guard_delta_us;
+                            if (rtt_short > min_rtt + delta) {
+                                guard_ok = false;
+                            }
+                        }
+                    }
+                    metrics.rtt_short_us.Add(rtt_short);
+                    metrics.rtt_long_us.Add(rtt_long);
+                    metrics.rtt_delta_us.Add(rtt_delta);
+                    metrics.rtt_short_iqr_us.Add(rtt_iqr);
+                    metrics.rtt_guard_total++;
+                    if (guard_ok) {
+                        metrics.rtt_guard_ok++;
+                    }
+                    if (method.quantile_cusum_gate && rtt_ready) {
+                        const double k_us = (method.cusum_k_us > 0.0) ? method.cusum_k_us : 50.0;
+                        const double h_us = (method.cusum_h_us > 0.0) ? method.cusum_h_us : 500.0;
+                        const uint64_t hold_us = (method.cusum_hold_us > 0)
+                            ? method.cusum_hold_us
+                            : node_a.stats_short_window_us;
+                        UpdateCusumGate(node_a, now_us, rtt_delta, k_us, h_us, hold_us);
+                        UpdateCusumGate(node_b, now_us, rtt_delta, k_us, h_us, hold_us);
+                    }
+                    rtt_trace.valid = true;
+                    rtt_trace.guard_ok = guard_ok;
+                    rtt_trace.short_us = rtt_short;
+                    rtt_trace.long_us = rtt_long;
+                    rtt_trace.delta_us = rtt_delta;
+                    rtt_trace.iqr_us = rtt_iqr;
+                }
+                node_a.rtt_short_valid = rtt_ready;
+                node_b.rtt_short_valid = rtt_ready;
+                if (rtt_ready) {
+                    node_a.rtt_short_last_us = rtt_short;
+                    node_b.rtt_short_last_us = rtt_short;
+                }
+
+                if (method.saw_use) {
+                    UpdateSawtoothDetector(node_a, now_us, method);
+                    UpdateSawtoothDetector(node_b, now_us, method);
+                }
+
+                if (PromoCseGateApplies(method)) {
+                    UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                }
+
+                if (method.kind == MethodKind::TimeSyncHysteresis) {
+                    if (method.hyst_use_gsp) {
+                        if (UpdateHysteresisGspTrigger(node_a, now_us, method, guard_ok)) {
+                            node_a.hyst_force_trigger = true;
+                        }
+                        if (UpdateHysteresisGspTrigger(node_b, now_us, method, guard_ok)) {
+                            node_b.hyst_force_trigger = true;
+                        }
+                    }
+                    if (method.hyst_use_stepguard) {
+                        const uint64_t step_before = node_a.step_resets + node_b.step_resets;
+                        UpdateStepGuard(node_a, node_b, now_us, method, guard_ok);
+                        const bool step_triggered = (node_a.step_resets + node_b.step_resets) > step_before;
+                        if (step_triggered) {
+                            if (node_a.step_reset_dir) {
+                                node_a.hyst_force_trigger = true;
+                            }
+                            if (node_b.step_reset_dir) {
+                                node_b.hyst_force_trigger = true;
+                            }
+                        }
+                    }
+                }
+
+                if (method.kind == MethodKind::TimeSyncAdaptive) {
+                    if (method.adaptive_use_cse_trigger) {
+                        UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                    }
+                    UpdateAdaptiveTriggers(node_a, now_us, method, rtt_ready, rtt_delta, rtt_iqr);
+                    UpdateAdaptiveTriggers(node_b, now_us, method, rtt_ready, rtt_delta, rtt_iqr);
+                    if (method.adaptive_use_stepguard) {
+                        const uint64_t step_before = node_a.step_resets + node_b.step_resets;
+                        UpdateStepGuard(node_a, node_b, now_us, method, guard_ok);
+                        const bool step_triggered = (node_a.step_resets + node_b.step_resets) > step_before;
+                        if (step_triggered) {
+                            if (node_a.step_reset_dir) {
+                                node_a.adaptive_force_trigger = true;
+                            }
+                            if (node_b.step_reset_dir) {
+                                node_b.adaptive_force_trigger = true;
+                            }
+                        }
+                    }
+                }
+
+                if (IsTimeSyncQuantileFamily(method.kind)) {
+                    auto init_window = [&](NodeState& node) {
+                        if (node.drift_window_us == 0) {
+                            const uint64_t window_us = (method.window_us > 0) ? method.window_us : 2000000ULL;
+                            node.drift_window_us = window_us;
+                            node.timesync.SetDriftWindowUsec(window_us);
+                            if (method.quantile_use_short_high) {
+                                node.timesync_short.SetDriftWindowUsec(window_us);
+                            }
+                        }
+                    };
+                    init_window(node_a);
+                    init_window(node_b);
+                    const bool need_cse = method.quantile_use_cse ||
+                        method.quantile_flip_reset ||
+                        method.quantile_flip_hold ||
+                        method.quantile_flip_shrink ||
+                        method.quantile_flip_use_short ||
+                        method.quantile_flip_use_xor ||
+                        method.quantile_use_cse_gate;
+                    if (need_cse) {
+                        UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                    }
+
+                    auto stale_dir = [&](NodeState& node) -> bool {
+                        if (!node.short_snapshot.valid || !node.long_min_valid) {
+                            return false;
+                        }
+                        const double jitter = GuardJitter(node, method);
+                        const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                        return node.short_snapshot.p10 > node.long_min_us + gb;
+                    };
+
+                    bool flip_a = false;
+                    bool flip_b = false;
+                    if (method.quantile_flip_reset ||
+                        method.quantile_flip_hold ||
+                        method.quantile_flip_shrink ||
+                        method.quantile_flip_use_short ||
+                        method.quantile_flip_use_xor) {
+                        flip_a = DetectQuantileCseFlip(node_a, method);
+                        flip_b = DetectQuantileCseFlip(node_b, method);
+                    }
+                    if (method.quantile_use_offset_slope) {
+                        flip_a = flip_a || DetectQuantileOffsetFlip(node_a, method, now_us);
+                        flip_b = flip_b || DetectQuantileOffsetFlip(node_b, method, now_us);
+                    }
+                    if (method.quantile_near_stale_reset) {
+                        flip_a = flip_a || DetectQuantileNearStale(node_a, method, now_us);
+                        flip_b = flip_b || DetectQuantileNearStale(node_b, method, now_us);
+                    }
+                    if (method.quantile_flip_use_xor) {
+                        const bool xor_ok = stale_dir(node_a) ^ stale_dir(node_b);
+                        if (!xor_ok) {
+                            flip_a = false;
+                            flip_b = false;
+                        }
+                    }
+                    if (method.gsp_use_rtt_guard && !guard_ok) {
+                        flip_a = false;
+                        flip_b = false;
+                    }
+                    if (method.quantile_use_cse_gate) {
+                        if (!node_a.cse_gate_ok) {
+                            flip_a = false;
+                        }
+                        if (!node_b.cse_gate_ok) {
+                            flip_b = false;
+                        }
+                    }
+                    if (method.quantile_cusum_gate) {
+                        if (node_a.cusum_hold_until_us > now_us) {
+                            flip_a = false;
+                        }
+                        if (node_b.cusum_hold_until_us > now_us) {
+                            flip_b = false;
+                        }
+                    }
+                    if (flip_a) {
+                        ApplyQuantileFlipAction(node_a, method, now_us);
+                    }
+                    if (flip_b) {
+                        ApplyQuantileFlipAction(node_b, method, now_us);
+                    }
+                    UpdateQuantileHold(node_a, method, now_us);
+                    UpdateQuantileHold(node_b, method, now_us);
+
+                    auto restore_window = [&](NodeState& node) {
+                        if (node.drift_window_restore_us > 0 && now_us >= node.drift_window_restore_us) {
+                            const uint64_t window_us = (method.window_us > 0) ? method.window_us : 2000000ULL;
+                            node.drift_window_us = window_us;
+                            node.timesync.SetDriftWindowUsec(window_us);
+                            if (method.quantile_use_short_high) {
+                                node.timesync_short.SetDriftWindowUsec(window_us);
+                            }
+                            node.drift_window_restore_us = 0;
+                        }
+                    };
+                    restore_window(node_a);
+                    restore_window(node_b);
+                }
+
+                if (method.kind == MethodKind::TimeSyncStepReset) {
+                    bool stale_ab = false;
+                    bool stale_ba = false;
+                    if (EnsureEffectiveMin(node_b) && node_b.short_snapshot.valid) {
+                        const double jitter = GuardJitter(node_b, method);
+                        const double gnear = std::max(method.step_gnear_min_us, method.step_gnear_k * jitter);
+                        stale_ab = (node_b.short_snapshot.p10 > node_b.effective_min_us + gnear);
+                    }
+                    if (EnsureEffectiveMin(node_a) && node_a.short_snapshot.valid) {
+                        const double jitter = GuardJitter(node_a, method);
+                        const double gnear = std::max(method.step_gnear_min_us, method.step_gnear_k * jitter);
+                        stale_ba = (node_a.short_snapshot.p10 > node_a.effective_min_us + gnear);
+                    }
+                    const bool xor_ok = stale_ab ^ stale_ba;
+                    node_a.stepreset_guard_ok = guard_ok;
+                    node_b.stepreset_guard_ok = guard_ok;
+                    node_a.stepreset_xor_ok = xor_ok;
+                    node_b.stepreset_xor_ok = xor_ok;
+                    node_a.stepreset_dir_ok = stale_ba && !stale_ab;
+                    node_b.stepreset_dir_ok = stale_ab && !stale_ba;
+                }
+
+                if (method.kind == MethodKind::TimeSyncShadow) {
+                    bool allow_promotion = true;
+                    if (method.gsp_use_xor_gate) {
+                        bool stale_ab = false;
+                        bool stale_ba = false;
+                        if (EnsureEffectiveMin(node_b) && node_b.short_snapshot.valid) {
+                            const double jitter = GuardJitter(node_b, method);
+                            const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                            stale_ab = (node_b.short_snapshot.p10 > node_b.effective_min_us + gb);
+                        }
+                        if (EnsureEffectiveMin(node_a) && node_a.short_snapshot.valid) {
+                            const double jitter = GuardJitter(node_a, method);
+                            const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                            stale_ba = (node_a.short_snapshot.p10 > node_a.effective_min_us + gb);
+                        }
+                        allow_promotion = (stale_ab ^ stale_ba);
+                    }
+                    UpdateShadowPromotion(node_b, now_us, method, allow_promotion, guard_ok);
+                    UpdateShadowPromotion(node_a, now_us, method, allow_promotion, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                    if (method.shadow_use_stepguard) {
+                        UpdateStepGuard(node_a, node_b, now_us, method, guard_ok);
+                    }
+                } else if (method.kind == MethodKind::TimeSyncShadowSkew) {
+                    bool allow_promotion = true;
+                    if (method.gsp_use_xor_gate) {
+                        bool stale_ab = false;
+                        bool stale_ba = false;
+                        if (EnsureEffectiveMin(node_b) && node_b.short_snapshot.valid) {
+                            const double jitter = GuardJitter(node_b, method);
+                            const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                            stale_ab = (node_b.short_snapshot.p10 > node_b.effective_min_us + gb);
+                        }
+                        if (EnsureEffectiveMin(node_a) && node_a.short_snapshot.valid) {
+                            const double jitter = GuardJitter(node_a, method);
+                            const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                            stale_ba = (node_a.short_snapshot.p10 > node_a.effective_min_us + gb);
+                        }
+                        allow_promotion = (stale_ab ^ stale_ba);
+                    }
+                    UpdateShadowPromotion(node_b, now_us, method, allow_promotion, guard_ok);
+                    UpdateShadowPromotion(node_a, now_us, method, allow_promotion, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                    if (method.shadow_use_stepguard) {
+                        UpdateStepGuard(node_a, node_b, now_us, method, guard_ok);
+                    }
+                    if (method.shadow_use_cse) {
+                        UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                    }
+
+                    auto skew_gate = [&](const NodeState& node) -> bool {
+                        if (!node.short_snapshot.valid) {
+                            return false;
+                        }
+                        const double jitter = GuardJitter(node, method);
+                        const double iqr_max = std::max(method.gsp_iqr_min_us, method.gsp_iqr_k * jitter);
+                        const bool stable = node.short_snapshot.iqr <= iqr_max;
+                        const bool enough = node.short_snapshot.count >= method.gsp_npkt_min;
+                        return stable && enough;
+                    };
+
+                    const bool skew_guard_ok = !method.shadow_skew_use_rtt_guard || guard_ok;
+                    if (skew_guard_ok && node_a.algo_offset_valid) {
+                        UpdateShadowSkew(node_a, now_us, node_a.algo_offset_us, method, skew_gate(node_a));
+                    }
+                    if (skew_guard_ok && node_b.algo_offset_valid) {
+                        UpdateShadowSkew(node_b, now_us, node_b.algo_offset_us, method, skew_gate(node_b));
+                    }
+                } else if (method.kind == MethodKind::TimeSyncNFHS) {
+                    UpdateNfhs(node_b, now_us, method, true, guard_ok);
+                    UpdateNfhs(node_a, now_us, method, true, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncAdaptiveBins) {
+                    bool allow_shrink = true;
+                    if (method.gsp_use_xor_gate) {
+                        bool stale_ab = false;
+                        bool stale_ba = false;
+                        if (node_b.short_snapshot.valid) {
+                            const double jitter = GuardJitter(node_b, method);
+                            const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                            stale_ab = (node_b.short_snapshot.p10 > node_b.long_min_us + gb);
+                        }
+                        if (node_a.short_snapshot.valid) {
+                            const double jitter = GuardJitter(node_a, method);
+                            const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                            stale_ba = (node_a.short_snapshot.p10 > node_a.long_min_us + gb);
+                        }
+                        allow_shrink = (stale_ab ^ stale_ba);
+                    }
+                    UpdateAdaptiveBins(node_b, now_us, method, allow_shrink, guard_ok);
+                    UpdateAdaptiveBins(node_a, now_us, method, allow_shrink, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncStepGuard) {
+                    UpdateStepGuard(node_a, node_b, now_us, method, guard_ok);
+                    if (method.step_guard_reset_bins) {
+                        bool reset_any = false;
+                        if (node_a.step_reset_dir && node_a.short_snapshot.valid) {
+                            ApplyLongBinStepReset(node_a, now_us, node_a.short_snapshot.p10);
+                            reset_any = true;
+                        }
+                        if (node_b.step_reset_dir && node_b.short_snapshot.valid) {
+                            ApplyLongBinStepReset(node_b, now_us, node_b.short_snapshot.p10);
+                            reset_any = true;
+                        }
+                        if (reset_any) {
+                            UpdateAlgoOffset(node_a, now_us);
+                            UpdateAlgoOffset(node_b, now_us);
+                        }
+                    }
+                } else if (method.kind == MethodKind::TimeSyncConsensus) {
+                    UpdateConsensusEstimate(node_b, now_us, method, guard_ok);
+                    UpdateConsensusEstimate(node_a, now_us, method, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncBlockQuantile) {
+                    UpdateBlockQuantile(node_b, now_us, method);
+                    UpdateBlockQuantile(node_a, now_us, method);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncSlope) {
+                    UpdateSlopeTheilSen(node_a, now_us, method);
+                    UpdateSlopeTheilSen(node_b, now_us, method);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncTilted) {
+                    UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                    if (method.tilted_use_shadow) {
+                        bool allow_promotion = true;
+                        if (method.gsp_use_xor_gate) {
+                            bool stale_ab = false;
+                            bool stale_ba = false;
+                            if (node_b.short_snapshot.valid) {
+                                const double jitter = GuardJitter(node_b, method);
+                                const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                                stale_ab = (node_b.short_snapshot.p10 > node_b.effective_min_us + gb);
+                            }
+                            if (node_a.short_snapshot.valid) {
+                                const double jitter = GuardJitter(node_a, method);
+                                const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                                stale_ba = (node_a.short_snapshot.p10 > node_a.effective_min_us + gb);
+                            }
+                            allow_promotion = (stale_ab ^ stale_ba);
+                        }
+                        const uint64_t promo_a_before = node_a.gsp_promotions;
+                        const uint64_t promo_b_before = node_b.gsp_promotions;
+                        UpdateShadowPromotion(node_a, now_us, method, allow_promotion, guard_ok);
+                        UpdateShadowPromotion(node_b, now_us, method, allow_promotion, guard_ok);
+                        bool reset_any = false;
+                        if (node_a.gsp_promotions > promo_a_before && node_a.short_snapshot.valid) {
+                            const double skew_ppm = node_a.cse_skew_valid ? node_a.cse_skew_ppm : 0.0;
+                            ApplyTiltedStepReset(node_a, now_us, node_a.short_snapshot.p10, skew_ppm);
+                            reset_any = true;
+                        }
+                        if (node_b.gsp_promotions > promo_b_before && node_b.short_snapshot.valid) {
+                            const double skew_ppm = node_b.cse_skew_valid ? node_b.cse_skew_ppm : 0.0;
+                            ApplyTiltedStepReset(node_b, now_us, node_b.short_snapshot.p10, skew_ppm);
+                            reset_any = true;
+                        }
+                        if (reset_any) {
+                            UpdateAlgoOffset(node_a, now_us);
+                            UpdateAlgoOffset(node_b, now_us);
+                        }
+                    }
+                    if (method.tilted_use_stepguard) {
+                        UpdateStepGuard(node_a, node_b, now_us, method, guard_ok);
+                        bool reset_any = false;
+                        if (node_a.step_reset_dir && node_a.short_snapshot.valid) {
+                            const double skew_ppm = node_a.cse_skew_valid ? node_a.cse_skew_ppm : 0.0;
+                            ApplyTiltedStepReset(node_a, now_us, node_a.short_snapshot.p10, skew_ppm);
+                            reset_any = true;
+                        }
+                        if (node_b.step_reset_dir && node_b.short_snapshot.valid) {
+                            const double skew_ppm = node_b.cse_skew_valid ? node_b.cse_skew_ppm : 0.0;
+                            ApplyTiltedStepReset(node_b, now_us, node_b.short_snapshot.p10, skew_ppm);
+                            reset_any = true;
+                        }
+                        if (reset_any) {
+                            UpdateAlgoOffset(node_a, now_us);
+                            UpdateAlgoOffset(node_b, now_us);
+                        }
+                    }
+                } else if (method.kind == MethodKind::TimeSyncAgeComp) {
+                    UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                    UpdateAgeCompMin(node_a, now_us, method, guard_ok);
+                    UpdateAgeCompMin(node_b, now_us, method, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                    if (method.age_comp_use_stepguard) {
+                        UpdateStepGuard(node_a, node_b, now_us, method, guard_ok);
+                        bool reset_any = false;
+                        if (node_a.step_reset_dir && node_a.short_snapshot.valid) {
+                            ApplyLongBinStepReset(node_a, now_us, node_a.short_snapshot.p10);
+                            reset_any = true;
+                        }
+                        if (node_b.step_reset_dir && node_b.short_snapshot.valid) {
+                            ApplyLongBinStepReset(node_b, now_us, node_b.short_snapshot.p10);
+                            reset_any = true;
+                        }
+                        if (reset_any) {
+                            UpdateAgeCompMin(node_a, now_us, method, guard_ok);
+                            UpdateAgeCompMin(node_b, now_us, method, guard_ok);
+                            UpdateAlgoOffset(node_a, now_us);
+                            UpdateAlgoOffset(node_b, now_us);
+                        }
+                    }
+                } else if (method.kind == MethodKind::TimeSyncDualSlope) {
+                    UpdateDualSlopeSkew(node_a, node_b, now_us, method, guard_ok);
+                    UpdateAgeCompMin(node_a, now_us, method, guard_ok);
+                    UpdateAgeCompMin(node_b, now_us, method, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncEnvelopeDecay) {
+                    if (method.decay_use_cse) {
+                        UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                    }
+                } else if (method.kind == MethodKind::TimeSyncMinReg) {
+                    if (method.minreg_use_cse_gate) {
+                        UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                    }
+                    UpdateMinReg(node_a, now_us, method);
+                    UpdateMinReg(node_b, now_us, method);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncMultiWindow) {
+                    if (method.multiwin_use_cse_gate) {
+                        UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                    }
+                    UpdateMultiWindow(node_a, now_us, method);
+                    UpdateMultiWindow(node_b, now_us, method);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncPolicy) {
+                    UpdateTimeSyncPolicy(node_a, node_b, now_us, method, guard_ok, rtt_ready, rtt_delta);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncStateMachine) {
+                    UpdateStateMachine(node_a, node_b, now_us, method, guard_ok);
+                } else if (method.kind == MethodKind::TimeSyncKMin) {
+                    bool allow_ab = true;
+                    bool allow_ba = true;
+                    if (method.kmin_use_stale_gate) {
+                        auto stale_dir = [&](const NodeState& node) -> bool {
+                            if (!node.short_snapshot.valid || !node.long_min_valid) {
+                                return false;
+                            }
+                            const double jitter = GuardJitter(node, method);
+                            const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                            const double iqr_max = std::max(method.gsp_iqr_min_us, method.gsp_iqr_k * jitter);
+                            const bool stable = node.short_snapshot.iqr <= iqr_max;
+                            const bool enough = node.short_snapshot.count >= method.gsp_npkt_min;
+                            return stable && enough && (node.short_snapshot.p10 > node.long_min_us + gb);
+                        };
+                        const bool stale_ab = stale_dir(node_b);
+                        const bool stale_ba = stale_dir(node_a);
+                        allow_ab = stale_ab;
+                        allow_ba = stale_ba;
+                        if (method.kmin_use_xor_gate) {
+                            allow_ab = stale_ab && !stale_ba;
+                            allow_ba = stale_ba && !stale_ab;
+                        }
+                    }
+                    if (method.kmin_use_rtt_guard && !guard_ok) {
+                        allow_ab = false;
+                        allow_ba = false;
+                    }
+                    UpdateKMin(node_b, now_us, method, allow_ab);
+                    UpdateKMin(node_a, now_us, method, allow_ba);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncKBest) {
+                    UpdateKBest(node_b, now_us, method, guard_ok);
+                    UpdateKBest(node_a, now_us, method, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncMoE) {
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                    UpdateMoE(node_a, node_b, now_us, method, guard_ok);
+                } else if (method.kind == MethodKind::TimeSyncRttBins) {
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                    UpdateRttBins(node_a, now_us, method);
+                    UpdateRttBins(node_b, now_us, method);
+                } else if (method.kind == MethodKind::TimeSyncDDAC) {
+                    UpdateDDAC(node_a, now_us, method, guard_ok);
+                    UpdateDDAC(node_b, now_us, method, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncDDACBlend) {
+                    UpdateDDACBlend(node_a, now_us, method, guard_ok);
+                    UpdateDDACBlend(node_b, now_us, method, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
                 }
             }
         }
@@ -1427,7 +8823,8 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
             if (EstimateRemoteTimeUsec(method, node_a, local_now, remote_est)) {
                 if (now_us >= metrics_start_us) {
                     const uint64_t true_remote = ComputeLocalTimeUsec(now_us, node_b.clock, rng, false);
-                    AddPollTimeError(metrics.ab, (double)remote_est - (double)true_remote);
+                    AddPollTimeError(metrics.ab, (double)remote_est - (double)true_remote,
+                        now_us, scenario.clock_step_enabled, scenario.clock_step_time_us);
                 }
             }
             next_poll_ab = poll_interval_us ? (now_us + poll_interval_us) : UINT64_MAX;
@@ -1439,7 +8836,8 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
             if (EstimateRemoteTimeUsec(method, node_b, local_now, remote_est)) {
                 if (now_us >= metrics_start_us) {
                     const uint64_t true_remote = ComputeLocalTimeUsec(now_us, node_a.clock, rng, false);
-                    AddPollTimeError(metrics.ba, (double)remote_est - (double)true_remote);
+                    AddPollTimeError(metrics.ba, (double)remote_est - (double)true_remote,
+                        now_us, scenario.clock_step_enabled, scenario.clock_step_time_us);
                 }
             }
             next_poll_ba = poll_interval_us ? (now_us + poll_interval_us) : UINT64_MAX;
@@ -1456,6 +8854,7 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
             msg.ts24 = node_a.timesync.LocalTimeToDatagramTS24(local_send);
             msg.true_remote_local_at_send = ComputeLocalTimeUsec(now_us, node_b.clock, rng, false);
             msg.app_ts23 = node_a.timesync.ToRemoteTime23(local_send);
+            MaybeCorruptTs24(scenario, true, rng, msg);
 
             ArrivalEvent ev;
             ev.deliver_true_us = now_us + scenario.inject_late_delay_us;
@@ -1474,6 +8873,7 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
             msg.ts24 = node_b.timesync.LocalTimeToDatagramTS24(local_send);
             msg.true_remote_local_at_send = ComputeLocalTimeUsec(now_us, node_a.clock, rng, false);
             msg.app_ts23 = node_b.timesync.ToRemoteTime23(local_send);
+            MaybeCorruptTs24(scenario, false, rng, msg);
 
             ArrivalEvent ev;
             ev.deliver_true_us = now_us + scenario.inject_late_delay_us;
@@ -1493,12 +8893,13 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
             msg.send_local_us = local_send;
             msg.true_remote_local_at_send = ComputeLocalTimeUsec(now_us, node_b.clock, rng, false);
             msg.stamped = true;
-            if ((method.kind == MethodKind::TimeSync || method.kind == MethodKind::Piggyback) && method.sample_stride > 1) {
+            if (UsesMinDeltaExchange(method.kind) && method.sample_stride > 1) {
                 msg.stamped = ((data_seq_ab % (uint64_t)method.sample_stride) == 0);
             }
             if (msg.stamped) {
                 msg.ts24 = node_a.timesync.LocalTimeToDatagramTS24(local_send);
                 msg.app_ts23 = node_a.timesync.ToRemoteTime23(local_send);
+                MaybeCorruptTs24(scenario, true, rng, msg);
             }
 
             const uint32_t delay = delay_ab.SampleDelay(now_us, rng);
@@ -1524,12 +8925,13 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
             msg.send_local_us = local_send;
             msg.true_remote_local_at_send = ComputeLocalTimeUsec(now_us, node_a.clock, rng, false);
             msg.stamped = true;
-            if ((method.kind == MethodKind::TimeSync || method.kind == MethodKind::Piggyback) && method.sample_stride > 1) {
+            if (UsesMinDeltaExchange(method.kind) && method.sample_stride > 1) {
                 msg.stamped = ((data_seq_ba % (uint64_t)method.sample_stride) == 0);
             }
             if (msg.stamped) {
                 msg.ts24 = node_b.timesync.LocalTimeToDatagramTS24(local_send);
                 msg.app_ts23 = node_b.timesync.ToRemoteTime23(local_send);
+                MaybeCorruptTs24(scenario, false, rng, msg);
             }
 
             const uint32_t delay = delay_ba.SampleDelay(now_us, rng);
@@ -1546,7 +8948,7 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
         }
 
         // Send probe A->B
-        if (next_probe_ab == now_us && (method.kind == MethodKind::Cristian || method.kind == MethodKind::Ntp || method.kind == MethodKind::Ptp)) {
+        if (next_probe_ab == now_us && MethodUsesProbes(method)) {
             const uint64_t local_send = ComputeLocalTimeUsec(now_us, node_a.clock, rng, false);
             Message msg;
             msg.from_a = true;
@@ -1566,7 +8968,7 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
         }
 
         // Send probe B->A
-        if (next_probe_ba == now_us && (method.kind == MethodKind::Cristian || method.kind == MethodKind::Ntp || method.kind == MethodKind::Ptp)) {
+        if (next_probe_ba == now_us && MethodUsesProbes(method)) {
             const uint64_t local_send = ComputeLocalTimeUsec(now_us, node_b.clock, rng, false);
             Message msg;
             msg.from_a = false;
@@ -1586,15 +8988,49 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
         }
 
         // MinDelta exchange for TimeSync/Piggyback
-        if (next_mindelta_ab == now_us && (method.kind == MethodKind::TimeSync || method.kind == MethodKind::Piggyback)) {
+        if (next_mindelta_ab == now_us && UsesMinDeltaExchange(method.kind)) {
             const uint64_t local_send = ComputeLocalTimeUsec(now_us, node_a.clock, rng, false);
             Message msg;
             msg.from_a = true;
             msg.kind = MsgKind::MinDelta;
             msg.send_true_us = now_us;
             msg.send_local_us = local_send;
-            if (method.kind == MethodKind::TimeSync) {
-                msg.min_delta = node_a.timesync.GetMinDeltaTS24();
+            if (UsesTimeSyncCore(method.kind)) {
+                if (UsesCustomTimeSync(method.kind) && node_a.effective_min_valid) {
+                    if ((method.kind == MethodKind::TimeSyncDDAC ||
+                         method.kind == MethodKind::TimeSyncDDACBlend) &&
+                        node_a.long_min_valid) {
+                        msg.min_delta = UsecToTs24(node_a.long_min_us);
+                    } else {
+                        msg.min_delta = UsecToTs24(node_a.effective_min_us);
+                    }
+                } else {
+                    msg.min_delta = node_a.timesync.GetMinDeltaTS24();
+                }
+                if (method.kind == MethodKind::TimeSyncPerDirSkew) {
+                    msg.skew_valid = node_a.estimator.Ready();
+                    double skew_ppm = node_a.estimator.skew_est_ppm;
+                    if (msg.skew_valid && method.perdir_skew_quantize_ppm > 0.0) {
+                        const double q = method.perdir_skew_quantize_ppm;
+                        skew_ppm = std::floor(skew_ppm / q + 0.5) * q;
+                    }
+                    msg.skew_est_ppm = msg.skew_valid ? skew_ppm : 0.0;
+                }
+                if (method.kind == MethodKind::TimeSyncDDAC ||
+                    method.kind == MethodKind::TimeSyncDDACBlend) {
+                    msg.ddac_seq = ++node_a.ddac_seq;
+                    if (node_a.long_min_valid && node_a.short_snapshot.valid) {
+                        msg.ddac_valid = true;
+                        msg.ddac_min_long_us = node_a.long_min_us;
+                        msg.ddac_age_us = (now_us > node_a.long_min_time_us)
+                            ? (now_us - node_a.long_min_time_us)
+                            : 0;
+                        msg.ddac_p10_us = node_a.short_snapshot.p10;
+                        msg.ddac_iqr_us = node_a.short_snapshot.iqr;
+                        msg.ddac_count = (uint32_t)node_a.short_snapshot.count;
+                        msg.ddac_p0_us = node_a.short_snapshot.p0;
+                    }
+                }
             } else {
                 msg.env_delta_us = (uint32_t)std::max(0.0, node_a.local_env.Value());
             }
@@ -1609,15 +9045,49 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
             next_mindelta_ab = (method.mindelta_interval_us > 0) ? (now_us + method.mindelta_interval_us) : UINT64_MAX;
         }
 
-        if (next_mindelta_ba == now_us && (method.kind == MethodKind::TimeSync || method.kind == MethodKind::Piggyback)) {
+        if (next_mindelta_ba == now_us && UsesMinDeltaExchange(method.kind)) {
             const uint64_t local_send = ComputeLocalTimeUsec(now_us, node_b.clock, rng, false);
             Message msg;
             msg.from_a = false;
             msg.kind = MsgKind::MinDelta;
             msg.send_true_us = now_us;
             msg.send_local_us = local_send;
-            if (method.kind == MethodKind::TimeSync) {
-                msg.min_delta = node_b.timesync.GetMinDeltaTS24();
+            if (UsesTimeSyncCore(method.kind)) {
+                if (UsesCustomTimeSync(method.kind) && node_b.effective_min_valid) {
+                    if ((method.kind == MethodKind::TimeSyncDDAC ||
+                         method.kind == MethodKind::TimeSyncDDACBlend) &&
+                        node_b.long_min_valid) {
+                        msg.min_delta = UsecToTs24(node_b.long_min_us);
+                    } else {
+                        msg.min_delta = UsecToTs24(node_b.effective_min_us);
+                    }
+                } else {
+                    msg.min_delta = node_b.timesync.GetMinDeltaTS24();
+                }
+                if (method.kind == MethodKind::TimeSyncPerDirSkew) {
+                    msg.skew_valid = node_b.estimator.Ready();
+                    double skew_ppm = node_b.estimator.skew_est_ppm;
+                    if (msg.skew_valid && method.perdir_skew_quantize_ppm > 0.0) {
+                        const double q = method.perdir_skew_quantize_ppm;
+                        skew_ppm = std::floor(skew_ppm / q + 0.5) * q;
+                    }
+                    msg.skew_est_ppm = msg.skew_valid ? skew_ppm : 0.0;
+                }
+                if (method.kind == MethodKind::TimeSyncDDAC ||
+                    method.kind == MethodKind::TimeSyncDDACBlend) {
+                    msg.ddac_seq = ++node_b.ddac_seq;
+                    if (node_b.long_min_valid && node_b.short_snapshot.valid) {
+                        msg.ddac_valid = true;
+                        msg.ddac_min_long_us = node_b.long_min_us;
+                        msg.ddac_age_us = (now_us > node_b.long_min_time_us)
+                            ? (now_us - node_b.long_min_time_us)
+                            : 0;
+                        msg.ddac_p10_us = node_b.short_snapshot.p10;
+                        msg.ddac_iqr_us = node_b.short_snapshot.iqr;
+                        msg.ddac_count = (uint32_t)node_b.short_snapshot.count;
+                        msg.ddac_p0_us = node_b.short_snapshot.p0;
+                    }
+                }
             } else {
                 msg.env_delta_us = (uint32_t)std::max(0.0, node_b.local_env.Value());
             }
@@ -1631,12 +9101,100 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
             }
             next_mindelta_ba = (method.mindelta_interval_us > 0) ? (now_us + method.mindelta_interval_us) : UINT64_MAX;
         }
+
+        trace.MaybeWrite(now_us, scenario, method, seed, rtt_trace, node_a, node_b);
     }
 
     metrics.synced_a = node_a.synced;
     metrics.synced_b = node_b.synced;
     metrics.sync_time_a_us = node_a.sync_time_us;
     metrics.sync_time_b_us = node_b.sync_time_us;
+    metrics.method_a.gsp_promotions = node_a.gsp_promotions;
+    metrics.method_b.gsp_promotions = node_b.gsp_promotions;
+    metrics.method_a.nfhs_promotions = node_a.nfhs_promotions;
+    metrics.method_b.nfhs_promotions = node_b.nfhs_promotions;
+    metrics.method_a.step_resets = node_a.step_resets;
+    metrics.method_b.step_resets = node_b.step_resets;
+    metrics.method_a.adaptive_bins_changes = node_a.adaptive_bins_changes;
+    metrics.method_b.adaptive_bins_changes = node_b.adaptive_bins_changes;
+    metrics.method_a.step_guard_ticks = node_a.step_guard_ticks;
+    metrics.method_b.step_guard_ticks = node_b.step_guard_ticks;
+    metrics.method_a.step_guard_stable = node_a.step_guard_stable;
+    metrics.method_b.step_guard_stable = node_b.step_guard_stable;
+    metrics.method_a.step_guard_enough = node_a.step_guard_enough;
+    metrics.method_b.step_guard_enough = node_b.step_guard_enough;
+    metrics.method_a.step_guard_nonear = node_a.step_guard_nonear;
+    metrics.method_b.step_guard_nonear = node_b.step_guard_nonear;
+    metrics.method_a.step_guard_near_ratio_ok = node_a.step_guard_near_ratio_ok;
+    metrics.method_b.step_guard_near_ratio_ok = node_b.step_guard_near_ratio_ok;
+    metrics.method_a.step_guard_rtt_ok = node_a.step_guard_rtt_ok;
+    metrics.method_b.step_guard_rtt_ok = node_b.step_guard_rtt_ok;
+    metrics.method_a.step_guard_xor_ok = node_a.step_guard_xor_ok;
+    metrics.method_b.step_guard_xor_ok = node_b.step_guard_xor_ok;
+    metrics.method_a.step_guard_sym_ok = node_a.step_guard_sym_ok;
+    metrics.method_b.step_guard_sym_ok = node_b.step_guard_sym_ok;
+    metrics.method_a.step_guard_stale_ab = node_a.step_guard_stale_ab;
+    metrics.method_b.step_guard_stale_ab = node_b.step_guard_stale_ab;
+    metrics.method_a.step_guard_stale_ba = node_a.step_guard_stale_ba;
+    metrics.method_b.step_guard_stale_ba = node_b.step_guard_stale_ba;
+    metrics.method_a.step_guard_innov_ok = node_a.step_guard_innov_ok;
+    metrics.method_b.step_guard_innov_ok = node_b.step_guard_innov_ok;
+    metrics.method_a.step_guard_all_ok = node_a.step_guard_all_ok;
+    metrics.method_b.step_guard_all_ok = node_b.step_guard_all_ok;
+    metrics.method_a.shadow_skew_updates = node_a.shadow_skew_updates;
+    metrics.method_b.shadow_skew_updates = node_b.shadow_skew_updates;
+    metrics.method_a.cse_updates = node_a.cse_updates;
+    metrics.method_b.cse_updates = node_b.cse_updates;
+    metrics.method_a.consensus_updates = node_a.consensus_updates;
+    metrics.method_b.consensus_updates = node_b.consensus_updates;
+    metrics.method_a.minreg_updates = node_a.minreg_updates;
+    metrics.method_b.minreg_updates = node_b.minreg_updates;
+    metrics.method_a.multiwin_updates = node_a.multiwin_updates;
+    metrics.method_b.multiwin_updates = node_b.multiwin_updates;
+    metrics.method_a.decay_updates = node_a.decay_updates;
+    metrics.method_b.decay_updates = node_b.decay_updates;
+    metrics.method_a.kmin_updates = node_a.kmin_updates;
+    metrics.method_b.kmin_updates = node_b.kmin_updates;
+    metrics.method_a.kbest_advances = node_a.kbest_advances;
+    metrics.method_b.kbest_advances = node_b.kbest_advances;
+    metrics.method_a.moe_updates = node_a.moe_updates;
+    metrics.method_b.moe_updates = node_b.moe_updates;
+    metrics.method_a.moe_blends = node_a.moe_blends;
+    metrics.method_b.moe_blends = node_b.moe_blends;
+    metrics.method_a.moe_conf_mean = (node_a.moe_conf_count > 0)
+        ? (node_a.moe_conf_sum / (double)node_a.moe_conf_count)
+        : 0.0;
+    metrics.method_b.moe_conf_mean = (node_b.moe_conf_count > 0)
+        ? (node_b.moe_conf_sum / (double)node_b.moe_conf_count)
+        : 0.0;
+    metrics.method_a.ddac_skew_updates = node_a.ddac_skew_updates;
+    metrics.method_b.ddac_skew_updates = node_b.ddac_skew_updates;
+    metrics.method_a.ddac_age_comp = node_a.ddac_age_comp;
+    metrics.method_b.ddac_age_comp = node_b.ddac_age_comp;
+    metrics.method_a.ddac_clamp_hits = node_a.ddac_clamp_hits;
+    metrics.method_b.ddac_clamp_hits = node_b.ddac_clamp_hits;
+    metrics.method_a.ddac_step_resets = node_a.ddac_step_resets;
+    metrics.method_b.ddac_step_resets = node_b.ddac_step_resets;
+    metrics.method_a.ddac_step_in_hits = node_a.ddac_step_in_hits;
+    metrics.method_b.ddac_step_in_hits = node_b.ddac_step_in_hits;
+    metrics.method_a.ddac_step_out_hits = node_a.ddac_step_out_hits;
+    metrics.method_b.ddac_step_out_hits = node_b.ddac_step_out_hits;
+    metrics.method_a.ddac_step_xor_hits = node_a.ddac_step_xor_hits;
+    metrics.method_b.ddac_step_xor_hits = node_b.ddac_step_xor_hits;
+    metrics.method_a.ddac_step_streak_max = (uint64_t)std::max(0, node_a.ddac_step_streak_max);
+    metrics.method_b.ddac_step_streak_max = (uint64_t)std::max(0, node_b.ddac_step_streak_max);
+    metrics.method_a.ddac_gap_in_mean_us = node_a.ddac_gap_in_us.Mean();
+    metrics.method_b.ddac_gap_in_mean_us = node_b.ddac_gap_in_us.Mean();
+    metrics.method_a.ddac_gap_in_p95_us = node_a.ddac_gap_in_us.Percentile(0.95);
+    metrics.method_b.ddac_gap_in_p95_us = node_b.ddac_gap_in_us.Percentile(0.95);
+    metrics.method_a.ddac_gap_out_mean_us = node_a.ddac_gap_out_us.Mean();
+    metrics.method_b.ddac_gap_out_mean_us = node_b.ddac_gap_out_us.Mean();
+    metrics.method_a.ddac_gap_out_p95_us = node_a.ddac_gap_out_us.Percentile(0.95);
+    metrics.method_b.ddac_gap_out_p95_us = node_b.ddac_gap_out_us.Percentile(0.95);
+    metrics.method_a.age_comp_updates = node_a.age_comp_updates;
+    metrics.method_b.age_comp_updates = node_b.age_comp_updates;
+    metrics.method_a.tilted_updates = node_a.tilted_updates;
+    metrics.method_b.tilted_updates = node_b.tilted_updates;
     metrics.mem_bytes = (double)(node_a.estimator.samples.size() + node_b.estimator.samples.size() +
         node_a.local_env.samples.size() + node_b.local_env.samples.size()) * sizeof(OffsetSample);
     metrics.cpu_ops = (double)(metrics.ab.sent + metrics.ba.sent + metrics.ab.received + metrics.ba.received);
@@ -1657,36 +9215,119 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
 {
     ScenarioConfig scenario = scenario_in;
     MethodConfig method = method_in;
+    ApplyScenarioOverrides(method, scenario);
     ApplyBudget(method, scenario);
 
     PCGRandom rng;
     rng.Seed(seed, 0xC0FFEEULL);
+
+    if (scenario.clock_step_random) {
+        scenario.clock_step_enabled = true;
+        uint64_t tmin = scenario.clock_step_time_min_us;
+        uint64_t tmax = scenario.clock_step_time_max_us;
+        if (tmax < tmin) {
+            std::swap(tmin, tmax);
+        }
+        scenario.clock_step_time_us = RandRangeU64(rng, tmin, tmax);
+        int64_t smin = scenario.clock_step_min_us;
+        int64_t smax = scenario.clock_step_max_us;
+        if (smax < smin) {
+            std::swap(smin, smax);
+        }
+        const int64_t step_us = RandRangeInt64(rng, smin, smax);
+        scenario.clock_step_a_us = 0;
+        scenario.clock_step_b_us = 0;
+        if (scenario.clock_step_random_side) {
+            if (rng.NextDouble01() < 0.5) {
+                scenario.clock_step_a_us = step_us;
+            } else {
+                scenario.clock_step_b_us = step_us;
+            }
+        } else {
+            scenario.clock_step_b_us = step_us;
+        }
+    }
 
     BenchmarkMetrics metrics;
     metrics.overhead_bps = EstimateOverheadBps(method, scenario);
 
     NodeState node_a;
     NodeState node_b;
+    TraceWriter trace;
+    trace.Open(g_trace, scenario, method, seed);
+    TraceRttSnapshot rtt_trace;
 
+    const uint32_t recv_noise_a = scenario.recv_noise_us_a ? scenario.recv_noise_us_a : scenario.recv_noise_us;
+    const uint32_t recv_noise_b = scenario.recv_noise_us_b ? scenario.recv_noise_us_b : scenario.recv_noise_us;
     node_a.clock.drift_ppm_base = scenario.drift_ppm_a;
+    node_a.clock.drift_ramp_ppm_per_s = scenario.drift_ramp_ppm_per_s_a;
+    node_a.clock.drift_ramp_max_ppm = scenario.drift_ramp_max_ppm;
+    node_a.clock.drift_ramp_start_us = scenario.drift_ramp_start_us;
     node_a.clock.offset_us = scenario.offset_a_us;
-    node_a.clock.recv_noise_us = scenario.recv_noise_us;
+    node_a.clock.recv_noise_us = recv_noise_a;
     node_a.clock.recv_noise_mode = scenario.recv_noise_mode;
     node_a.clock.recv_noise_sigma = scenario.recv_noise_sigma;
     node_b.clock = node_a.clock;
     node_b.clock.drift_ppm_base = scenario.drift_ppm_b;
+    node_b.clock.drift_ramp_ppm_per_s = scenario.drift_ramp_ppm_per_s_b;
     node_b.clock.offset_us = scenario.offset_b_us;
+    node_b.clock.recv_noise_us = recv_noise_b;
 
     node_a.estimator.estimator = method.estimator;
     node_a.estimator.discipline = method.discipline;
     node_a.estimator.quantile = method.quantile;
     node_a.estimator.window_us = method.window_us;
+    node_a.estimator.kalman_q_offset_us2 = method.kalman_q_offset_us2;
+    node_a.estimator.kalman_q_skew_ppm2 = method.kalman_q_skew_ppm2;
+    node_a.estimator.kalman_r_us2 = method.kalman_r_us2;
     node_b.estimator = node_a.estimator;
 
     node_a.local_env.estimator = method.estimator;
     node_a.local_env.quantile = method.quantile;
     node_a.local_env.window_us = method.window_us;
     node_b.local_env = node_a.local_env;
+
+    node_a.timesync.SetMinQuantile(method.timesync_quantile);
+    node_b.timesync.SetMinQuantile(method.timesync_quantile);
+    node_a.timesync_short.SetMinQuantile(method.timesync_quantile);
+    node_b.timesync_short.SetMinQuantile(method.timesync_quantile);
+    if (IsTimeSyncQuantileFamily(method.kind) && method.quantile_use_short_high) {
+        node_a.timesync_short.SetMinQuantile(method.quantile_short);
+        node_b.timesync_short.SetMinQuantile(method.quantile_short);
+    }
+
+    if (method.kind == MethodKind::TimeSyncDualWindow ||
+        method.kind == MethodKind::TimeSyncHybrid ||
+        method.kind == MethodKind::TimeSyncEnsemble) {
+        const uint64_t short_window_us = (method.short_window_us > 0)
+            ? method.short_window_us
+            : 200000;
+        node_a.timesync_short.SetDriftWindowUsec(short_window_us);
+        node_b.timesync_short.SetDriftWindowUsec(short_window_us);
+    }
+
+    if (UsesTimeSyncCore(method.kind)) {
+        const uint64_t long_window_us = (method.stats_long_window_us > 0)
+            ? method.stats_long_window_us
+            : node_a.timesync.GetDriftWindowUsec();
+        const uint64_t short_window_us = (method.stats_short_window_us > 0)
+            ? method.stats_short_window_us
+            : 2000000;
+        node_a.stats_long_window_us = long_window_us;
+        node_b.stats_long_window_us = long_window_us;
+        node_a.stats_short_window_us = short_window_us;
+        node_b.stats_short_window_us = short_window_us;
+        node_a.long_bins.Reset(long_window_us);
+        node_b.long_bins.Reset(long_window_us);
+        node_a.short_stats.Reset(short_window_us);
+        node_b.short_stats.Reset(short_window_us);
+        if (method.kind == MethodKind::TimeSyncTilted ||
+            method.kind == MethodKind::TimeSyncSlope ||
+            method.kind == MethodKind::TimeSyncPolicy) {
+            node_a.tilted_bins.Reset(long_window_us);
+            node_b.tilted_bins.Reset(long_window_us);
+        }
+    }
 
     DelayModel delay_ab = scenario.delay_ab;
     DelayModel delay_ba = scenario.delay_ba;
@@ -1705,13 +9346,19 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
     uint64_t next_telemetry = 0;
     uint64_t next_poll_ab = poll_interval_us ? 0 : UINT64_MAX;
     uint64_t next_poll_ba = poll_interval_us ? 0 : UINT64_MAX;
-    const bool uses_mindelta = (method.kind == MethodKind::TimeSync || method.kind == MethodKind::Piggyback);
+    const bool uses_mindelta = UsesMinDeltaExchange(method.kind);
     uint64_t next_mindelta_ab = (uses_mindelta && method.mindelta_interval_us)
         ? 0
         : UINT64_MAX;
     uint64_t next_mindelta_ba = (uses_mindelta && method.mindelta_interval_us)
         ? 0
         : UINT64_MAX;
+    uint64_t next_rtt_guard_us = 0;
+    SlidingMin rtt_min_guard;
+    if (method.rtt_guard_strict && method.rtt_guard_min_window_us > 0) {
+        rtt_min_guard.Reset(method.rtt_guard_min_window_us);
+    }
+    uint64_t prev_now_us = 0;
 
     std::priority_queue<ArrivalEvent, std::vector<ArrivalEvent>, ArrivalCompare> arrivals;
 
@@ -1726,6 +9373,241 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
 
     double u = 0.0;
     double desired = 0.0;
+
+    auto ProcessTeleopTimeSyncCore = [&](NodeState& recv_node,
+        DirectionMetrics& dm,
+        uint64_t local_recv,
+        uint64_t now_us,
+        const Message& msg) {
+        if (!UsesTimeSyncCore(method.kind) || !msg.stamped) {
+            return;
+        }
+        double delta_us = 0.0;
+        Counter24 delta_ts24 = 0;
+        if (!ComputeTs24DeltaSample(recv_node, method, msg.ts24, local_recv, delta_us, delta_ts24)) {
+            dm.ts24_drops++;
+            return;
+        }
+        (void)delta_ts24;
+        if (recv_node.stats_long_window_us > 0) {
+            recv_node.long_bins.Update(local_recv, delta_us);
+            double min_long = 0.0;
+            uint64_t min_time = 0;
+            uint32_t long_count = 0;
+            if (recv_node.long_bins.GetMin(local_recv, min_long, min_time, long_count)) {
+                recv_node.long_min_us = min_long;
+                recv_node.long_min_time_us = min_time;
+                recv_node.long_min_valid = true;
+            }
+        }
+        if (recv_node.stats_short_window_us > 0) {
+            recv_node.short_stats.Add(local_recv, delta_us);
+            MaybeUpdateShortStats(recv_node, dm, local_recv, method.stats_gnear_us);
+            if (method.kind == MethodKind::TimeSyncQuantileSwap ||
+                method.hyst_use_quantile_swap ||
+                method.adaptive_use_quantile_swap) {
+                UpdateQuantileSwap(recv_node, method);
+            } else if (method.kind == MethodKind::TimeSyncQuantileAdaptive) {
+                UpdateQuantileAdaptive(recv_node, method, now_us);
+            } else if (method.kind == MethodKind::TimeSyncQuantileNearHit) {
+                UpdateQuantileNearHit(recv_node, method);
+            }
+        }
+
+        if (UsesCustomTimeSync(method.kind)) {
+            if (method.kind == MethodKind::TimeSyncMinReg ||
+                method.kind == MethodKind::TimeSyncMultiWindow ||
+                method.kind == MethodKind::TimeSyncBlockQuantile) {
+                // Defer effective min updates to the 1 Hz tick.
+            } else if (method.kind == MethodKind::TimeSyncEnvelopeDecay) {
+                UpdateEnvelopeDecay(recv_node, local_recv, delta_us, method);
+            } else if (method.kind == MethodKind::TimeSyncConsensus) {
+                if (EnsureEffectiveMin(recv_node) && delta_us < recv_node.effective_min_us) {
+                    recv_node.effective_min_us = delta_us;
+                    recv_node.effective_min_time_us = now_us;
+                    recv_node.effective_min_valid = true;
+                }
+                UpdateConsensusCandidates(recv_node, local_recv, delta_us, method);
+            } else if (method.kind == MethodKind::TimeSyncSlope) {
+                const uint64_t window_us = (method.sloped_window_us > 0)
+                    ? method.sloped_window_us
+                    : 10000000ULL;
+                UpdateSampleWindow(recv_node.sloped_samples, local_recv, delta_us, window_us);
+                const double skew_ppm = recv_node.sloped_skew_valid ? recv_node.sloped_skew_ppm : 0.0;
+                UpdateTiltedMin(recv_node, local_recv, delta_us, skew_ppm);
+            } else if (method.kind == MethodKind::TimeSyncTilted) {
+                const double skew_ppm = recv_node.cse_skew_valid ? recv_node.cse_skew_ppm : 0.0;
+                UpdateTiltedMin(recv_node, local_recv, delta_us, skew_ppm);
+            } else if (method.kind == MethodKind::TimeSyncPolicy) {
+                const double prev_min = recv_node.effective_min_us;
+                const uint64_t prev_time = recv_node.effective_min_time_us;
+                const bool prev_valid = recv_node.effective_min_valid;
+                const double prev_peer = recv_node.peer_min_us;
+                const bool prev_peer_valid = recv_node.peer_min_valid;
+                recv_node.timesync.OnAuthenticatedDatagramTimestamp(msg.ts24, local_recv);
+                if (method.quantile_use_short_high) {
+                    recv_node.timesync_short.OnAuthenticatedDatagramTimestamp(msg.ts24, local_recv);
+                }
+                if (method.policy_use_decay) {
+                    UpdateEnvelopeDecay(recv_node, local_recv, delta_us, method);
+                }
+                if (method.policy_use_tilted) {
+                    const double skew_ppm = recv_node.cse_skew_valid ? recv_node.cse_skew_ppm : 0.0;
+                    UpdateTiltedMin(recv_node, local_recv, delta_us, skew_ppm);
+                }
+                recv_node.effective_min_us = prev_min;
+                recv_node.effective_min_time_us = prev_time;
+                recv_node.effective_min_valid = prev_valid;
+                recv_node.peer_min_us = prev_peer;
+                recv_node.peer_min_valid = prev_peer_valid;
+            } else if (method.kind == MethodKind::TimeSyncDDAC) {
+                // DD-AC updates effective mins on the 1 Hz tick.
+            } else if (EnsureEffectiveMin(recv_node) && delta_us < recv_node.effective_min_us) {
+                recv_node.effective_min_us = delta_us;
+                recv_node.effective_min_time_us = now_us;
+                recv_node.effective_min_valid = true;
+            }
+            UpdateAlgoOffset(recv_node, now_us);
+            if (recv_node.algo_offset_valid) {
+                MaybeSetSyncTime(true, now_us, recv_node.synced, recv_node.sync_time_us);
+            }
+            return;
+        }
+
+        const unsigned owd_est = recv_node.timesync.OnAuthenticatedDatagramTimestamp(msg.ts24, local_recv);
+        (void)owd_est;
+        if (method.kind == MethodKind::TimeSyncDualWindow ||
+            method.kind == MethodKind::TimeSyncHybrid ||
+            method.kind == MethodKind::TimeSyncEnsemble ||
+            (IsTimeSyncQuantileFamily(method.kind) && method.quantile_use_short_high)) {
+            recv_node.timesync_short.OnAuthenticatedDatagramTimestamp(msg.ts24, local_recv);
+        }
+        const bool synced = recv_node.timesync.IsSynchronized();
+        if (synced) {
+            MaybeSetSyncTime(true, now_us, recv_node.synced, recv_node.sync_time_us);
+        }
+        double offset_sample = 0.0;
+        const bool have_offset_sample = synced && UpdateTimeSyncOffsetSample(recv_node, local_recv, offset_sample);
+        if (!have_offset_sample) {
+            return;
+        }
+        if (method.kind == MethodKind::TimeSyncSkew ||
+            method.kind == MethodKind::TimeSyncSkewReg ||
+            method.kind == MethodKind::TimeSyncSkewCorrected ||
+            method.kind == MethodKind::TimeSyncPerDirSkew) {
+            recv_node.estimator.AddSample(now_us, offset_sample);
+            MaybeSetSyncTime(recv_node.estimator.Ready(), now_us, recv_node.synced, recv_node.sync_time_us);
+        } else if (method.kind == MethodKind::TimeSyncAdaptive) {
+            const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+            uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+            if (method.min_window_floor_us > 0) {
+                min_window_us = std::max<uint64_t>(min_window_us, method.min_window_floor_us);
+            }
+            double trigger_us = (method.adaptive_trigger_us > 0.0)
+                ? method.adaptive_trigger_us
+                : 100.0;
+            if (method.adaptive_trigger_use_jitter && recv_node.short_snapshot.valid) {
+                const double jitter = GuardJitter(recv_node, method);
+                const double k = (method.adaptive_trigger_jitter_k > 0.0)
+                    ? method.adaptive_trigger_jitter_k
+                    : 1.0;
+                const double min_trigger = (method.adaptive_trigger_jitter_min_us > 0.0)
+                    ? method.adaptive_trigger_jitter_min_us
+                    : 0.0;
+                trigger_us = std::max(min_trigger, k * jitter);
+            }
+            UpdateAdaptiveDriftWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us, trigger_us,
+                method.stationary_var_max_us2, method.stationary_delta_max_us, method.stationary_window_size,
+                recv_node.adaptive_force_trigger,
+                method.adaptive_trigger_count_req,
+                method.adaptive_shrink_ratio,
+                method.adaptive_expand_ratio);
+            recv_node.adaptive_force_trigger = false;
+        } else if (method.kind == MethodKind::TimeSyncAdaptiveGuard) {
+            const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+            const uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+            const double trigger_us = (method.adaptive_trigger_us > 0.0)
+                ? method.adaptive_trigger_us
+                : 100.0;
+            const double var_threshold_us2 = (method.adaptive_guard_var_threshold_us2 > 0.0)
+                ? method.adaptive_guard_var_threshold_us2
+                : 10000.0;
+            const size_t window_size = (method.adaptive_guard_window_size > 0)
+                ? method.adaptive_guard_window_size
+                : 20;
+            const int sign_count = (method.adaptive_guard_sign_count > 0)
+                ? method.adaptive_guard_sign_count
+                : 3;
+            const uint64_t hold_us = (method.adaptive_guard_hold_us > 0)
+                ? method.adaptive_guard_hold_us
+                : max_window_us;
+            UpdateAdaptiveGuardWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us,
+                trigger_us, var_threshold_us2, window_size, sign_count, hold_us);
+        } else if (method.kind == MethodKind::TimeSyncHybrid) {
+            const double trigger_us = (method.hybrid_trigger_us > 0.0)
+                ? method.hybrid_trigger_us
+                : 100.0;
+            const double var_threshold_us2 = (method.hybrid_var_threshold_us2 > 0.0)
+                ? method.hybrid_var_threshold_us2
+                : 10000.0;
+            const size_t window_size = (method.hybrid_window_size > 0)
+                ? method.hybrid_window_size
+                : 20;
+            const int sign_count = (method.hybrid_sign_count > 0)
+                ? method.hybrid_sign_count
+                : 3;
+            const uint64_t hold_us = (method.hybrid_hold_us > 0)
+                ? method.hybrid_hold_us
+                : std::max<uint64_t>(method.window_us, 200000);
+            double offset_short = 0.0;
+            if (recv_node.timesync_short.IsSynchronized() &&
+                UpdateTimeSyncShortOffsetSample(recv_node, local_recv, offset_short)) {
+                const double diff = offset_short - offset_sample;
+                UpdateHybridSelector(recv_node, now_us, diff,
+                    trigger_us, var_threshold_us2, window_size, sign_count, hold_us);
+            }
+        } else if (method.kind == MethodKind::TimeSyncHysteresis) {
+            const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+            const uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+            UpdateHysteresisWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us,
+                100.0, 3, max_window_us, recv_node.hyst_force_trigger);
+            recv_node.hyst_force_trigger = false;
+        } else if (method.kind == MethodKind::TimeSyncCUSUM) {
+            const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+            const uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+            UpdateCusumWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us,
+                50.0, 500.0, max_window_us);
+        } else if (method.kind == MethodKind::TimeSyncVarGate) {
+            const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+            uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+            if (method.min_window_floor_us > 0) {
+                min_window_us = std::max<uint64_t>(min_window_us, method.min_window_floor_us);
+            }
+            const double trigger_us = (method.vargate_trigger_us > 0.0) ? method.vargate_trigger_us : 100.0;
+            const double var_threshold_us2 = (method.vargate_var_threshold_us2 > 0.0)
+                ? method.vargate_var_threshold_us2
+                : 10000.0;
+            const size_t window_size = (method.vargate_window_size > 0)
+                ? method.vargate_window_size
+                : 20;
+            const uint64_t hold_us = (method.vargate_hold_us > 0) ? method.vargate_hold_us : max_window_us;
+            UpdateVarianceGateWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us,
+                trigger_us, var_threshold_us2, window_size, hold_us,
+                method.stationary_var_max_us2, method.stationary_delta_max_us, method.stationary_window_size);
+        } else if (method.kind == MethodKind::TimeSyncStepReset) {
+            const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+            const uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+            UpdateStepResetWindow(recv_node, now_us, offset_sample, method, min_window_us,
+                max_window_us, 2000.0, max_window_us);
+        } else if (method.kind == MethodKind::TimeSyncDualWindow) {
+            double offset_short = 0.0;
+            if (recv_node.timesync_short.IsSynchronized() &&
+                UpdateTimeSyncShortOffsetSample(recv_node, local_recv, offset_short)) {
+                recv_node.estimator.AddSample(now_us, offset_short);
+                MaybeSetSyncTime(recv_node.estimator.Ready(), now_us, recv_node.synced, recv_node.sync_time_us);
+            }
+        }
+    };
 
     while (now_us <= scenario.duration_us) {
         uint64_t next_arrival = arrivals.empty() ? UINT64_MAX : arrivals.top().deliver_true_us;
@@ -1743,9 +9625,12 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
         now_us = next_time;
 
         // Advance plant to now
-        const double dt = (double)control_interval_us / 1000000.0;
+        const double dt = (now_us >= prev_now_us)
+            ? (double)(now_us - prev_now_us) / 1000000.0
+            : 0.0;
         plant.v += (-0.8 * plant.v + u) * dt;
         plant.x += plant.v * dt;
+        prev_now_us = now_us;
 
         // Deliver messages
         while (!arrivals.empty() && arrivals.top().deliver_true_us == now_us) {
@@ -1755,17 +9640,18 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
             const bool to_b = ev.msg.from_a;
             NodeState& recv_node = to_b ? node_b : node_a;
             NodeState& send_node = to_b ? node_a : node_b;
+            DirectionMetrics& dm = to_b ? metrics.ab : metrics.ba;
+            (void)send_node;
 
             const uint64_t local_recv = ComputeLocalTimeUsec(now_us, recv_node.clock, rng, true);
-            const uint64_t true_remote_local = ev.msg.true_remote_local_at_send;
-            const double true_offset = (double)ev.msg.send_local_us - (double)true_remote_local;
+            const uint64_t true_local_now = ComputeLocalTimeUsec(now_us, recv_node.clock, rng, false);
+            const uint64_t true_remote_now = ComputeLocalTimeUsec(now_us, send_node.clock, rng, false);
+            const double true_offset = (double)true_remote_now - (double)true_local_now;
 
             if (ev.msg.kind == MsgKind::TeleopState) {
                 // Update estimator using timestamped telemetry
-                if (method.kind == MethodKind::TimeSync) {
-                    if (ev.msg.stamped) {
-                        recv_node.timesync.OnAuthenticatedDatagramTimestamp(ev.msg.ts24, local_recv);
-                    }
+                if (UsesTimeSyncCore(method.kind)) {
+                    ProcessTeleopTimeSyncCore(recv_node, dm, local_recv, now_us, ev.msg);
                 } else if (method.kind == MethodKind::Piggyback) {
                     if (ev.msg.stamped) {
                         const double delta_us = (double)local_recv - (double)ev.msg.send_local_us;
@@ -1786,12 +9672,186 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
                 std::memcpy(&plant_meas.v, &ev.msg.t3_remote, sizeof(double));
             }
             else if (ev.msg.kind == MsgKind::TeleopCmd) {
+                ProcessTeleopTimeSyncCore(recv_node, dm, local_recv, now_us, ev.msg);
                 // Apply command
                 std::memcpy(&u, &ev.msg.t2_remote, sizeof(double));
             }
             else if (ev.msg.kind == MsgKind::MinDelta) {
-                if (method.kind == MethodKind::TimeSync) {
+                if (UsesTimeSyncCore(method.kind)) {
+                    if (UsesCustomTimeSync(method.kind)) {
+                        if (method.kind == MethodKind::TimeSyncDDAC) {
+                            if (ev.msg.ddac_valid && ev.msg.ddac_seq >= recv_node.ddac_peer_seq) {
+                                recv_node.ddac_peer_valid = true;
+                                recv_node.ddac_peer_seq = ev.msg.ddac_seq;
+                                recv_node.ddac_peer_min_long_us = ev.msg.ddac_min_long_us;
+                                recv_node.ddac_peer_age_us = ev.msg.ddac_age_us;
+                                recv_node.ddac_peer_p10_us = ev.msg.ddac_p10_us;
+                                recv_node.ddac_peer_iqr_us = ev.msg.ddac_iqr_us;
+                                recv_node.ddac_peer_count = ev.msg.ddac_count;
+                                recv_node.ddac_peer_p0_us = ev.msg.ddac_p0_us;
+                                recv_node.ddac_peer_rx_us = now_us;
+                            }
+                            continue;
+                        }
+                        const uint64_t min_delta_ticks = ev.msg.min_delta.ToUnsigned();
+                        const double peer_min_raw = (double)(min_delta_ticks << kTime23LostBits);
+                        recv_node.peer_min_raw_us = peer_min_raw;
+                        recv_node.peer_min_raw_valid = true;
+                        recv_node.peer_min_us = peer_min_raw;
+                        recv_node.peer_min_valid = true;
+                        UpdateAlgoOffset(recv_node, now_us);
+                        if (recv_node.algo_offset_valid) {
+                            MaybeSetSyncTime(true, now_us, recv_node.synced, recv_node.sync_time_us);
+                        }
+                        continue;
+                    }
                     recv_node.timesync.OnPeerMinDeltaTS24(ev.msg.min_delta);
+                    if (method.kind == MethodKind::TimeSyncDualWindow ||
+                        method.kind == MethodKind::TimeSyncHybrid) {
+                        recv_node.timesync_short.OnPeerMinDeltaTS24(ev.msg.min_delta);
+                    }
+                    if (method.kind == MethodKind::TimeSyncPerDirSkew) {
+                        recv_node.peer_skew_valid = ev.msg.skew_valid;
+                        recv_node.peer_skew_est_ppm = -ev.msg.skew_est_ppm;
+                    }
+                    const bool synced = recv_node.timesync.IsSynchronized();
+                    if (synced && method.kind == MethodKind::TimeSyncSloped) {
+                        const uint64_t min_delta_ticks = recv_node.timesync.GetMinDeltaTS24().ToUnsigned();
+                        const double min_delta_us = (double)(min_delta_ticks << kTime23LostBits);
+                        UpdateSlopedSkewFromMethod(recv_node, method, now_us, min_delta_us);
+                    }
+                    if (synced && (method.kind == MethodKind::TimeSyncSkewReg ||
+                        method.kind == MethodKind::TimeSyncSkewCorrected ||
+                        method.kind == MethodKind::TimeSyncPerDirSkew ||
+                        method.kind == MethodKind::TimeSyncAdaptive ||
+                        method.kind == MethodKind::TimeSyncAdaptiveGuard ||
+                        method.kind == MethodKind::TimeSyncHybrid ||
+                        method.kind == MethodKind::TimeSyncSloped ||
+                        method.kind == MethodKind::TimeSyncHysteresis ||
+                        method.kind == MethodKind::TimeSyncCUSUM ||
+                        method.kind == MethodKind::TimeSyncVarGate ||
+                        method.kind == MethodKind::TimeSyncStepReset ||
+                        method.kind == MethodKind::TimeSyncDualWindow)) {
+                        if (method.kind == MethodKind::TimeSyncDualWindow) {
+                            double offset_short = 0.0;
+                            if (recv_node.timesync_short.IsSynchronized() &&
+                                UpdateTimeSyncShortOffsetSample(recv_node, local_recv, offset_short)) {
+                                recv_node.estimator.AddSample(now_us, offset_short);
+                            }
+                        } else {
+                            uint64_t remote_est_us = 0;
+                            if (recv_node.timesync.GetRemoteTimeUsec(local_recv, remote_est_us)) {
+                                const double offset_sample = (double)remote_est_us - (double)local_recv;
+                                if (method.kind == MethodKind::TimeSyncSkewReg ||
+                                    method.kind == MethodKind::TimeSyncSkewCorrected ||
+                                    method.kind == MethodKind::TimeSyncPerDirSkew) {
+                                    recv_node.estimator.AddSample(now_us, offset_sample);
+                                } else if (method.kind == MethodKind::TimeSyncAdaptive) {
+                                    const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                    uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                    if (method.min_window_floor_us > 0) {
+                                        min_window_us = std::max<uint64_t>(min_window_us, method.min_window_floor_us);
+                                    }
+                                    double trigger_us = (method.adaptive_trigger_us > 0.0)
+                                        ? method.adaptive_trigger_us
+                                        : 100.0;
+                                    if (method.adaptive_trigger_use_jitter && recv_node.short_snapshot.valid) {
+                                        const double jitter = GuardJitter(recv_node, method);
+                                        const double k = (method.adaptive_trigger_jitter_k > 0.0)
+                                            ? method.adaptive_trigger_jitter_k
+                                            : 1.0;
+                                        const double min_trigger = (method.adaptive_trigger_jitter_min_us > 0.0)
+                                            ? method.adaptive_trigger_jitter_min_us
+                                            : 0.0;
+                                        trigger_us = std::max(min_trigger, k * jitter);
+                                    }
+                                    UpdateAdaptiveDriftWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us, trigger_us,
+                                        method.stationary_var_max_us2, method.stationary_delta_max_us, method.stationary_window_size,
+                                        recv_node.adaptive_force_trigger,
+                                        method.adaptive_trigger_count_req,
+                                        method.adaptive_shrink_ratio,
+                                        method.adaptive_expand_ratio);
+                                    recv_node.adaptive_force_trigger = false;
+                                } else if (method.kind == MethodKind::TimeSyncAdaptiveGuard) {
+                                    const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                    const uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                    const double trigger_us = (method.adaptive_trigger_us > 0.0)
+                                        ? method.adaptive_trigger_us
+                                        : 100.0;
+                                    const double var_threshold_us2 = (method.adaptive_guard_var_threshold_us2 > 0.0)
+                                        ? method.adaptive_guard_var_threshold_us2
+                                        : 10000.0;
+                                    const size_t window_size = (method.adaptive_guard_window_size > 0)
+                                        ? method.adaptive_guard_window_size
+                                        : 20;
+                                    const int sign_count = (method.adaptive_guard_sign_count > 0)
+                                        ? method.adaptive_guard_sign_count
+                                        : 3;
+                                    const uint64_t hold_us = (method.adaptive_guard_hold_us > 0)
+                                        ? method.adaptive_guard_hold_us
+                                        : max_window_us;
+                                    UpdateAdaptiveGuardWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us,
+                                        trigger_us, var_threshold_us2, window_size, sign_count, hold_us);
+                                } else if (method.kind == MethodKind::TimeSyncHybrid) {
+                                    const double trigger_us = (method.hybrid_trigger_us > 0.0)
+                                        ? method.hybrid_trigger_us
+                                        : 100.0;
+                                    const double var_threshold_us2 = (method.hybrid_var_threshold_us2 > 0.0)
+                                        ? method.hybrid_var_threshold_us2
+                                        : 10000.0;
+                                    const size_t window_size = (method.hybrid_window_size > 0)
+                                        ? method.hybrid_window_size
+                                        : 20;
+                                    const int sign_count = (method.hybrid_sign_count > 0)
+                                        ? method.hybrid_sign_count
+                                        : 3;
+                                    const uint64_t hold_us = (method.hybrid_hold_us > 0)
+                                        ? method.hybrid_hold_us
+                                        : std::max<uint64_t>(method.window_us, 200000);
+                                    double offset_short = 0.0;
+                                    if (recv_node.timesync_short.IsSynchronized() &&
+                                        UpdateTimeSyncShortOffsetSample(recv_node, local_recv, offset_short)) {
+                                        const double diff = offset_short - offset_sample;
+                                        UpdateHybridSelector(recv_node, now_us, diff,
+                                            trigger_us, var_threshold_us2, window_size, sign_count, hold_us);
+                                    }
+                                } else if (method.kind == MethodKind::TimeSyncHysteresis) {
+                                    const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                    const uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                    UpdateHysteresisWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us,
+                                        100.0, 3, max_window_us, recv_node.hyst_force_trigger);
+                                    recv_node.hyst_force_trigger = false;
+                                } else if (method.kind == MethodKind::TimeSyncCUSUM) {
+                                    const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                    const uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                    UpdateCusumWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us,
+                                        50.0, 500.0, max_window_us);
+                                } else if (method.kind == MethodKind::TimeSyncVarGate) {
+                                    const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                    uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                    if (method.min_window_floor_us > 0) {
+                                        min_window_us = std::max<uint64_t>(min_window_us, method.min_window_floor_us);
+                                    }
+                                    const double trigger_us = (method.vargate_trigger_us > 0.0) ? method.vargate_trigger_us : 100.0;
+                                    const double var_threshold_us2 = (method.vargate_var_threshold_us2 > 0.0)
+                                        ? method.vargate_var_threshold_us2
+                                        : 10000.0;
+                                    const size_t window_size = (method.vargate_window_size > 0)
+                                        ? method.vargate_window_size
+                                        : 20;
+                                    const uint64_t hold_us = (method.vargate_hold_us > 0) ? method.vargate_hold_us : max_window_us;
+                                    UpdateVarianceGateWindow(recv_node, now_us, offset_sample, min_window_us, max_window_us,
+                                        trigger_us, var_threshold_us2, window_size, hold_us,
+                                        method.stationary_var_max_us2, method.stationary_delta_max_us, method.stationary_window_size);
+                                } else if (method.kind == MethodKind::TimeSyncStepReset) {
+                                    const uint64_t max_window_us = std::max<uint64_t>(method.window_us, 200000);
+                                    const uint64_t min_window_us = std::max<uint64_t>(max_window_us / 10, 100000);
+                                    UpdateStepResetWindow(recv_node, now_us, offset_sample, method, min_window_us,
+                                        max_window_us, 2000.0, max_window_us);
+                                }
+                            }
+                        }
+                    }
                 } else if (method.kind == MethodKind::Piggyback) {
                     recv_node.peer_env_value = (double)ev.msg.env_delta_us;
                     recv_node.peer_env_valid = true;
@@ -1805,7 +9865,8 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
             if (EstimateRemoteTimeUsec(method, node_a, local_now, remote_est)) {
                 if (now_us >= metrics_start_us) {
                     const uint64_t true_remote = ComputeLocalTimeUsec(now_us, node_b.clock, rng, false);
-                    AddPollTimeError(metrics.ab, (double)remote_est - (double)true_remote);
+                    AddPollTimeError(metrics.ab, (double)remote_est - (double)true_remote,
+                        now_us, scenario.clock_step_enabled, scenario.clock_step_time_us);
                 }
             }
             next_poll_ab = poll_interval_us ? (now_us + poll_interval_us) : UINT64_MAX;
@@ -1817,21 +9878,571 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
             if (EstimateRemoteTimeUsec(method, node_b, local_now, remote_est)) {
                 if (now_us >= metrics_start_us) {
                     const uint64_t true_remote = ComputeLocalTimeUsec(now_us, node_a.clock, rng, false);
-                    AddPollTimeError(metrics.ba, (double)remote_est - (double)true_remote);
+                    AddPollTimeError(metrics.ba, (double)remote_est - (double)true_remote,
+                        now_us, scenario.clock_step_enabled, scenario.clock_step_time_us);
                 }
             }
             next_poll_ba = poll_interval_us ? (now_us + poll_interval_us) : UINT64_MAX;
+        }
+
+        if (UsesTimeSyncCore(method.kind) && node_a.stats_short_window_us > 0) {
+            if (next_rtt_guard_us == 0) {
+                next_rtt_guard_us = now_us + node_a.stats_short_window_us;
+            }
+            if (now_us >= next_rtt_guard_us) {
+                next_rtt_guard_us = now_us + node_a.stats_short_window_us;
+                bool guard_ok = false;
+                bool rtt_ready = false;
+                double rtt_short = 0.0;
+                double rtt_long = 0.0;
+                double rtt_iqr = 0.0;
+                double rtt_delta = 0.0;
+                rtt_trace.valid = false;
+                if (node_a.long_min_valid && node_b.long_min_valid &&
+                    node_a.short_snapshot.valid && node_b.short_snapshot.valid) {
+                    guard_ok = EvaluateRttGuard(
+                        node_b.short_snapshot,
+                        node_a.short_snapshot,
+                        node_b.long_min_us,
+                        node_a.long_min_us,
+                        method.rtt_guard_delta_us,
+                        method.rtt_guard_iqr_us,
+                        rtt_short,
+                        rtt_long,
+                        rtt_iqr,
+                        rtt_delta);
+                    rtt_ready = true;
+                    if (method.rtt_guard_strict && rtt_min_guard.window_us > 0) {
+                        rtt_min_guard.Push(now_us, rtt_short);
+                        if (rtt_min_guard.Ready()) {
+                            const double min_rtt = rtt_min_guard.Min();
+                            const double delta = (method.rtt_guard_min_delta_us > 0.0)
+                                ? method.rtt_guard_min_delta_us
+                                : method.rtt_guard_delta_us;
+                            if (rtt_short > min_rtt + delta) {
+                                guard_ok = false;
+                            }
+                        }
+                    }
+                    metrics.rtt_short_us.Add(rtt_short);
+                    metrics.rtt_long_us.Add(rtt_long);
+                    metrics.rtt_delta_us.Add(rtt_delta);
+                    metrics.rtt_short_iqr_us.Add(rtt_iqr);
+                    metrics.rtt_guard_total++;
+                    if (guard_ok) {
+                        metrics.rtt_guard_ok++;
+                    }
+                    if (method.quantile_cusum_gate && rtt_ready) {
+                        const double k_us = (method.cusum_k_us > 0.0) ? method.cusum_k_us : 50.0;
+                        const double h_us = (method.cusum_h_us > 0.0) ? method.cusum_h_us : 500.0;
+                        const uint64_t hold_us = (method.cusum_hold_us > 0)
+                            ? method.cusum_hold_us
+                            : node_a.stats_short_window_us;
+                        UpdateCusumGate(node_a, now_us, rtt_delta, k_us, h_us, hold_us);
+                        UpdateCusumGate(node_b, now_us, rtt_delta, k_us, h_us, hold_us);
+                    }
+                    rtt_trace.valid = true;
+                    rtt_trace.guard_ok = guard_ok;
+                    rtt_trace.short_us = rtt_short;
+                    rtt_trace.long_us = rtt_long;
+                    rtt_trace.delta_us = rtt_delta;
+                    rtt_trace.iqr_us = rtt_iqr;
+                }
+                node_a.rtt_short_valid = rtt_ready;
+                node_b.rtt_short_valid = rtt_ready;
+                if (rtt_ready) {
+                    node_a.rtt_short_last_us = rtt_short;
+                    node_b.rtt_short_last_us = rtt_short;
+                }
+
+                if (method.saw_use) {
+                    UpdateSawtoothDetector(node_a, now_us, method);
+                    UpdateSawtoothDetector(node_b, now_us, method);
+                }
+
+                if (PromoCseGateApplies(method)) {
+                    UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                }
+
+                if (method.kind == MethodKind::TimeSyncHysteresis) {
+                    if (method.hyst_use_gsp) {
+                        if (UpdateHysteresisGspTrigger(node_a, now_us, method, guard_ok)) {
+                            node_a.hyst_force_trigger = true;
+                        }
+                        if (UpdateHysteresisGspTrigger(node_b, now_us, method, guard_ok)) {
+                            node_b.hyst_force_trigger = true;
+                        }
+                    }
+                    if (method.hyst_use_stepguard) {
+                        const uint64_t step_before = node_a.step_resets + node_b.step_resets;
+                        UpdateStepGuard(node_a, node_b, now_us, method, guard_ok);
+                        const bool step_triggered = (node_a.step_resets + node_b.step_resets) > step_before;
+                        if (step_triggered) {
+                            if (node_a.step_reset_dir) {
+                                node_a.hyst_force_trigger = true;
+                            }
+                            if (node_b.step_reset_dir) {
+                                node_b.hyst_force_trigger = true;
+                            }
+                        }
+                    }
+                }
+
+                if (method.kind == MethodKind::TimeSyncAdaptive) {
+                    if (method.adaptive_use_cse_trigger) {
+                        UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                    }
+                    UpdateAdaptiveTriggers(node_a, now_us, method, rtt_ready, rtt_delta, rtt_iqr);
+                    UpdateAdaptiveTriggers(node_b, now_us, method, rtt_ready, rtt_delta, rtt_iqr);
+                    if (method.adaptive_use_stepguard) {
+                        const uint64_t step_before = node_a.step_resets + node_b.step_resets;
+                        UpdateStepGuard(node_a, node_b, now_us, method, guard_ok);
+                        const bool step_triggered = (node_a.step_resets + node_b.step_resets) > step_before;
+                        if (step_triggered) {
+                            if (node_a.step_reset_dir) {
+                                node_a.adaptive_force_trigger = true;
+                            }
+                            if (node_b.step_reset_dir) {
+                                node_b.adaptive_force_trigger = true;
+                            }
+                        }
+                    }
+                }
+
+                if (IsTimeSyncQuantileFamily(method.kind)) {
+                    auto init_window = [&](NodeState& node) {
+                        if (node.drift_window_us == 0) {
+                            const uint64_t window_us = (method.window_us > 0) ? method.window_us : 2000000ULL;
+                            node.drift_window_us = window_us;
+                            node.timesync.SetDriftWindowUsec(window_us);
+                            if (method.quantile_use_short_high) {
+                                node.timesync_short.SetDriftWindowUsec(window_us);
+                            }
+                        }
+                    };
+                    init_window(node_a);
+                    init_window(node_b);
+                    const bool need_cse = method.quantile_use_cse ||
+                        method.quantile_flip_reset ||
+                        method.quantile_flip_hold ||
+                        method.quantile_flip_shrink ||
+                        method.quantile_flip_use_short ||
+                        method.quantile_flip_use_xor ||
+                        method.quantile_use_cse_gate;
+                    if (need_cse) {
+                        UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                    }
+
+                    auto stale_dir = [&](NodeState& node) -> bool {
+                        if (!node.short_snapshot.valid || !node.long_min_valid) {
+                            return false;
+                        }
+                        const double jitter = GuardJitter(node, method);
+                        const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                        return node.short_snapshot.p10 > node.long_min_us + gb;
+                    };
+
+                    bool flip_a = false;
+                    bool flip_b = false;
+                    if (method.quantile_flip_reset ||
+                        method.quantile_flip_hold ||
+                        method.quantile_flip_shrink ||
+                        method.quantile_flip_use_short ||
+                        method.quantile_flip_use_xor) {
+                        flip_a = DetectQuantileCseFlip(node_a, method);
+                        flip_b = DetectQuantileCseFlip(node_b, method);
+                    }
+                    if (method.quantile_use_offset_slope) {
+                        flip_a = flip_a || DetectQuantileOffsetFlip(node_a, method, now_us);
+                        flip_b = flip_b || DetectQuantileOffsetFlip(node_b, method, now_us);
+                    }
+                    if (method.quantile_near_stale_reset) {
+                        flip_a = flip_a || DetectQuantileNearStale(node_a, method, now_us);
+                        flip_b = flip_b || DetectQuantileNearStale(node_b, method, now_us);
+                    }
+                    if (method.quantile_flip_use_xor) {
+                        const bool xor_ok = stale_dir(node_a) ^ stale_dir(node_b);
+                        if (!xor_ok) {
+                            flip_a = false;
+                            flip_b = false;
+                        }
+                    }
+                    if (method.gsp_use_rtt_guard && !guard_ok) {
+                        flip_a = false;
+                        flip_b = false;
+                    }
+                    if (method.quantile_use_cse_gate) {
+                        if (!node_a.cse_gate_ok) {
+                            flip_a = false;
+                        }
+                        if (!node_b.cse_gate_ok) {
+                            flip_b = false;
+                        }
+                    }
+                    if (method.quantile_cusum_gate) {
+                        if (node_a.cusum_hold_until_us > now_us) {
+                            flip_a = false;
+                        }
+                        if (node_b.cusum_hold_until_us > now_us) {
+                            flip_b = false;
+                        }
+                    }
+                    if (flip_a) {
+                        ApplyQuantileFlipAction(node_a, method, now_us);
+                    }
+                    if (flip_b) {
+                        ApplyQuantileFlipAction(node_b, method, now_us);
+                    }
+                    UpdateQuantileHold(node_a, method, now_us);
+                    UpdateQuantileHold(node_b, method, now_us);
+
+                    auto restore_window = [&](NodeState& node) {
+                        if (node.drift_window_restore_us > 0 && now_us >= node.drift_window_restore_us) {
+                            const uint64_t window_us = (method.window_us > 0) ? method.window_us : 2000000ULL;
+                            node.drift_window_us = window_us;
+                            node.timesync.SetDriftWindowUsec(window_us);
+                            if (method.quantile_use_short_high) {
+                                node.timesync_short.SetDriftWindowUsec(window_us);
+                            }
+                            node.drift_window_restore_us = 0;
+                        }
+                    };
+                    restore_window(node_a);
+                    restore_window(node_b);
+                }
+
+                if (method.kind == MethodKind::TimeSyncStepReset) {
+                    bool stale_ab = false;
+                    bool stale_ba = false;
+                    if (EnsureEffectiveMin(node_b) && node_b.short_snapshot.valid) {
+                        const double jitter = GuardJitter(node_b, method);
+                        const double gnear = std::max(method.step_gnear_min_us, method.step_gnear_k * jitter);
+                        stale_ab = (node_b.short_snapshot.p10 > node_b.effective_min_us + gnear);
+                    }
+                    if (EnsureEffectiveMin(node_a) && node_a.short_snapshot.valid) {
+                        const double jitter = GuardJitter(node_a, method);
+                        const double gnear = std::max(method.step_gnear_min_us, method.step_gnear_k * jitter);
+                        stale_ba = (node_a.short_snapshot.p10 > node_a.effective_min_us + gnear);
+                    }
+                    const bool xor_ok = stale_ab ^ stale_ba;
+                    node_a.stepreset_guard_ok = guard_ok;
+                    node_b.stepreset_guard_ok = guard_ok;
+                    node_a.stepreset_xor_ok = xor_ok;
+                    node_b.stepreset_xor_ok = xor_ok;
+                    node_a.stepreset_dir_ok = stale_ba && !stale_ab;
+                    node_b.stepreset_dir_ok = stale_ab && !stale_ba;
+                }
+
+                if (method.kind == MethodKind::TimeSyncShadow) {
+                    bool allow_promotion = true;
+                    if (method.gsp_use_xor_gate) {
+                        bool stale_ab = false;
+                        bool stale_ba = false;
+                        if (EnsureEffectiveMin(node_b) && node_b.short_snapshot.valid) {
+                            const double jitter = GuardJitter(node_b, method);
+                            const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                            stale_ab = (node_b.short_snapshot.p10 > node_b.effective_min_us + gb);
+                        }
+                        if (EnsureEffectiveMin(node_a) && node_a.short_snapshot.valid) {
+                            const double jitter = GuardJitter(node_a, method);
+                            const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                            stale_ba = (node_a.short_snapshot.p10 > node_a.effective_min_us + gb);
+                        }
+                        allow_promotion = (stale_ab ^ stale_ba);
+                    }
+                    UpdateShadowPromotion(node_b, now_us, method, allow_promotion, guard_ok);
+                    UpdateShadowPromotion(node_a, now_us, method, allow_promotion, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                    if (method.shadow_use_stepguard) {
+                        UpdateStepGuard(node_a, node_b, now_us, method, guard_ok);
+                    }
+                } else if (method.kind == MethodKind::TimeSyncShadowSkew) {
+                    bool allow_promotion = true;
+                    if (method.gsp_use_xor_gate) {
+                        bool stale_ab = false;
+                        bool stale_ba = false;
+                        if (EnsureEffectiveMin(node_b) && node_b.short_snapshot.valid) {
+                            const double jitter = GuardJitter(node_b, method);
+                            const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                            stale_ab = (node_b.short_snapshot.p10 > node_b.effective_min_us + gb);
+                        }
+                        if (EnsureEffectiveMin(node_a) && node_a.short_snapshot.valid) {
+                            const double jitter = GuardJitter(node_a, method);
+                            const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                            stale_ba = (node_a.short_snapshot.p10 > node_a.effective_min_us + gb);
+                        }
+                        allow_promotion = (stale_ab ^ stale_ba);
+                    }
+                    UpdateShadowPromotion(node_b, now_us, method, allow_promotion, guard_ok);
+                    UpdateShadowPromotion(node_a, now_us, method, allow_promotion, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                    if (method.shadow_use_stepguard) {
+                        UpdateStepGuard(node_a, node_b, now_us, method, guard_ok);
+                    }
+                    if (method.shadow_use_cse) {
+                        UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                    }
+
+                    auto skew_gate = [&](const NodeState& node) -> bool {
+                        if (!node.short_snapshot.valid) {
+                            return false;
+                        }
+                        const double jitter = GuardJitter(node, method);
+                        const double iqr_max = std::max(method.gsp_iqr_min_us, method.gsp_iqr_k * jitter);
+                        const bool stable = node.short_snapshot.iqr <= iqr_max;
+                        const bool enough = node.short_snapshot.count >= method.gsp_npkt_min;
+                        return stable && enough;
+                    };
+
+                    const bool skew_guard_ok = !method.shadow_skew_use_rtt_guard || guard_ok;
+                    if (skew_guard_ok && node_a.algo_offset_valid) {
+                        UpdateShadowSkew(node_a, now_us, node_a.algo_offset_us, method, skew_gate(node_a));
+                    }
+                    if (skew_guard_ok && node_b.algo_offset_valid) {
+                        UpdateShadowSkew(node_b, now_us, node_b.algo_offset_us, method, skew_gate(node_b));
+                    }
+                } else if (method.kind == MethodKind::TimeSyncNFHS) {
+                    UpdateNfhs(node_b, now_us, method, true, guard_ok);
+                    UpdateNfhs(node_a, now_us, method, true, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncAdaptiveBins) {
+                    bool allow_shrink = true;
+                    if (method.gsp_use_xor_gate) {
+                        bool stale_ab = false;
+                        bool stale_ba = false;
+                        if (node_b.short_snapshot.valid) {
+                            const double jitter = GuardJitter(node_b, method);
+                            const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                            stale_ab = (node_b.short_snapshot.p10 > node_b.long_min_us + gb);
+                        }
+                        if (node_a.short_snapshot.valid) {
+                            const double jitter = GuardJitter(node_a, method);
+                            const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                            stale_ba = (node_a.short_snapshot.p10 > node_a.long_min_us + gb);
+                        }
+                        allow_shrink = (stale_ab ^ stale_ba);
+                    }
+                    UpdateAdaptiveBins(node_b, now_us, method, allow_shrink, guard_ok);
+                    UpdateAdaptiveBins(node_a, now_us, method, allow_shrink, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncStepGuard) {
+                    UpdateStepGuard(node_a, node_b, now_us, method, guard_ok);
+                    if (method.step_guard_reset_bins) {
+                        bool reset_any = false;
+                        if (node_a.step_reset_dir && node_a.short_snapshot.valid) {
+                            ApplyLongBinStepReset(node_a, now_us, node_a.short_snapshot.p10);
+                            reset_any = true;
+                        }
+                        if (node_b.step_reset_dir && node_b.short_snapshot.valid) {
+                            ApplyLongBinStepReset(node_b, now_us, node_b.short_snapshot.p10);
+                            reset_any = true;
+                        }
+                        if (reset_any) {
+                            UpdateAlgoOffset(node_a, now_us);
+                            UpdateAlgoOffset(node_b, now_us);
+                        }
+                    }
+                } else if (method.kind == MethodKind::TimeSyncConsensus) {
+                    UpdateConsensusEstimate(node_b, now_us, method, guard_ok);
+                    UpdateConsensusEstimate(node_a, now_us, method, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncBlockQuantile) {
+                    UpdateBlockQuantile(node_b, now_us, method);
+                    UpdateBlockQuantile(node_a, now_us, method);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncSlope) {
+                    UpdateSlopeTheilSen(node_a, now_us, method);
+                    UpdateSlopeTheilSen(node_b, now_us, method);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncTilted) {
+                    UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                    if (method.tilted_use_shadow) {
+                        bool allow_promotion = true;
+                        if (method.gsp_use_xor_gate) {
+                            bool stale_ab = false;
+                            bool stale_ba = false;
+                            if (node_b.short_snapshot.valid) {
+                                const double jitter = GuardJitter(node_b, method);
+                                const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                                stale_ab = (node_b.short_snapshot.p10 > node_b.effective_min_us + gb);
+                            }
+                            if (node_a.short_snapshot.valid) {
+                                const double jitter = GuardJitter(node_a, method);
+                                const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                                stale_ba = (node_a.short_snapshot.p10 > node_a.effective_min_us + gb);
+                            }
+                            allow_promotion = (stale_ab ^ stale_ba);
+                        }
+                        const uint64_t promo_a_before = node_a.gsp_promotions;
+                        const uint64_t promo_b_before = node_b.gsp_promotions;
+                        UpdateShadowPromotion(node_a, now_us, method, allow_promotion, guard_ok);
+                        UpdateShadowPromotion(node_b, now_us, method, allow_promotion, guard_ok);
+                        bool reset_any = false;
+                        if (node_a.gsp_promotions > promo_a_before && node_a.short_snapshot.valid) {
+                            const double skew_ppm = node_a.cse_skew_valid ? node_a.cse_skew_ppm : 0.0;
+                            ApplyTiltedStepReset(node_a, now_us, node_a.short_snapshot.p10, skew_ppm);
+                            reset_any = true;
+                        }
+                        if (node_b.gsp_promotions > promo_b_before && node_b.short_snapshot.valid) {
+                            const double skew_ppm = node_b.cse_skew_valid ? node_b.cse_skew_ppm : 0.0;
+                            ApplyTiltedStepReset(node_b, now_us, node_b.short_snapshot.p10, skew_ppm);
+                            reset_any = true;
+                        }
+                        if (reset_any) {
+                            UpdateAlgoOffset(node_a, now_us);
+                            UpdateAlgoOffset(node_b, now_us);
+                        }
+                    }
+                    if (method.tilted_use_stepguard) {
+                        UpdateStepGuard(node_a, node_b, now_us, method, guard_ok);
+                        bool reset_any = false;
+                        if (node_a.step_reset_dir && node_a.short_snapshot.valid) {
+                            const double skew_ppm = node_a.cse_skew_valid ? node_a.cse_skew_ppm : 0.0;
+                            ApplyTiltedStepReset(node_a, now_us, node_a.short_snapshot.p10, skew_ppm);
+                            reset_any = true;
+                        }
+                        if (node_b.step_reset_dir && node_b.short_snapshot.valid) {
+                            const double skew_ppm = node_b.cse_skew_valid ? node_b.cse_skew_ppm : 0.0;
+                            ApplyTiltedStepReset(node_b, now_us, node_b.short_snapshot.p10, skew_ppm);
+                            reset_any = true;
+                        }
+                        if (reset_any) {
+                            UpdateAlgoOffset(node_a, now_us);
+                            UpdateAlgoOffset(node_b, now_us);
+                        }
+                    }
+                } else if (method.kind == MethodKind::TimeSyncAgeComp) {
+                    UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                    UpdateAgeCompMin(node_a, now_us, method, guard_ok);
+                    UpdateAgeCompMin(node_b, now_us, method, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                    if (method.age_comp_use_stepguard) {
+                        UpdateStepGuard(node_a, node_b, now_us, method, guard_ok);
+                        bool reset_any = false;
+                        if (node_a.step_reset_dir && node_a.short_snapshot.valid) {
+                            ApplyLongBinStepReset(node_a, now_us, node_a.short_snapshot.p10);
+                            reset_any = true;
+                        }
+                        if (node_b.step_reset_dir && node_b.short_snapshot.valid) {
+                            ApplyLongBinStepReset(node_b, now_us, node_b.short_snapshot.p10);
+                            reset_any = true;
+                        }
+                        if (reset_any) {
+                            UpdateAgeCompMin(node_a, now_us, method, guard_ok);
+                            UpdateAgeCompMin(node_b, now_us, method, guard_ok);
+                            UpdateAlgoOffset(node_a, now_us);
+                            UpdateAlgoOffset(node_b, now_us);
+                        }
+                    }
+                } else if (method.kind == MethodKind::TimeSyncDualSlope) {
+                    UpdateDualSlopeSkew(node_a, node_b, now_us, method, guard_ok);
+                    UpdateAgeCompMin(node_a, now_us, method, guard_ok);
+                    UpdateAgeCompMin(node_b, now_us, method, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncEnvelopeDecay) {
+                    if (method.decay_use_cse) {
+                        UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                    }
+                } else if (method.kind == MethodKind::TimeSyncMinReg) {
+                    if (method.minreg_use_cse_gate) {
+                        UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                    }
+                    UpdateMinReg(node_a, now_us, method);
+                    UpdateMinReg(node_b, now_us, method);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncMultiWindow) {
+                    if (method.multiwin_use_cse_gate) {
+                        UpdateCoupledSkew(node_a, node_b, now_us, method, guard_ok);
+                    }
+                    UpdateMultiWindow(node_a, now_us, method);
+                    UpdateMultiWindow(node_b, now_us, method);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncPolicy) {
+                    UpdateTimeSyncPolicy(node_a, node_b, now_us, method, guard_ok, rtt_ready, rtt_delta);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncStateMachine) {
+                    UpdateStateMachine(node_a, node_b, now_us, method, guard_ok);
+                } else if (method.kind == MethodKind::TimeSyncKMin) {
+                    bool allow_ab = true;
+                    bool allow_ba = true;
+                    if (method.kmin_use_stale_gate) {
+                        auto stale_dir = [&](const NodeState& node) -> bool {
+                            if (!node.short_snapshot.valid || !node.long_min_valid) {
+                                return false;
+                            }
+                            const double jitter = GuardJitter(node, method);
+                            const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                            const double iqr_max = std::max(method.gsp_iqr_min_us, method.gsp_iqr_k * jitter);
+                            const bool stable = node.short_snapshot.iqr <= iqr_max;
+                            const bool enough = node.short_snapshot.count >= method.gsp_npkt_min;
+                            return stable && enough && (node.short_snapshot.p10 > node.long_min_us + gb);
+                        };
+                        const bool stale_ab = stale_dir(node_b);
+                        const bool stale_ba = stale_dir(node_a);
+                        allow_ab = stale_ab;
+                        allow_ba = stale_ba;
+                        if (method.kmin_use_xor_gate) {
+                            allow_ab = stale_ab && !stale_ba;
+                            allow_ba = stale_ba && !stale_ab;
+                        }
+                    }
+                    if (method.kmin_use_rtt_guard && !guard_ok) {
+                        allow_ab = false;
+                        allow_ba = false;
+                    }
+                    UpdateKMin(node_b, now_us, method, allow_ab);
+                    UpdateKMin(node_a, now_us, method, allow_ba);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncKBest) {
+                    UpdateKBest(node_b, now_us, method, guard_ok);
+                    UpdateKBest(node_a, now_us, method, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncMoE) {
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                    UpdateMoE(node_a, node_b, now_us, method, guard_ok);
+                } else if (method.kind == MethodKind::TimeSyncRttBins) {
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                    UpdateRttBins(node_a, now_us, method);
+                    UpdateRttBins(node_b, now_us, method);
+                } else if (method.kind == MethodKind::TimeSyncDDAC) {
+                    UpdateDDAC(node_a, now_us, method, guard_ok);
+                    UpdateDDAC(node_b, now_us, method, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                } else if (method.kind == MethodKind::TimeSyncDDACBlend) {
+                    UpdateDDACBlend(node_a, now_us, method, guard_ok);
+                    UpdateDDACBlend(node_b, now_us, method, guard_ok);
+                    UpdateAlgoOffset(node_a, now_us);
+                    UpdateAlgoOffset(node_b, now_us);
+                }
+            }
         }
 
         if (next_control == now_us) {
             // Controller at A
             desired = std::sin(2.0 * 3.14159265358979323846 * (double)now_us / 1000000.0 * 0.2);
 
-            double age_est_s = 0.0;
-            if (method.kind == MethodKind::TimeSync && node_a.timesync.IsSynchronized()) {
+            double age_est_s = (double)scenario.delay_ba.base_delay_us / 1000000.0;
+            if (UsesTimeSyncCore(method.kind) && node_a.timesync.IsSynchronized()) {
                 age_est_s = node_a.timesync.GetMinimumOneWayDelayUsec() / 1000000.0;
-            } else if (node_a.estimator.Ready()) {
-                age_est_s = std::max(0.0, node_a.estimator.offset_est / 1000000.0);
             }
 
             const double x_pred = plant_meas.x + plant_meas.v * age_est_s;
@@ -1849,6 +10460,14 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
             msg.send_true_us = now_us;
             msg.send_local_us = local_send;
             msg.true_remote_local_at_send = ComputeLocalTimeUsec(now_us, node_b.clock, rng, false);
+            msg.stamped = true;
+            if (UsesMinDeltaExchange(method.kind) && method.sample_stride > 1) {
+                msg.stamped = ((now_us / control_interval_us) % (uint64_t)method.sample_stride) == 0;
+            }
+            if (msg.stamped) {
+                msg.ts24 = node_a.timesync.LocalTimeToDatagramTS24(local_send);
+                MaybeCorruptTs24(scenario, true, rng, msg);
+            }
             std::memcpy(&msg.t2_remote, &u, sizeof(double));
 
             const uint32_t delay = delay_ab.SampleDelay(now_us, rng);
@@ -1859,10 +10478,12 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
             }
 
             // Teleop error metrics
-            const double err = plant.x - desired;
-            err_sum += err * err;
-            err_max = std::max(err_max, std::fabs(err));
-            err_count++;
+            if (now_us >= metrics_start_us) {
+                const double err = plant.x - desired;
+                err_sum += err * err;
+                err_max = std::max(err_max, std::fabs(err));
+                err_count++;
+            }
 
             next_control = now_us + control_interval_us;
         }
@@ -1877,11 +10498,12 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
             msg.send_local_us = local_send;
             msg.true_remote_local_at_send = ComputeLocalTimeUsec(now_us, node_a.clock, rng, false);
             msg.stamped = true;
-            if ((method.kind == MethodKind::TimeSync || method.kind == MethodKind::Piggyback) && method.sample_stride > 1) {
+            if (UsesMinDeltaExchange(method.kind) && method.sample_stride > 1) {
                 msg.stamped = ((now_us / control_interval_us) % (uint64_t)method.sample_stride) == 0;
             }
             if (msg.stamped) {
                 msg.ts24 = node_b.timesync.LocalTimeToDatagramTS24(local_send);
+                MaybeCorruptTs24(scenario, false, rng, msg);
             }
             std::memcpy(&msg.t2_remote, &plant.x, sizeof(double));
             std::memcpy(&msg.t3_remote, &plant.v, sizeof(double));
@@ -1895,15 +10517,24 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
             next_telemetry = now_us + control_interval_us;
         }
 
-        if (next_mindelta_ab == now_us && (method.kind == MethodKind::TimeSync || method.kind == MethodKind::Piggyback)) {
+        if (next_mindelta_ab == now_us && UsesMinDeltaExchange(method.kind)) {
             const uint64_t local_send = ComputeLocalTimeUsec(now_us, node_a.clock, rng, false);
             Message msg;
             msg.from_a = true;
             msg.kind = MsgKind::MinDelta;
             msg.send_true_us = now_us;
             msg.send_local_us = local_send;
-            if (method.kind == MethodKind::TimeSync) {
+            if (UsesTimeSyncCore(method.kind)) {
                 msg.min_delta = node_a.timesync.GetMinDeltaTS24();
+                if (method.kind == MethodKind::TimeSyncPerDirSkew) {
+                    msg.skew_valid = node_a.estimator.Ready();
+                    double skew_ppm = node_a.estimator.skew_est_ppm;
+                    if (msg.skew_valid && method.perdir_skew_quantize_ppm > 0.0) {
+                        const double q = method.perdir_skew_quantize_ppm;
+                        skew_ppm = std::floor(skew_ppm / q + 0.5) * q;
+                    }
+                    msg.skew_est_ppm = msg.skew_valid ? skew_ppm : 0.0;
+                }
             } else {
                 msg.env_delta_us = (uint32_t)std::max(0.0, node_a.local_env.Value());
             }
@@ -1918,15 +10549,24 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
             next_mindelta_ab = (method.mindelta_interval_us > 0) ? (now_us + method.mindelta_interval_us) : UINT64_MAX;
         }
 
-        if (next_mindelta_ba == now_us && (method.kind == MethodKind::TimeSync || method.kind == MethodKind::Piggyback)) {
+        if (next_mindelta_ba == now_us && UsesMinDeltaExchange(method.kind)) {
             const uint64_t local_send = ComputeLocalTimeUsec(now_us, node_b.clock, rng, false);
             Message msg;
             msg.from_a = false;
             msg.kind = MsgKind::MinDelta;
             msg.send_true_us = now_us;
             msg.send_local_us = local_send;
-            if (method.kind == MethodKind::TimeSync) {
+            if (UsesTimeSyncCore(method.kind)) {
                 msg.min_delta = node_b.timesync.GetMinDeltaTS24();
+                if (method.kind == MethodKind::TimeSyncPerDirSkew) {
+                    msg.skew_valid = node_b.estimator.Ready();
+                    double skew_ppm = node_b.estimator.skew_est_ppm;
+                    if (msg.skew_valid && method.perdir_skew_quantize_ppm > 0.0) {
+                        const double q = method.perdir_skew_quantize_ppm;
+                        skew_ppm = std::floor(skew_ppm / q + 0.5) * q;
+                    }
+                    msg.skew_est_ppm = msg.skew_valid ? skew_ppm : 0.0;
+                }
             } else {
                 msg.env_delta_us = (uint32_t)std::max(0.0, node_b.local_env.Value());
             }
@@ -1940,6 +10580,8 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
             }
             next_mindelta_ba = (method.mindelta_interval_us > 0) ? (now_us + method.mindelta_interval_us) : UINT64_MAX;
         }
+
+        trace.MaybeWrite(now_us, scenario, method, seed, rtt_trace, node_a, node_b);
     }
 
     if (err_count > 0) {
@@ -1965,6 +10607,138 @@ static ScenarioConfig BaseScenario(const string& name)
     cfg.offset_a_us = 0;
     cfg.offset_b_us = 1000000;
     return cfg;
+}
+
+static const std::unordered_set<string> kStressScenarios = {
+    // Asymmetry and one-way traffic (explicitly treated as non-core).
+    "E2_asymmetry_40ms",
+    "E23_asym_path_change",
+    "E24_asym_bufferbloat",
+    "E29_asym_loss_reorder",
+    "E32_asym_loss_reorder_ba",
+    "E34_asym_drift",
+    "E37_asym_drift_step",
+    "E38_asym_drift_netmix",
+    "E56_video_asym_jitter_ramp",
+    "E62_video_asym_spike_step",
+    "E75_video_asym_path_bloat",
+    "E77_video_asym_loss_burst",
+    "E83_video_asym_bw_drop",
+    "E93_asym_timestamp_noise",
+    "E101_ts_quant_asym_noise",
+    "E103_asym_path_switch",
+    "E109_asym_baseline_periodic_drops",
+    "E118_cross_traffic_asym_jitter",
+    "E123_wifi_roam_asym_burst",
+    "E127_asym_periodic_outage",
+    "E129_asym_scheduler_noise_burst",
+    "E104_bursty_uplink_steady_downlink",
+    "E112_oneway_priority_inversion",
+    "E117_upstream_congestion_waves",
+    "E132_uplink_saturation_ack_compress",
+
+    // Timestamp corruption / wrap stress.
+    "E80_ts24_poison",
+    "E128_ts24_wrap_stress",
+
+    // Clock discontinuities (steps/jumps/freezes/MC).
+    "E14_clock_step_small",
+    "E15_clock_step_large",
+    "E16_clock_step_small_a_fwd",
+    "E17_clock_step_small_a_back",
+    "E18_clock_step_large_a_fwd",
+    "E19_clock_step_large_a_back",
+    "E20_clock_step_small_b_back",
+    "E21_clock_step_large_b_back",
+    "E27_clock_step_quick",
+    "E33_lowrate_step",
+    "E39_lowrate_jitter_step",
+    "E41_lowrate_randstep",
+    "E42_lowrate_loss_step",
+    "E43_lowrate_asym_reorder_step",
+    "E44_lowrate_probe_burst",
+    "E45_clock_jump_small_a_fwd",
+    "E45_clock_jump_small_a_back",
+    "E45_clock_jump_large_b_fwd",
+    "E45_clock_jump_large_b_back",
+    "E53_randstep_normal",
+    "E86_clock_step_300s_a_fwd",
+    "E87_clock_step_300s_b_back",
+    "E91_clock_freeze_resume",
+    "E95_clock_jump_small_b_fwd",
+    "E96_clock_jump_small_b_back",
+    "E97_clock_jump_large_a_fwd",
+    "E98_clock_jump_large_a_back",
+    "E136_clock_jump_matrix_pp",
+    "E137_clock_jump_matrix_pn",
+    "E138_clock_jump_matrix_np",
+    "E139_clock_jump_matrix_nn",
+    "E63_clock_step_1s_a_fwd",
+    "E64_clock_step_1s_a_back",
+    "E65_clock_step_1s_b_fwd",
+    "E66_clock_step_1s_b_back",
+    "E67_clock_step_120s_a_fwd",
+    "E68_clock_step_120s_a_back",
+    "E69_clock_step_120s_b_fwd",
+    "E70_clock_step_120s_b_back",
+    "E26_clock_step_mc",
+    "E30_clock_step_mc_side",
+    "E31_drift_step_mc",
+    "E79_clock_step_mc_huge",
+    "E28_noise_floor_quick",
+
+    // Skew dynamics considered unrealistic for teleop (sign flips, random walk, ramps).
+    "E7_drift",
+    "E7_drift_25ppm",
+    "E7_drift_100ppm",
+    "E7_drift_200ppm",
+    "E7_drift_300ppm",
+    "E7_drift_400ppm",
+    "E7_drift_ramp",
+    "E54_drift_sign_flip",
+    "E85_drift_rw_signflip",
+    "E92_clock_slew",
+    "E114_skew_sign_flip",
+    "E122_skew_reset_zero",
+    "E107_temp_skew_sine",
+    "E133_temp_drift_sine_step",
+    "E115_bursty_jitter_diurnal_skew",
+    "E119_drift_rw_long",
+    "E81_clock_skew_random_walk_mc",
+    "E102_clock_skew_random_walk",
+    "E134_satellite_doppler_skew",
+
+    // Satellite / extreme RTT.
+    "E116_satellite_burst_loss_long_rtt",
+    "E89_video_satlink_jitter",
+
+    // Sparse or budget-extreme.
+    "E8_budget_200bps",
+    "E90_sparse_traffic",
+
+    // Long-horizon diurnal pulse (not representative of short teleop sessions).
+    "E99_video_diurnal_rtt_pulses",
+};
+
+static bool ShouldExcludeFromCore(const ScenarioConfig& cfg)
+{
+    return kStressScenarios.count(cfg.name) > 0;
+}
+
+static bool IsStressScenario(const ScenarioConfig& cfg)
+{
+    return kStressScenarios.count(cfg.name) > 0;
+}
+
+static bool IsSkewScenario(const ScenarioConfig& cfg)
+{
+    const string& name = cfg.name;
+    if (name.find("asym") != string::npos) {
+        return false;
+    }
+    return (name.find("drift") != string::npos)
+        || (name.find("skew") != string::npos)
+        || (name.find("slew") != string::npos);
 }
 
 static std::vector<ScenarioConfig> BuildScenarios()
@@ -2040,6 +10814,880 @@ static std::vector<ScenarioConfig> BuildScenarios()
         sc.push_back(cfg);
     }
 
+    // E80 TS24 poison (corrupted timestamp samples)
+    {
+        ScenarioConfig cfg = BaseScenario("E80_ts24_poison");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 2000;
+        cfg.delay_ba.jitter_us = 2000;
+        cfg.ts24_poison_enabled = true;
+        cfg.ts24_poison_prob_ab = 0.01;
+        cfg.ts24_poison_prob_ba = 0.02;
+        cfg.ts24_poison_offset_us_ab = 5000000;
+        cfg.ts24_poison_offset_us_ba = -5000000;
+        sc.push_back(cfg);
+    }
+
+    // E29 Asymmetric loss + reorder burst (AB only)
+    {
+        ScenarioConfig cfg = BaseScenario("E29_asym_loss_reorder");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 2000;
+        cfg.delay_ba.jitter_us = 2000;
+        cfg.loss_ab.loss_rate = 0.01;
+        cfg.loss_ab.burst_start_prob = 0.02;
+        cfg.loss_ab.burst_len_min = 5;
+        cfg.loss_ab.burst_len_max = 15;
+        cfg.reorder_prob_ab = 0.05;
+        cfg.reorder_advance_us = 2000;
+        cfg.reorder_delay_us = 8000;
+        cfg.duplicate_prob_ab = 0.01;
+        cfg.duplicate_delay_us = 1000;
+        sc.push_back(cfg);
+    }
+
+    // E32 Asymmetric loss + reorder burst (BA only)
+    {
+        ScenarioConfig cfg = BaseScenario("E32_asym_loss_reorder_ba");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 2000;
+        cfg.delay_ba.jitter_us = 2000;
+        cfg.loss_ba.loss_rate = 0.01;
+        cfg.loss_ba.burst_start_prob = 0.02;
+        cfg.loss_ba.burst_len_min = 5;
+        cfg.loss_ba.burst_len_max = 15;
+        cfg.reorder_prob_ba = 0.05;
+        cfg.reorder_advance_us = 2000;
+        cfg.reorder_delay_us = 8000;
+        cfg.duplicate_prob_ba = 0.01;
+        cfg.duplicate_delay_us = 1000;
+        sc.push_back(cfg);
+    }
+
+    // E33 Low data-rate step (probe-only gating stress)
+    {
+        ScenarioConfig cfg = BaseScenario("E33_lowrate_step");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.send_rate_hz = 2.0;
+        cfg.poll_rate_hz = 1.0;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20000000ULL;
+        cfg.clock_step_b_us = 2000000;
+        sc.push_back(cfg);
+    }
+
+    // E39 Low data-rate + jitter step
+    {
+        ScenarioConfig cfg = BaseScenario("E39_lowrate_jitter_step");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.send_rate_hz = 2.0;
+        cfg.poll_rate_hz = 1.0;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 8000;
+        cfg.delay_ba.jitter_us = 8000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20000000ULL;
+        cfg.clock_step_b_us = 2000000;
+        sc.push_back(cfg);
+    }
+
+    // E41 Low data-rate random step time/size
+    {
+        ScenarioConfig cfg = BaseScenario("E41_lowrate_randstep");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.send_rate_hz = 2.0;
+        cfg.poll_rate_hz = 1.0;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.clock_step_random = true;
+        cfg.clock_step_random_side = false;
+        cfg.clock_step_time_min_us = 10000000ULL;
+        cfg.clock_step_time_max_us = 50000000ULL;
+        cfg.clock_step_min_us = 1000000;
+        cfg.clock_step_max_us = 5000000;
+        sc.push_back(cfg);
+    }
+
+    // E42 Low data-rate + burst loss + step
+    {
+        ScenarioConfig cfg = BaseScenario("E42_lowrate_loss_step");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.send_rate_hz = 2.0;
+        cfg.poll_rate_hz = 1.0;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.loss_ab.burst_start_prob = 0.02;
+        cfg.loss_ab.burst_len_min = 3;
+        cfg.loss_ab.burst_len_max = 8;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20000000ULL;
+        cfg.clock_step_b_us = 2000000;
+        sc.push_back(cfg);
+    }
+
+    // E43 Low data-rate + asymmetric reorder + step
+    {
+        ScenarioConfig cfg = BaseScenario("E43_lowrate_asym_reorder_step");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.send_rate_hz = 2.0;
+        cfg.poll_rate_hz = 1.0;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.reorder_prob_ab = 0.05;
+        cfg.reorder_advance_us = 5000;
+        cfg.reorder_delay_us = 15000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20000000ULL;
+        cfg.clock_step_b_us = 2000000;
+        sc.push_back(cfg);
+    }
+
+    // E44 Low data-rate with probe burst polling
+    {
+        ScenarioConfig cfg = BaseScenario("E44_lowrate_probe_burst");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.send_rate_hz = 2.0;
+        cfg.poll_rate_hz = 10.0;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20000000ULL;
+        cfg.clock_step_b_us = 2000000;
+        sc.push_back(cfg);
+    }
+
+    // E90 Sparse traffic (1 Hz send/poll)
+    {
+        ScenarioConfig cfg = BaseScenario("E90_sparse_traffic");
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.send_rate_hz = 1.0;
+        cfg.poll_rate_hz = 1.0;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        sc.push_back(cfg);
+    }
+
+    // E91 Clock freeze + resume on B
+    {
+        ScenarioConfig cfg = BaseScenario("E91_clock_freeze_resume");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.clock_freeze_b = true;
+        cfg.clock_freeze_b_start_us = 20 * 1000 * 1000ULL;
+        cfg.clock_freeze_b_end_us = 30 * 1000 * 1000ULL;
+        sc.push_back(cfg);
+    }
+
+    // E92 Clock slew (gradual correction via drift ramp)
+    {
+        ScenarioConfig cfg = BaseScenario("E92_clock_slew");
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.offset_a_us = 1000000;
+        cfg.drift_ramp_start_us = 20 * 1000 * 1000ULL;
+        cfg.drift_ramp_max_ppm = 200.0;
+        cfg.drift_ramp_ppm_per_s_a = -8.0;
+        cfg.drift_ramp_ppm_per_s_b = 8.0;
+        sc.push_back(cfg);
+    }
+
+    // E93 Asymmetric timestamp noise/jitter
+    {
+        ScenarioConfig cfg = BaseScenario("E93_asym_timestamp_noise");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.recv_noise_mode = NoiseMode::Uniform;
+        cfg.recv_noise_us_a = 50;
+        cfg.recv_noise_us_b = 500;
+        sc.push_back(cfg);
+    }
+
+    // E101 Timestamp quantization + asymmetric noise
+    {
+        ScenarioConfig cfg = BaseScenario("E101_ts_quant_asym_noise");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.quantize_us = 10;
+        cfg.recv_noise_mode = NoiseMode::Uniform;
+        cfg.recv_noise_us_a = 50;
+        cfg.recv_noise_us_b = 500;
+        sc.push_back(cfg);
+    }
+
+    // E45 Clock jump small (A forward)
+    {
+        ScenarioConfig cfg = BaseScenario("E45_clock_jump_small_a_fwd");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20000000ULL;
+        cfg.clock_step_a_us = 2000000;
+        sc.push_back(cfg);
+    }
+
+    // E45 Clock jump small (A backward)
+    {
+        ScenarioConfig cfg = BaseScenario("E45_clock_jump_small_a_back");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20000000ULL;
+        cfg.clock_step_a_us = -2000000;
+        sc.push_back(cfg);
+    }
+
+    // E45 Clock jump large (B forward)
+    {
+        ScenarioConfig cfg = BaseScenario("E45_clock_jump_large_b_fwd");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20000000ULL;
+        cfg.clock_step_b_us = 120000000;
+        sc.push_back(cfg);
+    }
+
+    // E45 Clock jump large (B backward)
+    {
+        ScenarioConfig cfg = BaseScenario("E45_clock_jump_large_b_back");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20000000ULL;
+        cfg.clock_step_b_us = -120000000;
+        sc.push_back(cfg);
+    }
+
+    // E95 Clock jump small (B forward)
+    {
+        ScenarioConfig cfg = BaseScenario("E95_clock_jump_small_b_fwd");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20000000ULL;
+        cfg.clock_step_b_us = 2000000;
+        sc.push_back(cfg);
+    }
+
+    // E96 Clock jump small (B backward)
+    {
+        ScenarioConfig cfg = BaseScenario("E96_clock_jump_small_b_back");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20000000ULL;
+        cfg.clock_step_b_us = -2000000;
+        sc.push_back(cfg);
+    }
+
+    // E97 Clock jump large (A forward)
+    {
+        ScenarioConfig cfg = BaseScenario("E97_clock_jump_large_a_fwd");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20000000ULL;
+        cfg.clock_step_a_us = 120000000;
+        sc.push_back(cfg);
+    }
+
+    // E98 Clock jump large (A backward)
+    {
+        ScenarioConfig cfg = BaseScenario("E98_clock_jump_large_a_back");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20000000ULL;
+        cfg.clock_step_a_us = -120000000;
+        sc.push_back(cfg);
+    }
+
+    // E46 Video-latency congestion sweep (20–120ms)
+    {
+        ScenarioConfig cfg = BaseScenario("E46_video_latency_congestion");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ba.queue_amp_us = 80000;
+        cfg.delay_ab.queue_period_us = 10000000ULL;
+        cfg.delay_ba.queue_period_us = 12000000ULL;
+        cfg.delay_ab.step_at_us = 30000000ULL;
+        cfg.delay_ab.step_delta_us = 20000;
+        cfg.delay_ba.step_at_us = 30000000ULL;
+        cfg.delay_ba.step_delta_us = 10000;
+        sc.push_back(cfg);
+    }
+
+    // E47 Video-latency with loss bursts + asymmetric reorder
+    {
+        ScenarioConfig cfg = BaseScenario("E47_video_loss_reorder");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ba.queue_amp_us = 80000;
+        cfg.delay_ab.queue_period_us = 10000000ULL;
+        cfg.delay_ba.queue_period_us = 12000000ULL;
+        cfg.loss_ab.burst_start_prob = 0.02;
+        cfg.loss_ab.burst_len_min = 3;
+        cfg.loss_ab.burst_len_max = 8;
+        cfg.loss_ba.burst_start_prob = 0.01;
+        cfg.loss_ba.burst_len_min = 2;
+        cfg.loss_ba.burst_len_max = 6;
+        cfg.reorder_prob_ab = 0.05;
+        cfg.reorder_advance_us = 5000;
+        cfg.reorder_delay_us = 20000;
+        sc.push_back(cfg);
+    }
+
+    // E48 Video-latency with congestion step and recovery
+    {
+        ScenarioConfig cfg = BaseScenario("E48_video_congestion_step");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ba.queue_amp_us = 80000;
+        cfg.delay_ab.queue_period_us = 9000000ULL;
+        cfg.delay_ba.queue_period_us = 11000000ULL;
+        cfg.delay_ab.step_at_us = 15000000ULL;
+        cfg.delay_ab.step_delta_us = 20000;
+        cfg.delay_ab.step2_at_us = 40000000ULL;
+        cfg.delay_ab.step2_delta_us = -15000;
+        cfg.delay_ba.step_at_us = 15000000ULL;
+        cfg.delay_ba.step_delta_us = 15000;
+        cfg.delay_ba.step2_at_us = 40000000ULL;
+        cfg.delay_ba.step2_delta_us = -10000;
+        sc.push_back(cfg);
+    }
+
+    // E49 Video-latency with lognormal jitter
+    {
+        ScenarioConfig cfg = BaseScenario("E49_video_lognormal_jitter");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.delay_ab.jitter_mode = JitterMode::LogNormal;
+        cfg.delay_ba.jitter_mode = JitterMode::LogNormal;
+        cfg.delay_ab.lognormal_sigma = 0.7;
+        cfg.delay_ba.lognormal_sigma = 0.7;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ba.queue_amp_us = 80000;
+        cfg.delay_ab.queue_period_us = 11000000ULL;
+        cfg.delay_ba.queue_period_us = 13000000ULL;
+        sc.push_back(cfg);
+    }
+
+    // E50 Video-latency with congestion step + asym path change
+    {
+        ScenarioConfig cfg = BaseScenario("E50_video_step_pathchange");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ba.queue_amp_us = 80000;
+        cfg.delay_ab.queue_period_us = 10000000ULL;
+        cfg.delay_ba.queue_period_us = 12000000ULL;
+        cfg.delay_ab.step_at_us = 25000000ULL;
+        cfg.delay_ab.step_delta_us = 30000;
+        cfg.delay_ba.step_at_us = 25000000ULL;
+        cfg.delay_ba.step_delta_us = -15000;
+        cfg.delay_ab.step2_at_us = 45000000ULL;
+        cfg.delay_ab.step2_delta_us = -20000;
+        cfg.delay_ba.step2_at_us = 45000000ULL;
+        cfg.delay_ba.step2_delta_us = 10000;
+        sc.push_back(cfg);
+    }
+
+    // E51 Video-latency with drift + congestion step
+    {
+        ScenarioConfig cfg = BaseScenario("E51_video_drift_congestion");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ba.queue_amp_us = 80000;
+        cfg.delay_ab.queue_period_us = 10000000ULL;
+        cfg.delay_ba.queue_period_us = 12000000ULL;
+        cfg.delay_ab.step_at_us = 30000000ULL;
+        cfg.delay_ab.step_delta_us = 20000;
+        cfg.delay_ba.step_at_us = 30000000ULL;
+        cfg.delay_ba.step_delta_us = 10000;
+        cfg.drift_ppm_a = 50;
+        cfg.drift_ppm_b = -50;
+        sc.push_back(cfg);
+    }
+
+    // E52 Video-latency with bimodal delay + asymmetric path change
+    {
+        ScenarioConfig cfg = BaseScenario("E52_video_bimodal_pathchange");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 2000;
+        cfg.delay_ba.jitter_us = 2000;
+        cfg.delay_ab.jitter_mode = JitterMode::Bimodal;
+        cfg.delay_ba.jitter_mode = JitterMode::Bimodal;
+        cfg.delay_ab.bimodal_high_prob = 0.25;
+        cfg.delay_ba.bimodal_high_prob = 0.20;
+        cfg.delay_ab.bimodal_delay_us = 80000;
+        cfg.delay_ba.bimodal_delay_us = 60000;
+        cfg.delay_ab.step_at_us = 25000000ULL;
+        cfg.delay_ab.step_delta_us = 25000;
+        cfg.delay_ba.step_at_us = 25000000ULL;
+        cfg.delay_ba.step_delta_us = -15000;
+        sc.push_back(cfg);
+    }
+
+    // E53 Random clock step at normal rate
+    {
+        ScenarioConfig cfg = BaseScenario("E53_randstep_normal");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.send_rate_hz = 60.0;
+        cfg.poll_rate_hz = 1.0;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 2000;
+        cfg.delay_ba.jitter_us = 2000;
+        cfg.clock_step_random = true;
+        cfg.clock_step_random_side = true;
+        cfg.clock_step_time_min_us = 10000000ULL;
+        cfg.clock_step_time_max_us = 50000000ULL;
+        cfg.clock_step_min_us = 1000000;
+        cfg.clock_step_max_us = 5000000;
+        sc.push_back(cfg);
+    }
+
+    // E54 Drift sign flip mid-run
+    {
+        ScenarioConfig cfg = BaseScenario("E54_drift_sign_flip");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.drift_ppm_a = 50;
+        cfg.drift_ppm_b = -50;
+        cfg.drift_step_enabled = true;
+        cfg.drift_step_time_us = 30000000ULL;
+        cfg.drift_step_delta_ppm_a = -100;
+        cfg.drift_step_delta_ppm_b = 100;
+        sc.push_back(cfg);
+    }
+
+    // E122 Skew reset to zero mid-run
+    {
+        ScenarioConfig cfg = BaseScenario("E122_skew_reset_zero");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 30000;
+        cfg.delay_ba.base_delay_us = 30000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.drift_ppm_a = 80;
+        cfg.drift_ppm_b = -80;
+        cfg.drift_step_enabled = true;
+        cfg.drift_step_time_us = 30000000ULL;
+        cfg.drift_step_delta_ppm_a = -80;
+        cfg.drift_step_delta_ppm_b = 80;
+        sc.push_back(cfg);
+    }
+
+    // E85 Drift RW + sign flip
+    {
+        ScenarioConfig cfg = BaseScenario("E85_drift_rw_signflip");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 2000;
+        cfg.delay_ba.jitter_us = 2000;
+        cfg.drift_ppm_a = 50;
+        cfg.drift_ppm_b = -50;
+        cfg.drift_rw_step_ppm = 4.0;
+        cfg.drift_rw_step_interval_us = 2000000;
+        cfg.drift_step_enabled = true;
+        cfg.drift_step_time_us = 40000000ULL;
+        cfg.drift_step_delta_ppm_a = -100;
+        cfg.drift_step_delta_ppm_b = 100;
+        sc.push_back(cfg);
+    }
+
+    // E119 Long-horizon drift RW stress (10 min)
+    {
+        ScenarioConfig cfg = BaseScenario("E119_drift_rw_long");
+        // Stress test (excluded from core)
+        cfg.duration_us = 600 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 40000;
+        cfg.delay_ba.base_delay_us = 40000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.drift_ppm_a = 30;
+        cfg.drift_ppm_b = -30;
+        cfg.drift_rw_step_ppm = 2.0;
+        cfg.drift_rw_step_interval_us = 1000000;
+        sc.push_back(cfg);
+    }
+
+    // E133 Oscillator temp drift (sine) + step
+    {
+        ScenarioConfig cfg = BaseScenario("E133_temp_drift_sine_step");
+        // Stress test (excluded from core)
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 2000;
+        cfg.delay_ba.jitter_us = 2000;
+        cfg.drift_sine_amp_ppm_a = 120.0;
+        cfg.drift_sine_amp_ppm_b = -120.0;
+        cfg.drift_sine_period_us = 90 * 1000 * 1000ULL;
+        cfg.drift_step_enabled = true;
+        cfg.drift_step_time_us = 70000000ULL;
+        cfg.drift_step_delta_ppm_a = 80.0;
+        cfg.drift_step_delta_ppm_b = -80.0;
+        sc.push_back(cfg);
+    }
+
+    // E120 Route change / NAT rebinding
+    {
+        ScenarioConfig cfg = BaseScenario("E120_route_rebind");
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 30000;
+        cfg.delay_ba.base_delay_us = 35000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.delay_ab.queue_amp_us = 40000;
+        cfg.delay_ba.queue_amp_us = 30000;
+        cfg.delay_ab.queue_period_us = 10000000ULL;
+        cfg.delay_ba.queue_period_us = 12000000ULL;
+        cfg.delay_ab.step_at_us = 30000000ULL;
+        cfg.delay_ab.step_delta_us = 20000;
+        cfg.delay_ba.step_at_us = 30000000ULL;
+        cfg.delay_ba.step_delta_us = 10000;
+        cfg.delay_ab.step2_at_us = 80000000ULL;
+        cfg.delay_ab.step2_delta_us = -15000;
+        cfg.delay_ba.step2_at_us = 80000000ULL;
+        cfg.delay_ba.step2_delta_us = -10000;
+        cfg.loss_ab.burst_start_prob = 0.02;
+        cfg.loss_ab.burst_len_min = 2;
+        cfg.loss_ab.burst_len_max = 6;
+        cfg.reorder_prob_ab = 0.03;
+        cfg.reorder_advance_us = 4000;
+        cfg.reorder_delay_us = 15000;
+        sc.push_back(cfg);
+    }
+
+    // E135 NAT rebinding outage + path flip
+    {
+        ScenarioConfig cfg = BaseScenario("E135_nat_rebind_outage_flip");
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 30000;
+        cfg.delay_ba.base_delay_us = 35000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.delay_ab.step_at_us = 40000000ULL;
+        cfg.delay_ab.step_delta_us = 30000;
+        cfg.delay_ba.step_at_us = 40000000ULL;
+        cfg.delay_ba.step_delta_us = 15000;
+        cfg.loss_ab.burst_start_prob = 0.004;
+        cfg.loss_ab.burst_len_min = 50;
+        cfg.loss_ab.burst_len_max = 80;
+        cfg.loss_ba.burst_start_prob = 0.003;
+        cfg.loss_ba.burst_len_min = 40;
+        cfg.loss_ba.burst_len_max = 70;
+        cfg.delay_ab.step2_at_us = 80000000ULL;
+        cfg.delay_ab.step2_delta_us = -20000;
+        cfg.delay_ba.step2_at_us = 80000000ULL;
+        cfg.delay_ba.step2_delta_us = -10000;
+        sc.push_back(cfg);
+    }
+
+    // E121 CPU scheduling jitter burst + outliers
+    {
+        ScenarioConfig cfg = BaseScenario("E121_cpu_jitter_burst");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 30000;
+        cfg.delay_ba.base_delay_us = 30000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.spike_prob = 0.02;
+        cfg.delay_ab.spike_delay_us = 40000;
+        cfg.delay_ba.spike_prob = 0.01;
+        cfg.delay_ba.spike_delay_us = 30000;
+        cfg.loss_ab.burst_start_prob = 0.03;
+        cfg.loss_ab.burst_len_min = 2;
+        cfg.loss_ab.burst_len_max = 8;
+        cfg.recv_noise_mode = NoiseMode::LogNormal;
+        cfg.recv_noise_sigma = 0.8;
+        cfg.recv_noise_us_a = 2000;
+        cfg.recv_noise_us_b = 5000;
+        sc.push_back(cfg);
+    }
+
+    // E129 Asymmetric scheduler noise bursts
+    {
+        ScenarioConfig cfg = BaseScenario("E129_asym_scheduler_noise_burst");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 28000;
+        cfg.delay_ba.base_delay_us = 28000;
+        cfg.delay_ab.jitter_us = 2000;
+        cfg.delay_ba.jitter_us = 2000;
+        cfg.delay_ab.spike_prob = 0.015;
+        cfg.delay_ab.spike_delay_us = 35000;
+        cfg.delay_ba.spike_prob = 0.004;
+        cfg.delay_ba.spike_delay_us = 15000;
+        cfg.recv_noise_mode = NoiseMode::LogNormal;
+        cfg.recv_noise_sigma = 0.9;
+        cfg.recv_noise_us_a = 6000;
+        cfg.recv_noise_us_b = 1500;
+        sc.push_back(cfg);
+    }
+
+    // E86 Extreme clock step (300s) on A (forward)
+    {
+        ScenarioConfig cfg = BaseScenario("E86_clock_step_300s_a_fwd");
+        cfg.duration_us = 600 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 300 * 1000 * 1000ULL;
+        cfg.clock_step_a_us = 300 * 1000 * 1000LL;
+        sc.push_back(cfg);
+    }
+
+    // E87 Extreme clock step (300s) on B (backward)
+    {
+        ScenarioConfig cfg = BaseScenario("E87_clock_step_300s_b_back");
+        cfg.duration_us = 600 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 300 * 1000 * 1000ULL;
+        cfg.clock_step_b_us = -300 * 1000 * 1000LL;
+        sc.push_back(cfg);
+    }
+
+    // E55 Video-latency with spike-train congestion
+    {
+        ScenarioConfig cfg = BaseScenario("E55_video_latency_spike_train");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ba.queue_amp_us = 70000;
+        cfg.delay_ab.queue_period_us = 9000000ULL;
+        cfg.delay_ba.queue_period_us = 11000000ULL;
+        cfg.delay_ab.spike_prob = 0.02;
+        cfg.delay_ab.spike_delay_us = 60000;
+        cfg.delay_ba.spike_prob = 0.015;
+        cfg.delay_ba.spike_delay_us = 50000;
+        sc.push_back(cfg);
+    }
+
+    // E56 Video-latency with asymmetric jitter ramp
+    {
+        ScenarioConfig cfg = BaseScenario("E56_video_asym_jitter_ramp");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 8000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.jitter_mode = JitterMode::Gaussian;
+        cfg.delay_ba.jitter_mode = JitterMode::Gaussian;
+        cfg.delay_ab.jitter_clip_sigma = 3.0;
+        cfg.delay_ba.jitter_clip_sigma = 3.0;
+        cfg.delay_ab.ramp_us_per_s = 1500;
+        cfg.delay_ba.ramp_us_per_s = 300;
+        sc.push_back(cfg);
+    }
+
+    // E57 Video-latency with Pareto heavy-tail jitter
+    {
+        ScenarioConfig cfg = BaseScenario("E57_video_pareto_jitter");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.delay_ab.jitter_mode = JitterMode::Pareto;
+        cfg.delay_ba.jitter_mode = JitterMode::Pareto;
+        cfg.delay_ab.pareto_alpha = 1.8;
+        cfg.delay_ba.pareto_alpha = 2.0;
+        cfg.delay_ab.pareto_scale_us = 2000;
+        cfg.delay_ba.pareto_scale_us = 2000;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ba.queue_amp_us = 80000;
+        cfg.delay_ab.queue_period_us = 10000000ULL;
+        cfg.delay_ba.queue_period_us = 12000000ULL;
+        sc.push_back(cfg);
+    }
+
+    // E58 Video-latency with spike train + loss/reorder bursts
+    {
+        ScenarioConfig cfg = BaseScenario("E58_video_spike_loss_reorder");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ba.queue_amp_us = 70000;
+        cfg.delay_ab.queue_period_us = 9000000ULL;
+        cfg.delay_ba.queue_period_us = 11000000ULL;
+        cfg.delay_ab.spike_prob = 0.02;
+        cfg.delay_ab.spike_delay_us = 60000;
+        cfg.delay_ba.spike_prob = 0.015;
+        cfg.delay_ba.spike_delay_us = 50000;
+        cfg.loss_ab.burst_start_prob = 0.02;
+        cfg.loss_ab.burst_len_min = 3;
+        cfg.loss_ab.burst_len_max = 8;
+        cfg.loss_ba.burst_start_prob = 0.015;
+        cfg.loss_ba.burst_len_min = 2;
+        cfg.loss_ba.burst_len_max = 6;
+        cfg.reorder_prob_ab = 0.04;
+        cfg.reorder_prob_ba = 0.02;
+        cfg.reorder_advance_us = 5000;
+        cfg.reorder_delay_us = 20000;
+        sc.push_back(cfg);
+    }
+
+    // E60 Video-latency with correlated jitter (random walk)
+    {
+        ScenarioConfig cfg = BaseScenario("E60_video_correlated_jitter");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.queue_amp_us = 60000;
+        cfg.delay_ba.queue_amp_us = 60000;
+        cfg.delay_ab.queue_period_us = 11000000ULL;
+        cfg.delay_ba.queue_period_us = 13000000ULL;
+        cfg.delay_ab.rw_step_interval_us = 2000000ULL;
+        cfg.delay_ab.rw_step_us = 4000;
+        cfg.delay_ab.rw_max_us = 40000;
+        cfg.delay_ba.rw_step_interval_us = 2500000ULL;
+        cfg.delay_ba.rw_step_us = 3500;
+        cfg.delay_ba.rw_max_us = 35000;
+        sc.push_back(cfg);
+    }
+
+    // E61 Video-latency with 20–120ms congestion step + recovery
+    {
+        ScenarioConfig cfg = BaseScenario("E61_video_congestion_120ms");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ba.queue_amp_us = 80000;
+        cfg.delay_ab.queue_period_us = 9000000ULL;
+        cfg.delay_ba.queue_period_us = 11000000ULL;
+        cfg.delay_ab.step_at_us = 20000000ULL;
+        cfg.delay_ab.step_delta_us = 100000;
+        cfg.delay_ab.step2_at_us = 45000000ULL;
+        cfg.delay_ab.step2_delta_us = -80000;
+        cfg.delay_ba.step_at_us = 20000000ULL;
+        cfg.delay_ba.step_delta_us = 80000;
+        cfg.delay_ba.step2_at_us = 45000000ULL;
+        cfg.delay_ba.step2_delta_us = -60000;
+        sc.push_back(cfg);
+    }
+
+    // E62 Video-latency with asymmetric spike train + congestion step
+    {
+        ScenarioConfig cfg = BaseScenario("E62_video_asym_spike_step");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ba.queue_amp_us = 70000;
+        cfg.delay_ab.queue_period_us = 9000000ULL;
+        cfg.delay_ba.queue_period_us = 11000000ULL;
+        cfg.delay_ab.spike_prob = 0.025;
+        cfg.delay_ab.spike_delay_us = 70000;
+        cfg.delay_ba.spike_prob = 0.01;
+        cfg.delay_ba.spike_delay_us = 40000;
+        cfg.delay_ab.step_at_us = 25000000ULL;
+        cfg.delay_ab.step_delta_us = 40000;
+        cfg.delay_ab.step2_at_us = 45000000ULL;
+        cfg.delay_ab.step2_delta_us = -30000;
+        cfg.delay_ba.step_at_us = 25000000ULL;
+        cfg.delay_ba.step_delta_us = 20000;
+        cfg.delay_ba.step2_at_us = 45000000ULL;
+        cfg.delay_ba.step2_delta_us = -15000;
+        sc.push_back(cfg);
+    }
+
     // E6 Path change / handover
     {
         ScenarioConfig cfg = BaseScenario("E6_path_change");
@@ -2047,6 +11695,491 @@ static std::vector<ScenarioConfig> BuildScenarios()
         cfg.delay_ab.step_delta_us = 30000;
         cfg.delay_ba.step_at_us = 30000000ULL;
         cfg.delay_ba.step_delta_us = -10000;
+        sc.push_back(cfg);
+    }
+
+    // E103 Asymmetric path switch (large AB increase, small BA change)
+    {
+        ScenarioConfig cfg = BaseScenario("E103_asym_path_switch");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.step_at_us = 30000000ULL;
+        cfg.delay_ab.step_delta_us = 60000;
+        cfg.delay_ba.step_at_us = 30000000ULL;
+        cfg.delay_ba.step_delta_us = 10000;
+        sc.push_back(cfg);
+    }
+
+    // E104 Bursty uplink + steady downlink
+    {
+        ScenarioConfig cfg = BaseScenario("E104_bursty_uplink_steady_downlink");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 1000;
+        cfg.loss_ab.burst_start_prob = 0.03;
+        cfg.loss_ab.burst_len_min = 3;
+        cfg.loss_ab.burst_len_max = 8;
+        cfg.reorder_prob_ab = 0.05;
+        cfg.reorder_prob_ba = 0.005;
+        cfg.reorder_advance_us = 5000;
+        cfg.reorder_delay_us = 20000;
+        sc.push_back(cfg);
+    }
+
+    // E105 Intermittent probe rate (bursty outages)
+    {
+        ScenarioConfig cfg = BaseScenario("E105_intermittent_probe_rate");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.send_rate_hz = 10.0;
+        cfg.poll_rate_hz = 5.0;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.loss_ab.burst_start_prob = 0.01;
+        cfg.loss_ab.burst_len_min = 20;
+        cfg.loss_ab.burst_len_max = 50;
+        cfg.loss_ba.burst_start_prob = 0.008;
+        cfg.loss_ba.burst_len_min = 15;
+        cfg.loss_ba.burst_len_max = 40;
+        sc.push_back(cfg);
+    }
+
+    // E106 Bi-directional queue coupling
+    {
+        ScenarioConfig cfg = BaseScenario("E106_bidirectional_queue_coupling");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 2000;
+        cfg.delay_ba.jitter_us = 2000;
+        cfg.delay_ab.queue_amp_us = 90000;
+        cfg.delay_ba.queue_amp_us = 90000;
+        cfg.delay_ab.queue_period_us = 10000000ULL;
+        cfg.delay_ba.queue_period_us = 10000000ULL;
+        sc.push_back(cfg);
+    }
+
+    // E107 Temperature-induced skew sweep (sinusoidal drift)
+    {
+        ScenarioConfig cfg = BaseScenario("E107_temp_skew_sine");
+        // Stress test (excluded from core)
+        cfg.duration_us = 180 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.drift_sine_amp_ppm_a = 50.0;
+        cfg.drift_sine_amp_ppm_b = -50.0;
+        cfg.drift_sine_period_us = 120 * 1000 * 1000ULL;
+        sc.push_back(cfg);
+    }
+
+    // E108 Mobile handover (high latency + loss burst)
+    {
+        ScenarioConfig cfg = BaseScenario("E108_mobile_handover");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 90000;
+        cfg.delay_ba.base_delay_us = 90000;
+        cfg.delay_ab.jitter_us = 8000;
+        cfg.delay_ba.jitter_us = 8000;
+        cfg.delay_ab.step_at_us = 30000000ULL;
+        cfg.delay_ab.step_delta_us = 60000;
+        cfg.delay_ba.step_at_us = 30000000ULL;
+        cfg.delay_ba.step_delta_us = 40000;
+        cfg.loss_ab.burst_start_prob = 0.02;
+        cfg.loss_ab.burst_len_min = 5;
+        cfg.loss_ab.burst_len_max = 15;
+        cfg.loss_ba.burst_start_prob = 0.015;
+        cfg.loss_ba.burst_len_min = 4;
+        cfg.loss_ba.burst_len_max = 12;
+        sc.push_back(cfg);
+    }
+
+    // E114 Skew sign flip (drift inversion mid-run)
+    {
+        ScenarioConfig cfg = BaseScenario("E114_skew_sign_flip");
+        // Stress test (excluded from core)
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 30000;
+        cfg.delay_ba.base_delay_us = 30000;
+        cfg.delay_ab.jitter_us = 2000;
+        cfg.delay_ba.jitter_us = 2000;
+        cfg.drift_ppm_a = 80;
+        cfg.drift_ppm_b = -80;
+        cfg.drift_step_enabled = true;
+        cfg.drift_step_time_us = 60000000ULL;
+        cfg.drift_step_delta_ppm_a = -160;
+        cfg.drift_step_delta_ppm_b = 160;
+        sc.push_back(cfg);
+    }
+
+    // E115 Bursty jitter with diurnal skew
+    {
+        ScenarioConfig cfg = BaseScenario("E115_bursty_jitter_diurnal_skew");
+        // Stress test (excluded from core)
+        cfg.duration_us = 180 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 40000;
+        cfg.delay_ba.base_delay_us = 40000;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.delay_ab.jitter_mode = JitterMode::Gaussian;
+        cfg.delay_ba.jitter_mode = JitterMode::Gaussian;
+        cfg.delay_ab.spike_prob = 0.02;
+        cfg.delay_ab.spike_delay_us = 60000;
+        cfg.delay_ba.spike_prob = 0.015;
+        cfg.delay_ba.spike_delay_us = 50000;
+        cfg.drift_sine_amp_ppm_a = 80.0;
+        cfg.drift_sine_amp_ppm_b = -80.0;
+        cfg.drift_sine_period_us = 120 * 1000 * 1000ULL;
+        sc.push_back(cfg);
+    }
+
+    // E116 Satellite burst loss + long RTT
+    {
+        ScenarioConfig cfg = BaseScenario("E116_satellite_burst_loss_long_rtt");
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 200000;
+        cfg.delay_ba.base_delay_us = 200000;
+        cfg.delay_ab.jitter_us = 12000;
+        cfg.delay_ba.jitter_us = 12000;
+        cfg.delay_ab.jitter_mode = JitterMode::LogNormal;
+        cfg.delay_ba.jitter_mode = JitterMode::LogNormal;
+        cfg.loss_ab.burst_start_prob = 0.003;
+        cfg.loss_ab.burst_len_min = 30;
+        cfg.loss_ab.burst_len_max = 80;
+        cfg.loss_ba.burst_start_prob = 0.002;
+        cfg.loss_ba.burst_len_min = 25;
+        cfg.loss_ba.burst_len_max = 70;
+        sc.push_back(cfg);
+    }
+
+    // E134 Satellite Doppler-like skew drift + jitter spikes
+    {
+        ScenarioConfig cfg = BaseScenario("E134_satellite_doppler_skew");
+        // Stress test (excluded from core)
+        cfg.duration_us = 180 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 120000;
+        cfg.delay_ba.base_delay_us = 120000;
+        cfg.delay_ab.jitter_us = 6000;
+        cfg.delay_ba.jitter_us = 6000;
+        cfg.delay_ab.jitter_mode = JitterMode::LogNormal;
+        cfg.delay_ba.jitter_mode = JitterMode::LogNormal;
+        cfg.drift_sine_amp_ppm_a = 60.0;
+        cfg.drift_sine_amp_ppm_b = -60.0;
+        cfg.drift_sine_period_us = 180 * 1000 * 1000ULL;
+        cfg.delay_ab.spike_prob = 0.002;
+        cfg.delay_ab.spike_delay_us = 200000;
+        cfg.delay_ba.spike_prob = 0.002;
+        cfg.delay_ba.spike_delay_us = 200000;
+        sc.push_back(cfg);
+    }
+
+    // E117 Upstream-only congestion waves
+    {
+        ScenarioConfig cfg = BaseScenario("E117_upstream_congestion_waves");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 30000;
+        cfg.delay_ba.base_delay_us = 30000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 1500;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ab.queue_period_us = 8000000ULL;
+        cfg.loss_ab.delay_drop_threshold_us = 70000;
+        cfg.loss_ab.delay_drop_prob = 0.4;
+        sc.push_back(cfg);
+    }
+
+    // E131 Periodic congestion wave + correlated jitter
+    {
+        ScenarioConfig cfg = BaseScenario("E131_congestion_wave_corr");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 30000;
+        cfg.delay_ba.base_delay_us = 30000;
+        cfg.delay_ab.jitter_us = 2500;
+        cfg.delay_ba.jitter_us = 2500;
+        cfg.delay_ab.jitter_mode = JitterMode::Gaussian;
+        cfg.delay_ba.jitter_mode = JitterMode::Gaussian;
+        cfg.delay_ab.jitter_clip_sigma = 3.0;
+        cfg.delay_ba.jitter_clip_sigma = 3.0;
+        cfg.delay_ab.queue_amp_us = 40000;
+        cfg.delay_ba.queue_amp_us = 30000;
+        cfg.delay_ab.queue_period_us = 10000000ULL;
+        cfg.delay_ba.queue_period_us = 10000000ULL;
+        cfg.delay_ab.rw_step_interval_us = 1200000;
+        cfg.delay_ba.rw_step_interval_us = 1200000;
+        cfg.delay_ab.rw_step_us = 4000;
+        cfg.delay_ba.rw_step_us = 3000;
+        cfg.delay_ab.rw_max_us = 25000;
+        cfg.delay_ba.rw_max_us = 20000;
+        sc.push_back(cfg);
+    }
+
+    // E118 Cross-traffic induced asymmetric jitter
+    {
+        ScenarioConfig cfg = BaseScenario("E118_cross_traffic_asym_jitter");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 25000;
+        cfg.delay_ba.base_delay_us = 25000;
+        cfg.delay_ab.jitter_mode = JitterMode::Pareto;
+        cfg.delay_ab.pareto_alpha = 2.2;
+        cfg.delay_ab.pareto_scale_us = 4000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_mode = JitterMode::Gaussian;
+        cfg.delay_ba.jitter_us = 2000;
+        cfg.delay_ab.spike_prob = 0.01;
+        cfg.delay_ab.spike_delay_us = 50000;
+        sc.push_back(cfg);
+    }
+
+    // E132 Asymmetric uplink saturation + ACK compression
+    {
+        ScenarioConfig cfg = BaseScenario("E132_uplink_saturation_ack_compress");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 28000;
+        cfg.delay_ba.base_delay_us = 28000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 1500;
+        cfg.delay_ab.queue_amp_us = 90000;
+        cfg.delay_ab.queue_period_us = 7000000ULL;
+        cfg.delay_ba.queue_amp_us = 12000;
+        cfg.delay_ba.queue_period_us = 7000000ULL;
+        cfg.reorder_prob_ab = 0.02;
+        cfg.reorder_advance_us = 3000;
+        cfg.reorder_delay_us = 15000;
+        cfg.loss_ab.delay_drop_threshold_us = 85000;
+        cfg.loss_ab.delay_drop_prob = 0.3;
+        sc.push_back(cfg);
+    }
+
+    // E109 Asymmetric baseline + periodic drops
+    {
+        ScenarioConfig cfg = BaseScenario("E109_asym_baseline_periodic_drops");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 30000;
+        cfg.delay_ba.base_delay_us = 70000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.loss_ab.periodic_n = 120; // drop every ~2s at 60 Hz
+        sc.push_back(cfg);
+    }
+
+    // E110 Jitter square wave
+    {
+        ScenarioConfig cfg = BaseScenario("E110_jitter_square_wave");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 1000;
+        cfg.delay_ba.jitter_us = 1000;
+        cfg.delay_ab.square_amp_us = 15000;
+        cfg.delay_ba.square_amp_us = 15000;
+        cfg.delay_ab.square_period_us = 8000000ULL;
+        cfg.delay_ba.square_period_us = 8000000ULL;
+        cfg.delay_ab.square_duty = 0.5;
+        cfg.delay_ba.square_duty = 0.5;
+        sc.push_back(cfg);
+    }
+
+    // E111 Periodic outage bursts
+    {
+        ScenarioConfig cfg = BaseScenario("E111_periodic_outage");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 25000;
+        cfg.delay_ba.base_delay_us = 25000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.loss_ab.burst_start_prob = 0.0015;
+        cfg.loss_ab.burst_len_min = 80;
+        cfg.loss_ab.burst_len_max = 140;
+        cfg.loss_ba.burst_start_prob = 0.0010;
+        cfg.loss_ba.burst_len_min = 60;
+        cfg.loss_ba.burst_len_max = 120;
+        sc.push_back(cfg);
+    }
+
+    // E127 Asymmetric periodic outage (uplink only)
+    {
+        ScenarioConfig cfg = BaseScenario("E127_asym_periodic_outage");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 25000;
+        cfg.delay_ba.base_delay_us = 25000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 2000;
+        cfg.loss_ab.burst_start_prob = 0.0025;
+        cfg.loss_ab.burst_len_min = 90;
+        cfg.loss_ab.burst_len_max = 160;
+        cfg.loss_ba.burst_start_prob = 0.0002;
+        cfg.loss_ba.burst_len_min = 10;
+        cfg.loss_ba.burst_len_max = 20;
+        sc.push_back(cfg);
+    }
+
+    // E112 One-way priority inversion (uplink queue dominance)
+    {
+        ScenarioConfig cfg = BaseScenario("E112_oneway_priority_inversion");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 22000;
+        cfg.delay_ba.base_delay_us = 22000;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 1500;
+        cfg.delay_ab.queue_amp_us = 70000;
+        cfg.delay_ab.queue_period_us = 9000000ULL;
+        cfg.loss_ab.delay_drop_threshold_us = 80000;
+        cfg.loss_ab.delay_drop_prob = 0.4;
+        sc.push_back(cfg);
+    }
+
+    // E113 Correlated loss + jitter
+    {
+        ScenarioConfig cfg = BaseScenario("E113_correlated_loss_jitter");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 25000;
+        cfg.delay_ba.base_delay_us = 25000;
+        cfg.delay_ab.jitter_us = 18000;
+        cfg.delay_ba.jitter_us = 12000;
+        cfg.delay_ab.jitter_mode = JitterMode::Gaussian;
+        cfg.delay_ba.jitter_mode = JitterMode::Gaussian;
+        cfg.loss_ab.delay_drop_threshold_us = 45000;
+        cfg.loss_ab.delay_drop_prob = 0.5;
+        cfg.loss_ba.delay_drop_threshold_us = 40000;
+        cfg.loss_ba.delay_drop_prob = 0.35;
+        sc.push_back(cfg);
+    }
+
+    // E94 Anti-symmetric drift + symmetric path change
+    {
+        ScenarioConfig cfg = BaseScenario("E94_drift_sym_pathchange");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 2000;
+        cfg.delay_ba.jitter_us = 2000;
+        cfg.delay_ab.step_at_us = 30000000ULL;
+        cfg.delay_ab.step_delta_us = 20000;
+        cfg.delay_ba.step_at_us = 30000000ULL;
+        cfg.delay_ba.step_delta_us = 20000;
+        cfg.delay_ab.step2_at_us = 45000000ULL;
+        cfg.delay_ab.step2_delta_us = -20000;
+        cfg.delay_ba.step2_at_us = 45000000ULL;
+        cfg.delay_ba.step2_delta_us = -20000;
+        cfg.drift_ppm_a = 80;
+        cfg.drift_ppm_b = -80;
+        sc.push_back(cfg);
+    }
+
+    // E94 Video-link realistic mix (20–120ms, congestion/loss/reorder/path change)
+    {
+        ScenarioConfig cfg = BaseScenario("E94_video_link_realistic");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ba.queue_amp_us = 70000;
+        cfg.delay_ab.queue_period_us = 9000000ULL;
+        cfg.delay_ba.queue_period_us = 11000000ULL;
+        cfg.delay_ab.step_at_us = 20000000ULL;
+        cfg.delay_ab.step_delta_us = 100000;
+        cfg.delay_ba.step_at_us = 20000000ULL;
+        cfg.delay_ba.step_delta_us = 80000;
+        cfg.delay_ab.step2_at_us = 60000000ULL;
+        cfg.delay_ab.step2_delta_us = -60000;
+        cfg.delay_ba.step2_at_us = 60000000ULL;
+        cfg.delay_ba.step2_delta_us = -40000;
+        cfg.loss_ab.burst_start_prob = 0.02;
+        cfg.loss_ab.burst_len_min = 2;
+        cfg.loss_ab.burst_len_max = 6;
+        cfg.loss_ba.burst_start_prob = 0.015;
+        cfg.loss_ba.burst_len_min = 2;
+        cfg.loss_ba.burst_len_max = 5;
+        cfg.reorder_prob_ab = 0.03;
+        cfg.reorder_prob_ba = 0.015;
+        cfg.reorder_advance_us = 5000;
+        cfg.reorder_delay_us = 20000;
+        sc.push_back(cfg);
+    }
+
+    // E59 Path flap with repeated delay shifts
+    {
+        ScenarioConfig cfg = BaseScenario("E59_path_flap");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.step_at_us = 15000000ULL;
+        cfg.delay_ab.step_delta_us = 30000;
+        cfg.delay_ab.step2_at_us = 30000000ULL;
+        cfg.delay_ab.step2_delta_us = -30000;
+        cfg.delay_ab.rw_step_interval_us = 5000000ULL;
+        cfg.delay_ab.rw_step_us = 8000;
+        cfg.delay_ab.rw_max_us = 40000;
+        cfg.delay_ba.step_at_us = 20000000ULL;
+        cfg.delay_ba.step_delta_us = -15000;
+        cfg.delay_ba.step2_at_us = 40000000ULL;
+        cfg.delay_ba.step2_delta_us = 15000;
+        cfg.delay_ba.rw_step_interval_us = 6000000ULL;
+        cfg.delay_ba.rw_step_us = 6000;
+        cfg.delay_ba.rw_max_us = 30000;
+        sc.push_back(cfg);
+    }
+
+    // E99 Video-latency with diurnal RTT + jitter pulses
+    {
+        ScenarioConfig cfg = BaseScenario("E99_video_diurnal_rtt_pulses");
+        cfg.duration_us = 180 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 30000;
+        cfg.delay_ba.base_delay_us = 30000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.jitter_mode = JitterMode::Gaussian;
+        cfg.delay_ba.jitter_mode = JitterMode::Gaussian;
+        cfg.delay_ab.queue_amp_us = 90000;
+        cfg.delay_ba.queue_amp_us = 90000;
+        cfg.delay_ab.queue_period_us = 120000000ULL;
+        cfg.delay_ba.queue_period_us = 120000000ULL;
+        cfg.delay_ab.spike_prob = 0.03;
+        cfg.delay_ab.spike_delay_us = 50000;
+        cfg.delay_ba.spike_prob = 0.02;
+        cfg.delay_ba.spike_delay_us = 40000;
+        sc.push_back(cfg);
+    }
+
+    // E100 Video heavy-tail queue + reorder bursts
+    {
+        ScenarioConfig cfg = BaseScenario("E100_video_heavytail_reorder");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 30000;
+        cfg.delay_ba.base_delay_us = 30000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.delay_ab.jitter_mode = JitterMode::Pareto;
+        cfg.delay_ba.jitter_mode = JitterMode::Pareto;
+        cfg.delay_ab.pareto_alpha = 1.6;
+        cfg.delay_ba.pareto_alpha = 1.8;
+        cfg.delay_ab.pareto_scale_us = 3000;
+        cfg.delay_ba.pareto_scale_us = 3000;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ba.queue_amp_us = 70000;
+        cfg.delay_ab.queue_period_us = 10000000ULL;
+        cfg.delay_ba.queue_period_us = 12000000ULL;
+        cfg.reorder_prob_ab = 0.05;
+        cfg.reorder_prob_ba = 0.03;
+        cfg.reorder_advance_us = 6000;
+        cfg.reorder_delay_us = 25000;
+        cfg.loss_ab.burst_start_prob = 0.01;
+        cfg.loss_ab.burst_len_min = 2;
+        cfg.loss_ab.burst_len_max = 5;
+        cfg.loss_ba.burst_start_prob = 0.008;
+        cfg.loss_ba.burst_len_min = 2;
+        cfg.loss_ba.burst_len_max = 4;
         sc.push_back(cfg);
     }
 
@@ -2059,6 +12192,121 @@ static std::vector<ScenarioConfig> BuildScenarios()
         cfg.drift_step_time_us = 20000000ULL;
         cfg.drift_step_delta_ppm_a = 100;
         cfg.drift_step_delta_ppm_b = -100;
+        sc.push_back(cfg);
+    }
+
+    // E7 Drift sweep - lower drift
+    {
+        ScenarioConfig cfg = BaseScenario("E7_drift_25ppm");
+        cfg.drift_ppm_a = 25;
+        cfg.drift_ppm_b = -25;
+        cfg.drift_step_enabled = true;
+        cfg.drift_step_time_us = 20000000ULL;
+        cfg.drift_step_delta_ppm_a = 50;
+        cfg.drift_step_delta_ppm_b = -50;
+        sc.push_back(cfg);
+    }
+
+    // E7 Drift sweep - higher drift
+    {
+        ScenarioConfig cfg = BaseScenario("E7_drift_100ppm");
+        cfg.drift_ppm_a = 100;
+        cfg.drift_ppm_b = -100;
+        cfg.drift_step_enabled = true;
+        cfg.drift_step_time_us = 20000000ULL;
+        cfg.drift_step_delta_ppm_a = 200;
+        cfg.drift_step_delta_ppm_b = -200;
+        sc.push_back(cfg);
+    }
+
+    // E7 Drift sweep - very high drift
+    {
+        ScenarioConfig cfg = BaseScenario("E7_drift_200ppm");
+        // Stress test (excluded from core)
+        cfg.drift_ppm_a = 200;
+        cfg.drift_ppm_b = -200;
+        cfg.drift_step_enabled = true;
+        cfg.drift_step_time_us = 20000000ULL;
+        cfg.drift_step_delta_ppm_a = 400;
+        cfg.drift_step_delta_ppm_b = -400;
+        sc.push_back(cfg);
+    }
+
+    // E7 Drift sweep - ultra high drift
+    {
+        ScenarioConfig cfg = BaseScenario("E7_drift_300ppm");
+        cfg.drift_ppm_a = 300;
+        cfg.drift_ppm_b = -300;
+        cfg.drift_step_enabled = true;
+        cfg.drift_step_time_us = 20000000ULL;
+        cfg.drift_step_delta_ppm_a = 600;
+        cfg.drift_step_delta_ppm_b = -600;
+        sc.push_back(cfg);
+    }
+
+    // E7 Drift sweep - extreme drift
+    {
+        ScenarioConfig cfg = BaseScenario("E7_drift_400ppm");
+        // Stress test (excluded from core)
+        cfg.drift_ppm_a = 400;
+        cfg.drift_ppm_b = -400;
+        cfg.drift_step_enabled = true;
+        cfg.drift_step_time_us = 20000000ULL;
+        cfg.drift_step_delta_ppm_a = 800;
+        cfg.drift_step_delta_ppm_b = -800;
+        sc.push_back(cfg);
+    }
+
+    // E7 Drift ramp (linear ramp, no steps)
+    {
+        ScenarioConfig cfg = BaseScenario("E7_drift_ramp");
+        // Stress test (excluded from core)
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.drift_ramp_start_us = 0;
+        cfg.drift_ramp_max_ppm = 200.0;
+        cfg.drift_ramp_ppm_per_s_a = 4.0;
+        cfg.drift_ramp_ppm_per_s_b = -4.0;
+        sc.push_back(cfg);
+    }
+
+    // E34 Asymmetric drift (non-anti-symmetric)
+    {
+        ScenarioConfig cfg = BaseScenario("E34_asym_drift");
+        cfg.drift_ppm_a = 0;
+        cfg.drift_ppm_b = 100;
+        cfg.drift_step_enabled = true;
+        cfg.drift_step_time_us = 20000000ULL;
+        cfg.drift_step_delta_ppm_a = 0;
+        cfg.drift_step_delta_ppm_b = 100;
+        sc.push_back(cfg);
+    }
+
+    // E37 Asymmetric drift + step (A only)
+    {
+        ScenarioConfig cfg = BaseScenario("E37_asym_drift_step");
+        cfg.drift_ppm_a = 50;
+        cfg.drift_ppm_b = 0;
+        cfg.drift_step_enabled = true;
+        cfg.drift_step_time_us = 30000000ULL;
+        cfg.drift_step_delta_ppm_a = 100;
+        cfg.drift_step_delta_ppm_b = 0;
+        sc.push_back(cfg);
+    }
+
+    // E38 Asymmetric drift + network pulses (AB only)
+    {
+        ScenarioConfig cfg = BaseScenario("E38_asym_drift_netmix");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 40000;
+        cfg.delay_ba.base_delay_us = 40000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.queue_amp_us = 40000;
+        cfg.delay_ab.queue_period_us = 4000000;
+        cfg.delay_ab.spike_prob = 0.002;
+        cfg.delay_ab.spike_delay_us = 120000;
+        cfg.drift_ppm_a = 75;
+        cfg.drift_ppm_b = -25;
         sc.push_back(cfg);
     }
 
@@ -2082,9 +12330,1138 @@ static std::vector<ScenarioConfig> BuildScenarios()
         sc.push_back(cfg);
     }
 
-    // Train/holdout split (mark last 3 as holdout)
-    for (size_t i = 0; i < sc.size(); ++i) {
-        sc[i].train = (i < sc.size() - 3);
+    // E10 Video baseline (60ms, lognormal jitter)
+    {
+        ScenarioConfig cfg = BaseScenario("E10_video_baseline");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_mode = JitterMode::LogNormal;
+        cfg.delay_ba.jitter_mode = JitterMode::LogNormal;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.delay_ab.lognormal_sigma = 0.6;
+        cfg.delay_ba.lognormal_sigma = 0.6;
+        sc.push_back(cfg);
+    }
+
+    // E11 Video congestion wave + queueing (20–120ms range)
+    {
+        ScenarioConfig cfg = BaseScenario("E11_video_congestion");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 50000;
+        cfg.delay_ba.base_delay_us = 50000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.queue_amp_us = 50000;
+        cfg.delay_ba.queue_amp_us = 50000;
+        cfg.delay_ab.queue_period_us = 2000000;
+        cfg.delay_ba.queue_period_us = 2000000;
+        sc.push_back(cfg);
+    }
+
+    // E12 Video bursty loss + spikes
+    {
+        ScenarioConfig cfg = BaseScenario("E12_video_bursty_loss");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 80000;
+        cfg.delay_ba.base_delay_us = 80000;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.delay_ab.spike_prob = 0.002;
+        cfg.delay_ba.spike_prob = 0.002;
+        cfg.delay_ab.spike_delay_us = 200000;
+        cfg.delay_ba.spike_delay_us = 200000;
+        cfg.loss_ab.burst_start_prob = 0.02;
+        cfg.loss_ba.burst_start_prob = 0.02;
+        cfg.loss_ab.burst_len_min = 5;
+        cfg.loss_ab.burst_len_max = 20;
+        cfg.loss_ba.burst_len_min = 5;
+        cfg.loss_ba.burst_len_max = 20;
+        sc.push_back(cfg);
+    }
+
+    // E13 Video path change (step up then partial recovery)
+    {
+        ScenarioConfig cfg = BaseScenario("E13_video_path_change");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 40000;
+        cfg.delay_ba.base_delay_us = 40000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.step_at_us = 20 * 1000 * 1000ULL;
+        cfg.delay_ba.step_at_us = 20 * 1000 * 1000ULL;
+        cfg.delay_ab.step_delta_us = 40000;
+        cfg.delay_ba.step_delta_us = 40000;
+        cfg.delay_ab.step2_at_us = 50 * 1000 * 1000ULL;
+        cfg.delay_ba.step2_at_us = 50 * 1000 * 1000ULL;
+        cfg.delay_ab.step2_delta_us = -20000;
+        cfg.delay_ba.step2_delta_us = -20000;
+        sc.push_back(cfg);
+    }
+
+    // E23 Asymmetric path change + reorder burst (AB only)
+    {
+        ScenarioConfig cfg = BaseScenario("E23_asym_path_change");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 40000;
+        cfg.delay_ba.base_delay_us = 40000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.step_at_us = 20 * 1000 * 1000ULL;
+        cfg.delay_ab.step_delta_us = 50000;
+        cfg.delay_ab.step2_at_us = 50 * 1000 * 1000ULL;
+        cfg.delay_ab.step2_delta_us = -20000;
+        cfg.reorder_prob_ab = 0.05;
+        cfg.reorder_advance_us = 5000;
+        cfg.reorder_delay_us = 15000;
+        sc.push_back(cfg);
+    }
+
+    // E24 Asymmetric bufferbloat (queueing on AB only)
+    {
+        ScenarioConfig cfg = BaseScenario("E24_asym_bufferbloat");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 40000;
+        cfg.delay_ba.base_delay_us = 40000;
+        cfg.delay_ab.jitter_mode = JitterMode::LogNormal;
+        cfg.delay_ab.lognormal_sigma = 0.8;
+        cfg.delay_ab.jitter_us = 6000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.queue_amp_us = 60000;
+        cfg.delay_ab.queue_period_us = 3000000;
+        cfg.delay_ab.spike_prob = 0.001;
+        cfg.delay_ab.spike_delay_us = 150000;
+        sc.push_back(cfg);
+    }
+
+    // E35 Video congestion bursts + delay random-walk
+    {
+        ScenarioConfig cfg = BaseScenario("E35_video_congestion_burst");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 70000;
+        cfg.delay_ba.base_delay_us = 70000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ba.queue_amp_us = 80000;
+        cfg.delay_ab.queue_period_us = 3000000;
+        cfg.delay_ba.queue_period_us = 3000000;
+        cfg.delay_ab.rw_step_interval_us = 5000000;
+        cfg.delay_ba.rw_step_interval_us = 5000000;
+        cfg.delay_ab.rw_step_us = 2000;
+        cfg.delay_ba.rw_step_us = 2000;
+        cfg.delay_ab.spike_prob = 0.001;
+        cfg.delay_ba.spike_prob = 0.001;
+        cfg.delay_ab.spike_delay_us = 200000;
+        cfg.delay_ba.spike_delay_us = 200000;
+        sc.push_back(cfg);
+    }
+
+    // E36 Video handover + bursty loss
+    {
+        ScenarioConfig cfg = BaseScenario("E36_video_handover_burst");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 40000;
+        cfg.delay_ba.base_delay_us = 40000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.step_at_us = 25 * 1000 * 1000ULL;
+        cfg.delay_ba.step_at_us = 25 * 1000 * 1000ULL;
+        cfg.delay_ab.step_delta_us = 60000;
+        cfg.delay_ba.step_delta_us = 60000;
+        cfg.loss_ab.burst_start_prob = 0.02;
+        cfg.loss_ba.burst_start_prob = 0.02;
+        cfg.loss_ab.burst_len_min = 5;
+        cfg.loss_ab.burst_len_max = 15;
+        cfg.loss_ba.burst_len_min = 5;
+        cfg.loss_ba.burst_len_max = 15;
+        sc.push_back(cfg);
+    }
+
+    // E40 Video high-latency congestion + reorder
+    {
+        ScenarioConfig cfg = BaseScenario("E40_video_highlat_reorder");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 120000;
+        cfg.delay_ba.base_delay_us = 120000;
+        cfg.delay_ab.jitter_us = 6000;
+        cfg.delay_ba.jitter_us = 6000;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ba.queue_amp_us = 80000;
+        cfg.delay_ab.queue_period_us = 3000000;
+        cfg.delay_ba.queue_period_us = 3000000;
+        cfg.reorder_prob_ab = 0.03;
+        cfg.reorder_prob_ba = 0.03;
+        cfg.reorder_advance_us = 5000;
+        cfg.reorder_delay_us = 15000;
+        sc.push_back(cfg);
+    }
+
+    // E71 Video latency random-walk (20–120ms RTT)
+    {
+        ScenarioConfig cfg = BaseScenario("E71_video_latency_ramp");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 2000;
+        cfg.delay_ba.jitter_us = 2000;
+        cfg.delay_ab.rw_step_interval_us = 2000000;
+        cfg.delay_ba.rw_step_interval_us = 2000000;
+        cfg.delay_ab.rw_step_us = 4000;
+        cfg.delay_ba.rw_step_us = 4000;
+        cfg.delay_ab.rw_max_us = 100000;
+        cfg.delay_ba.rw_max_us = 100000;
+        cfg.delay_ab.queue_amp_us = 20000;
+        cfg.delay_ba.queue_amp_us = 20000;
+        cfg.delay_ab.queue_period_us = 3000000;
+        cfg.delay_ba.queue_period_us = 3000000;
+        sc.push_back(cfg);
+    }
+
+    // E72 Video congestion ramp (rising floor with periodic queues)
+    {
+        ScenarioConfig cfg = BaseScenario("E72_video_congestion_ramp");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 40000;
+        cfg.delay_ba.base_delay_us = 40000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.ramp_us_per_s = 1000;
+        cfg.delay_ba.ramp_us_per_s = 1000;
+        cfg.delay_ab.queue_amp_us = 30000;
+        cfg.delay_ba.queue_amp_us = 30000;
+        cfg.delay_ab.queue_period_us = 5000000;
+        cfg.delay_ba.queue_period_us = 5000000;
+        sc.push_back(cfg);
+    }
+
+    // E73 Video jitter bursts (lognormal + spikes)
+    {
+        ScenarioConfig cfg = BaseScenario("E73_video_jitter_burst");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_mode = JitterMode::LogNormal;
+        cfg.delay_ba.jitter_mode = JitterMode::LogNormal;
+        cfg.delay_ab.lognormal_sigma = 0.9;
+        cfg.delay_ba.lognormal_sigma = 0.9;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.delay_ab.spike_prob = 0.003;
+        cfg.delay_ba.spike_prob = 0.003;
+        cfg.delay_ab.spike_delay_us = 120000;
+        cfg.delay_ba.spike_delay_us = 120000;
+        sc.push_back(cfg);
+    }
+
+    // E74 Video path change + bufferbloat
+    {
+        ScenarioConfig cfg = BaseScenario("E74_video_path_bloat");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 50000;
+        cfg.delay_ba.base_delay_us = 50000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.delay_ab.step_at_us = 30 * 1000 * 1000ULL;
+        cfg.delay_ba.step_at_us = 30 * 1000 * 1000ULL;
+        cfg.delay_ab.step_delta_us = 80000;
+        cfg.delay_ba.step_delta_us = 80000;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ba.queue_amp_us = 80000;
+        cfg.delay_ab.queue_period_us = 2000000;
+        cfg.delay_ba.queue_period_us = 2000000;
+        sc.push_back(cfg);
+    }
+
+    // E75 Video asymmetric path change + queueing
+    {
+        ScenarioConfig cfg = BaseScenario("E75_video_asym_path_bloat");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 40000;
+        cfg.delay_ba.base_delay_us = 40000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.step_at_us = 25 * 1000 * 1000ULL;
+        cfg.delay_ba.step_at_us = 25 * 1000 * 1000ULL;
+        cfg.delay_ab.step_delta_us = 100000;
+        cfg.delay_ba.step_delta_us = 20000;
+        cfg.delay_ab.queue_amp_us = 90000;
+        cfg.delay_ab.queue_period_us = 2500000;
+        sc.push_back(cfg);
+    }
+
+    // E76 Video sawtooth queue + spikes
+    {
+        ScenarioConfig cfg = BaseScenario("E76_video_queue_sawtooth");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.delay_ab.saw_period_us = 4000000;
+        cfg.delay_ba.saw_period_us = 4000000;
+        cfg.delay_ab.saw_amp_us = 120000;
+        cfg.delay_ba.saw_amp_us = 120000;
+        cfg.delay_ab.spike_prob = 0.002;
+        cfg.delay_ba.spike_prob = 0.002;
+        cfg.delay_ab.spike_delay_us = 150000;
+        cfg.delay_ba.spike_delay_us = 150000;
+        sc.push_back(cfg);
+    }
+
+    // E77 Video asymmetric loss bursts + queue wave
+    {
+        ScenarioConfig cfg = BaseScenario("E77_video_asym_loss_burst");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 30000;
+        cfg.delay_ba.base_delay_us = 30000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.queue_amp_us = 70000;
+        cfg.delay_ba.queue_amp_us = 50000;
+        cfg.delay_ab.queue_period_us = 8000000;
+        cfg.delay_ba.queue_period_us = 10000000;
+        cfg.loss_ab.burst_start_prob = 0.03;
+        cfg.loss_ab.burst_len_min = 4;
+        cfg.loss_ab.burst_len_max = 12;
+        cfg.loss_ba.burst_start_prob = 0.01;
+        cfg.loss_ba.burst_len_min = 2;
+        cfg.loss_ba.burst_len_max = 6;
+        cfg.reorder_prob_ab = 0.01;
+        cfg.reorder_prob_ba = 0.005;
+        cfg.reorder_advance_us = 5000;
+        cfg.reorder_delay_us = 15000;
+        sc.push_back(cfg);
+    }
+
+    // E78 Video path flaps + jitter drift
+    {
+        ScenarioConfig cfg = BaseScenario("E78_video_path_flap_jitter");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 50000;
+        cfg.delay_ba.base_delay_us = 50000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.delay_ab.step_at_us = 20 * 1000 * 1000ULL;
+        cfg.delay_ab.step_delta_us = 70000;
+        cfg.delay_ab.step2_at_us = 45 * 1000 * 1000ULL;
+        cfg.delay_ab.step2_delta_us = -50000;
+        cfg.delay_ba.step_at_us = 25 * 1000 * 1000ULL;
+        cfg.delay_ba.step_delta_us = 20000;
+        cfg.delay_ba.step2_at_us = 50 * 1000 * 1000ULL;
+        cfg.delay_ba.step2_delta_us = -10000;
+        cfg.delay_ab.rw_step_interval_us = 3000000;
+        cfg.delay_ab.rw_step_us = 6000;
+        cfg.delay_ab.rw_max_us = 60000;
+        cfg.delay_ba.rw_step_interval_us = 4000000;
+        cfg.delay_ba.rw_step_us = 4000;
+        cfg.delay_ba.rw_max_us = 40000;
+        cfg.delay_ab.spike_prob = 0.002;
+        cfg.delay_ba.spike_prob = 0.002;
+        cfg.delay_ab.spike_delay_us = 100000;
+        cfg.delay_ba.spike_delay_us = 100000;
+        sc.push_back(cfg);
+    }
+
+    // E80 Video congestion pulses + huge spikes
+    {
+        ScenarioConfig cfg = BaseScenario("E80_video_congestion_pulses");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.queue_amp_us = 80000;
+        cfg.delay_ba.queue_amp_us = 80000;
+        cfg.delay_ab.queue_period_us = 4000000;
+        cfg.delay_ba.queue_period_us = 4000000;
+        cfg.delay_ab.spike_prob = 0.003;
+        cfg.delay_ba.spike_prob = 0.003;
+        cfg.delay_ab.spike_delay_us = 300000;
+        cfg.delay_ba.spike_delay_us = 300000;
+        sc.push_back(cfg);
+    }
+
+    // E82 Video RTT random-walk + burst loss (cellular-like)
+    {
+        ScenarioConfig cfg = BaseScenario("E82_video_rtt_random_walk_cellular");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.delay_ab.rw_step_interval_us = 2000000;
+        cfg.delay_ba.rw_step_interval_us = 2000000;
+        cfg.delay_ab.rw_step_us = 8000;
+        cfg.delay_ba.rw_step_us = 8000;
+        cfg.delay_ab.rw_max_us = 100000;
+        cfg.delay_ba.rw_max_us = 100000;
+        cfg.loss_ab.burst_start_prob = 0.02;
+        cfg.loss_ab.burst_len_min = 3;
+        cfg.loss_ab.burst_len_max = 8;
+        cfg.loss_ba.burst_start_prob = 0.015;
+        cfg.loss_ba.burst_len_min = 2;
+        cfg.loss_ba.burst_len_max = 6;
+        cfg.reorder_prob_ab = 0.01;
+        cfg.reorder_prob_ba = 0.005;
+        cfg.reorder_advance_us = 5000;
+        cfg.reorder_delay_us = 15000;
+        sc.push_back(cfg);
+    }
+
+    // E124 Cellular RLC retransmit (bimodal jitter + spikes)
+    {
+        ScenarioConfig cfg = BaseScenario("E124_cellular_rlc_bimodal");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 40000;
+        cfg.delay_ba.base_delay_us = 40000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.delay_ab.jitter_mode = JitterMode::Bimodal;
+        cfg.delay_ba.jitter_mode = JitterMode::Bimodal;
+        cfg.delay_ab.bimodal_high_prob = 0.25;
+        cfg.delay_ba.bimodal_high_prob = 0.2;
+        cfg.delay_ab.bimodal_delay_us = 60000;
+        cfg.delay_ba.bimodal_delay_us = 50000;
+        cfg.delay_ab.spike_prob = 0.004;
+        cfg.delay_ba.spike_prob = 0.003;
+        cfg.delay_ab.spike_delay_us = 120000;
+        cfg.delay_ba.spike_delay_us = 100000;
+        cfg.loss_ab.burst_start_prob = 0.015;
+        cfg.loss_ab.burst_len_min = 2;
+        cfg.loss_ab.burst_len_max = 6;
+        cfg.loss_ba.burst_start_prob = 0.01;
+        cfg.loss_ba.burst_len_min = 2;
+        cfg.loss_ba.burst_len_max = 5;
+        sc.push_back(cfg);
+    }
+
+    // E125 Bufferbloat ramp + drop
+    {
+        ScenarioConfig cfg = BaseScenario("E125_bufferbloat_ramp_drop");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 25000;
+        cfg.delay_ba.base_delay_us = 25000;
+        cfg.delay_ab.jitter_us = 2000;
+        cfg.delay_ba.jitter_us = 2000;
+        cfg.delay_ab.ramp_us_per_s = 1000;
+        cfg.delay_ba.ramp_us_per_s = 800;
+        cfg.delay_ab.step2_at_us = 60000000ULL;
+        cfg.delay_ab.step2_delta_us = -30000;
+        cfg.delay_ba.step2_at_us = 60000000ULL;
+        cfg.delay_ba.step2_delta_us = -24000;
+        cfg.delay_ab.queue_amp_us = 20000;
+        cfg.delay_ba.queue_amp_us = 15000;
+        cfg.delay_ab.queue_period_us = 8000000ULL;
+        cfg.delay_ba.queue_period_us = 9000000ULL;
+        sc.push_back(cfg);
+    }
+
+    // E83 Video asymmetric bandwidth drop + recovery
+    {
+        ScenarioConfig cfg = BaseScenario("E83_video_asym_bw_drop");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 30000;
+        cfg.delay_ba.base_delay_us = 30000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.step_at_us = 20 * 1000 * 1000ULL;
+        cfg.delay_ba.step_at_us = 20 * 1000 * 1000ULL;
+        cfg.delay_ab.step_delta_us = 120000;
+        cfg.delay_ba.step_delta_us = 40000;
+        cfg.delay_ab.step2_at_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ba.step2_at_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.step2_delta_us = -80000;
+        cfg.delay_ba.step2_delta_us = -30000;
+        sc.push_back(cfg);
+    }
+
+    // E84 Video multipath reorder + dup bursts
+    {
+        ScenarioConfig cfg = BaseScenario("E84_video_multipath_reorder_burst");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 40000;
+        cfg.delay_ba.base_delay_us = 40000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.reorder_prob_ab = 0.05;
+        cfg.reorder_prob_ba = 0.03;
+        cfg.reorder_advance_us = 5000;
+        cfg.reorder_delay_us = 30000;
+        cfg.duplicate_prob_ab = 0.01;
+        cfg.duplicate_prob_ba = 0.005;
+        cfg.duplicate_delay_us = 2000;
+        cfg.delay_ab.spike_prob = 0.002;
+        cfg.delay_ba.spike_prob = 0.002;
+        cfg.delay_ab.spike_delay_us = 100000;
+        cfg.delay_ba.spike_delay_us = 100000;
+        sc.push_back(cfg);
+    }
+
+    // E140 Correlated reorder + dup storm
+    {
+        ScenarioConfig cfg = BaseScenario("E140_reorder_dup_storm");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 35000;
+        cfg.delay_ba.base_delay_us = 35000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.delay_ab.jitter_mode = JitterMode::Pareto;
+        cfg.delay_ba.jitter_mode = JitterMode::Pareto;
+        cfg.delay_ab.pareto_alpha = 1.8;
+        cfg.delay_ba.pareto_alpha = 1.8;
+        cfg.delay_ab.pareto_scale_us = 4000;
+        cfg.delay_ba.pareto_scale_us = 4000;
+        cfg.reorder_prob_ab = 0.08;
+        cfg.reorder_prob_ba = 0.06;
+        cfg.reorder_advance_us = 5000;
+        cfg.reorder_delay_us = 25000;
+        cfg.duplicate_prob_ab = 0.03;
+        cfg.duplicate_prob_ba = 0.02;
+        cfg.duplicate_delay_us = 3000;
+        sc.push_back(cfg);
+    }
+
+    // E88 Video WiFi bursty (correlated jitter + burst loss + reorder)
+    {
+        ScenarioConfig cfg = BaseScenario("E88_video_wifi_bursty");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 40000;
+        cfg.delay_ba.base_delay_us = 40000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.jitter_mode = JitterMode::Gaussian;
+        cfg.delay_ba.jitter_mode = JitterMode::Gaussian;
+        cfg.delay_ab.jitter_clip_sigma = 3.0;
+        cfg.delay_ba.jitter_clip_sigma = 3.0;
+        cfg.delay_ab.rw_step_interval_us = 1500000;
+        cfg.delay_ba.rw_step_interval_us = 1800000;
+        cfg.delay_ab.rw_step_us = 3000;
+        cfg.delay_ba.rw_step_us = 2500;
+        cfg.delay_ab.rw_max_us = 20000;
+        cfg.delay_ba.rw_max_us = 15000;
+        cfg.loss_ab.burst_start_prob = 0.03;
+        cfg.loss_ab.burst_len_min = 3;
+        cfg.loss_ab.burst_len_max = 10;
+        cfg.loss_ba.burst_start_prob = 0.02;
+        cfg.loss_ba.burst_len_min = 2;
+        cfg.loss_ba.burst_len_max = 8;
+        cfg.loss_ab.loss_rate = 0.005;
+        cfg.loss_ba.loss_rate = 0.004;
+        cfg.reorder_prob_ab = 0.02;
+        cfg.reorder_prob_ba = 0.015;
+        cfg.reorder_advance_us = 4000;
+        cfg.reorder_delay_us = 12000;
+        sc.push_back(cfg);
+    }
+
+    // E123 WiFi roam + asymmetric jitter bursts
+    {
+        ScenarioConfig cfg = BaseScenario("E123_wifi_roam_asym_burst");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 35000;
+        cfg.delay_ba.base_delay_us = 35000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 2500;
+        cfg.delay_ab.jitter_mode = JitterMode::Gaussian;
+        cfg.delay_ba.jitter_mode = JitterMode::Gaussian;
+        cfg.delay_ab.jitter_clip_sigma = 3.0;
+        cfg.delay_ba.jitter_clip_sigma = 3.0;
+        cfg.delay_ab.step_at_us = 30000000ULL;
+        cfg.delay_ab.step_delta_us = 20000;
+        cfg.delay_ba.step_at_us = 30000000ULL;
+        cfg.delay_ba.step_delta_us = 10000;
+        cfg.delay_ab.step2_at_us = 65000000ULL;
+        cfg.delay_ab.step2_delta_us = -15000;
+        cfg.delay_ba.step2_at_us = 65000000ULL;
+        cfg.delay_ba.step2_delta_us = -8000;
+        cfg.delay_ab.spike_prob = 0.01;
+        cfg.delay_ab.spike_delay_us = 60000;
+        cfg.delay_ba.spike_prob = 0.004;
+        cfg.delay_ba.spike_delay_us = 30000;
+        cfg.loss_ab.burst_start_prob = 0.03;
+        cfg.loss_ab.burst_len_min = 2;
+        cfg.loss_ab.burst_len_max = 8;
+        cfg.loss_ba.burst_start_prob = 0.01;
+        cfg.loss_ba.burst_len_min = 2;
+        cfg.loss_ba.burst_len_max = 5;
+        cfg.reorder_prob_ab = 0.04;
+        cfg.reorder_advance_us = 4000;
+        cfg.reorder_delay_us = 20000;
+        sc.push_back(cfg);
+    }
+
+    // E89 Video satlink jitter (120ms baseline, heavy-tail + spikes)
+    {
+        ScenarioConfig cfg = BaseScenario("E89_video_satlink_jitter");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 120000;
+        cfg.delay_ba.base_delay_us = 120000;
+        cfg.delay_ab.jitter_us = 5000;
+        cfg.delay_ba.jitter_us = 5000;
+        cfg.delay_ab.jitter_mode = JitterMode::Pareto;
+        cfg.delay_ba.jitter_mode = JitterMode::Pareto;
+        cfg.delay_ab.pareto_alpha = 1.6;
+        cfg.delay_ba.pareto_alpha = 1.6;
+        cfg.delay_ab.pareto_scale_us = 5000;
+        cfg.delay_ba.pareto_scale_us = 5000;
+        cfg.delay_ab.spike_prob = 0.002;
+        cfg.delay_ba.spike_prob = 0.002;
+        cfg.delay_ab.spike_delay_us = 300000;
+        cfg.delay_ba.spike_delay_us = 300000;
+        sc.push_back(cfg);
+    }
+
+    // E126 Video heavy-tail mix (20-120ms baseline wander + Pareto jitter)
+    {
+        ScenarioConfig cfg = BaseScenario("E126_video_heavy_tail_mix");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.jitter_mode = JitterMode::Pareto;
+        cfg.delay_ba.jitter_mode = JitterMode::Pareto;
+        cfg.delay_ab.pareto_alpha = 1.7;
+        cfg.delay_ba.pareto_alpha = 1.7;
+        cfg.delay_ab.pareto_scale_us = 4000;
+        cfg.delay_ba.pareto_scale_us = 4000;
+        cfg.delay_ab.rw_step_interval_us = 2000000;
+        cfg.delay_ba.rw_step_interval_us = 2500000;
+        cfg.delay_ab.rw_step_us = 5000;
+        cfg.delay_ba.rw_step_us = 4000;
+        cfg.delay_ab.rw_max_us = 100000;
+        cfg.delay_ba.rw_max_us = 100000;
+        cfg.delay_ab.spike_prob = 0.003;
+        cfg.delay_ba.spike_prob = 0.002;
+        cfg.delay_ab.spike_delay_us = 120000;
+        cfg.delay_ba.spike_delay_us = 100000;
+        sc.push_back(cfg);
+    }
+
+    // E128 TS24 wrap/poison stress
+    {
+        ScenarioConfig cfg = BaseScenario("E128_ts24_wrap_stress");
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.send_rate_hz = 120.0;
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 1000;
+        cfg.delay_ba.jitter_us = 1000;
+        cfg.reorder_prob_ab = 0.02;
+        cfg.reorder_prob_ba = 0.02;
+        cfg.reorder_advance_us = 3000;
+        cfg.reorder_delay_us = 12000;
+        cfg.duplicate_prob_ab = 0.01;
+        cfg.duplicate_prob_ba = 0.01;
+        cfg.duplicate_delay_us = 2000;
+        cfg.ts24_poison_enabled = true;
+        cfg.ts24_poison_prob_ab = 0.002;
+        cfg.ts24_poison_prob_ba = 0.002;
+        cfg.ts24_poison_offset_us_ab = -20000000;
+        cfg.ts24_poison_offset_us_ba = 20000000;
+        sc.push_back(cfg);
+    }
+
+    // E130 Heavy-tail jitter + step + reorder
+    {
+        ScenarioConfig cfg = BaseScenario("E130_heavytail_step_reorder");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 35000;
+        cfg.delay_ba.base_delay_us = 35000;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.delay_ab.jitter_mode = JitterMode::Pareto;
+        cfg.delay_ba.jitter_mode = JitterMode::Pareto;
+        cfg.delay_ab.pareto_alpha = 1.5;
+        cfg.delay_ba.pareto_alpha = 1.5;
+        cfg.delay_ab.pareto_scale_us = 5000;
+        cfg.delay_ba.pareto_scale_us = 5000;
+        cfg.reorder_prob_ab = 0.03;
+        cfg.reorder_prob_ba = 0.02;
+        cfg.reorder_advance_us = 4000;
+        cfg.reorder_delay_us = 20000;
+        cfg.delay_ab.step_at_us = 40000000ULL;
+        cfg.delay_ab.step_delta_us = 25000;
+        cfg.delay_ba.step_at_us = 40000000ULL;
+        cfg.delay_ba.step_delta_us = 15000;
+        sc.push_back(cfg);
+    }
+
+    // E14 Clock step small (2s) on B
+    {
+        ScenarioConfig cfg = BaseScenario("E14_clock_step_small");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20 * 1000 * 1000ULL;
+        cfg.clock_step_b_us = 2000000;
+        sc.push_back(cfg);
+    }
+
+    // E15 Clock step large (30s) on B
+    {
+        ScenarioConfig cfg = BaseScenario("E15_clock_step_large");
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 30 * 1000 * 1000ULL;
+        cfg.clock_step_b_us = 30000000;
+        sc.push_back(cfg);
+    }
+
+    // E16 Clock step small (2s) on A (forward)
+    {
+        ScenarioConfig cfg = BaseScenario("E16_clock_step_small_a_fwd");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20 * 1000 * 1000ULL;
+        cfg.clock_step_a_us = 2000000;
+        sc.push_back(cfg);
+    }
+
+    // E136 Two-sided clock jump matrix (A+, B+)
+    {
+        ScenarioConfig cfg = BaseScenario("E136_clock_jump_matrix_pp");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20 * 1000 * 1000ULL;
+        cfg.clock_step_a_us = 2000000;
+        cfg.clock_step_b_us = 2000000;
+        sc.push_back(cfg);
+    }
+
+    // E137 Two-sided clock jump matrix (A+, B-)
+    {
+        ScenarioConfig cfg = BaseScenario("E137_clock_jump_matrix_pn");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20 * 1000 * 1000ULL;
+        cfg.clock_step_a_us = 2000000;
+        cfg.clock_step_b_us = -2000000;
+        sc.push_back(cfg);
+    }
+
+    // E138 Two-sided clock jump matrix (A-, B+)
+    {
+        ScenarioConfig cfg = BaseScenario("E138_clock_jump_matrix_np");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20 * 1000 * 1000ULL;
+        cfg.clock_step_a_us = -2000000;
+        cfg.clock_step_b_us = 2000000;
+        sc.push_back(cfg);
+    }
+
+    // E139 Two-sided clock jump matrix (A-, B-)
+    {
+        ScenarioConfig cfg = BaseScenario("E139_clock_jump_matrix_nn");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20 * 1000 * 1000ULL;
+        cfg.clock_step_a_us = -2000000;
+        cfg.clock_step_b_us = -2000000;
+        sc.push_back(cfg);
+    }
+
+    // E17 Clock step small (2s) on A (backward)
+    {
+        ScenarioConfig cfg = BaseScenario("E17_clock_step_small_a_back");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20 * 1000 * 1000ULL;
+        cfg.clock_step_a_us = -2000000;
+        sc.push_back(cfg);
+    }
+
+    // E18 Clock step large (30s) on A (forward)
+    {
+        ScenarioConfig cfg = BaseScenario("E18_clock_step_large_a_fwd");
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 30 * 1000 * 1000ULL;
+        cfg.clock_step_a_us = 30000000;
+        sc.push_back(cfg);
+    }
+
+    // E19 Clock step large (30s) on A (backward)
+    {
+        ScenarioConfig cfg = BaseScenario("E19_clock_step_large_a_back");
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 30 * 1000 * 1000ULL;
+        cfg.clock_step_a_us = -30000000;
+        sc.push_back(cfg);
+    }
+
+    // E20 Clock step small (2s) on B (backward)
+    {
+        ScenarioConfig cfg = BaseScenario("E20_clock_step_small_b_back");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20 * 1000 * 1000ULL;
+        cfg.clock_step_b_us = -2000000;
+        sc.push_back(cfg);
+    }
+
+    // E21 Clock step large (30s) on B (backward)
+    {
+        ScenarioConfig cfg = BaseScenario("E21_clock_step_large_b_back");
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 30 * 1000 * 1000ULL;
+        cfg.clock_step_b_us = -30000000;
+        sc.push_back(cfg);
+    }
+
+    // E63 Clock step 1s on A (forward)
+    {
+        ScenarioConfig cfg = BaseScenario("E63_clock_step_1s_a_fwd");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20 * 1000 * 1000ULL;
+        cfg.clock_step_a_us = 1000000;
+        sc.push_back(cfg);
+    }
+
+    // E64 Clock step 1s on A (backward)
+    {
+        ScenarioConfig cfg = BaseScenario("E64_clock_step_1s_a_back");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20 * 1000 * 1000ULL;
+        cfg.clock_step_a_us = -1000000;
+        sc.push_back(cfg);
+    }
+
+    // E65 Clock step 1s on B (forward)
+    {
+        ScenarioConfig cfg = BaseScenario("E65_clock_step_1s_b_fwd");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20 * 1000 * 1000ULL;
+        cfg.clock_step_b_us = 1000000;
+        sc.push_back(cfg);
+    }
+
+    // E66 Clock step 1s on B (backward)
+    {
+        ScenarioConfig cfg = BaseScenario("E66_clock_step_1s_b_back");
+        cfg.duration_us = 60 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 20 * 1000 * 1000ULL;
+        cfg.clock_step_b_us = -1000000;
+        sc.push_back(cfg);
+    }
+
+    // E67 Clock step 120s on A (forward)
+    {
+        ScenarioConfig cfg = BaseScenario("E67_clock_step_120s_a_fwd");
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 30 * 1000 * 1000ULL;
+        cfg.clock_step_a_us = 120000000;
+        sc.push_back(cfg);
+    }
+
+    // E68 Clock step 120s on A (backward)
+    {
+        ScenarioConfig cfg = BaseScenario("E68_clock_step_120s_a_back");
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 30 * 1000 * 1000ULL;
+        cfg.clock_step_a_us = -120000000;
+        sc.push_back(cfg);
+    }
+
+    // E69 Clock step 120s on B (forward)
+    {
+        ScenarioConfig cfg = BaseScenario("E69_clock_step_120s_b_fwd");
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 30 * 1000 * 1000ULL;
+        cfg.clock_step_b_us = 120000000;
+        sc.push_back(cfg);
+    }
+
+    // E70 Clock step 120s on B (backward)
+    {
+        ScenarioConfig cfg = BaseScenario("E70_clock_step_120s_b_back");
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 30 * 1000 * 1000ULL;
+        cfg.clock_step_b_us = -120000000;
+        sc.push_back(cfg);
+    }
+
+    // E27 Clock step quick (0.5s) on B (forward) - fast validation case
+    {
+        ScenarioConfig cfg = BaseScenario("E27_clock_step_quick");
+        cfg.duration_us = 200 * 1000ULL;
+        cfg.send_rate_hz = 50.0;
+        cfg.poll_rate_hz = 10.0;
+        cfg.mindelta_interval_us = 100000;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_enabled = true;
+        cfg.clock_step_time_us = 100 * 1000ULL;
+        cfg.clock_step_b_us = 2000000;
+        sc.push_back(cfg);
+    }
+
+    // E28 Noise floor quick (fast baseline sanity check)
+    {
+        ScenarioConfig cfg = BaseScenario("E28_noise_floor_quick");
+        cfg.duration_us = 200 * 1000ULL;
+        cfg.send_rate_hz = 50.0;
+        cfg.poll_rate_hz = 10.0;
+        cfg.mindelta_interval_us = 100000;
+        cfg.delay_ab.base_delay_us = 2000;
+        cfg.delay_ba.base_delay_us = 2000;
+        cfg.delay_ab.jitter_us = 0;
+        cfg.delay_ba.jitter_us = 0;
+        cfg.recv_noise_us = 50;
+        sc.push_back(cfg);
+    }
+
+    // E26 Clock step Monte Carlo (random time/magnitude on B)
+    {
+        ScenarioConfig cfg = BaseScenario("E26_clock_step_mc");
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_random = true;
+        cfg.clock_step_time_min_us = 10 * 1000 * 1000ULL;
+        cfg.clock_step_time_max_us = 60 * 1000 * 1000ULL;
+        cfg.clock_step_min_us = -30000000;
+        cfg.clock_step_max_us = 30000000;
+        sc.push_back(cfg);
+    }
+
+    // E30 Clock step Monte Carlo (random side/time/magnitude)
+    {
+        ScenarioConfig cfg = BaseScenario("E30_clock_step_mc_side");
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_random = true;
+        cfg.clock_step_random_side = true;
+        cfg.clock_step_time_min_us = 10 * 1000 * 1000ULL;
+        cfg.clock_step_time_max_us = 60 * 1000 * 1000ULL;
+        cfg.clock_step_min_us = -30000000;
+        cfg.clock_step_max_us = 30000000;
+        sc.push_back(cfg);
+    }
+
+    // E31 Drift ramp + clock step Monte Carlo (random side/time/magnitude)
+    {
+        ScenarioConfig cfg = BaseScenario("E31_drift_step_mc");
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.drift_ramp_start_us = 0;
+        cfg.drift_ramp_max_ppm = 200.0;
+        cfg.drift_ramp_ppm_per_s_a = 4.0;
+        cfg.drift_ramp_ppm_per_s_b = -4.0;
+        cfg.clock_step_random = true;
+        cfg.clock_step_random_side = true;
+        cfg.clock_step_time_min_us = 10 * 1000 * 1000ULL;
+        cfg.clock_step_time_max_us = 60 * 1000 * 1000ULL;
+        cfg.clock_step_min_us = -30000000;
+        cfg.clock_step_max_us = 30000000;
+        sc.push_back(cfg);
+    }
+
+    // E79 Clock step Monte Carlo (huge random side/time/magnitude)
+    {
+        ScenarioConfig cfg = BaseScenario("E79_clock_step_mc_huge");
+        cfg.duration_us = 180 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.clock_step_random = true;
+        cfg.clock_step_random_side = true;
+        cfg.clock_step_time_min_us = 10 * 1000 * 1000ULL;
+        cfg.clock_step_time_max_us = 90 * 1000 * 1000ULL;
+        cfg.clock_step_min_us = -120000000;
+        cfg.clock_step_max_us = 120000000;
+        sc.push_back(cfg);
+    }
+
+    // E81 Clock skew random-walk + drift step Monte Carlo
+    {
+        ScenarioConfig cfg = BaseScenario("E81_clock_skew_random_walk_mc");
+        // Stress test (excluded from core)
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.drift_rw_step_ppm = 4.0;
+        cfg.drift_rw_step_interval_us = 2000000;
+        cfg.drift_step_enabled = true;
+        cfg.drift_step_time_us = 40 * 1000 * 1000ULL;
+        cfg.drift_step_delta_ppm_a = 50.0;
+        cfg.drift_step_delta_ppm_b = -50.0;
+        sc.push_back(cfg);
+    }
+
+    // E102 Clock skew random-walk (no step)
+    {
+        ScenarioConfig cfg = BaseScenario("E102_clock_skew_random_walk");
+        // Stress test (excluded from core)
+        cfg.duration_us = 120 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 60000;
+        cfg.delay_ba.base_delay_us = 60000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.drift_rw_step_ppm = 3.0;
+        cfg.drift_rw_step_interval_us = 1000000;
+        sc.push_back(cfg);
+    }
+
+    // E22 Video jitter + congestion pulses (20–120ms RTT)
+    {
+        ScenarioConfig cfg = BaseScenario("E22_video_jitter_pulse");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.base_delay_us = 30000;
+        cfg.delay_ba.base_delay_us = 30000;
+        cfg.delay_ab.jitter_mode = JitterMode::LogNormal;
+        cfg.delay_ba.jitter_mode = JitterMode::LogNormal;
+        cfg.delay_ab.jitter_us = 4000;
+        cfg.delay_ba.jitter_us = 4000;
+        cfg.delay_ab.lognormal_sigma = 0.8;
+        cfg.delay_ba.lognormal_sigma = 0.8;
+        cfg.delay_ab.queue_amp_us = 30000;
+        cfg.delay_ba.queue_amp_us = 30000;
+        cfg.delay_ab.queue_period_us = 3000000;
+        cfg.delay_ba.queue_period_us = 3000000;
+        cfg.delay_ab.spike_prob = 0.003;
+        cfg.delay_ba.spike_prob = 0.003;
+        cfg.delay_ab.spike_delay_us = 80000;
+        cfg.delay_ba.spike_delay_us = 80000;
+        cfg.delay_ab.rw_step_interval_us = 5000000;
+        cfg.delay_ba.rw_step_interval_us = 5000000;
+        cfg.delay_ab.rw_step_us = 2000;
+        cfg.delay_ba.rw_step_us = 2000;
+        cfg.delay_ab.rw_max_us = 15000;
+        cfg.delay_ba.rw_max_us = 15000;
+        sc.push_back(cfg);
+    }
+
+    // E150 Regime-switching jitter (Markov)
+    {
+        ScenarioConfig cfg = BaseScenario("E150_regime_markov_jitter");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.markov_enabled = true;
+        cfg.delay_ba.markov_enabled = true;
+        cfg.delay_ab.markov_step_interval_us = 500000;
+        cfg.delay_ba.markov_step_interval_us = 500000;
+        cfg.delay_ab.markov_p_switch = 0.2;
+        cfg.delay_ba.markov_p_switch = 0.2;
+        cfg.delay_ab.markov_base_low_us = 30000;
+        cfg.delay_ab.markov_base_high_us = 30000;
+        cfg.delay_ba.markov_base_low_us = 30000;
+        cfg.delay_ba.markov_base_high_us = 30000;
+        cfg.delay_ab.markov_jitter_low_us = 1000;
+        cfg.delay_ab.markov_jitter_high_us = 8000;
+        cfg.delay_ba.markov_jitter_low_us = 1000;
+        cfg.delay_ba.markov_jitter_high_us = 8000;
+        sc.push_back(cfg);
+    }
+
+    // E151 Regime-switching congestion (Markov base delay)
+    {
+        ScenarioConfig cfg = BaseScenario("E151_regime_markov_congestion");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.markov_enabled = true;
+        cfg.delay_ba.markov_enabled = true;
+        cfg.delay_ab.markov_step_interval_us = 1000000;
+        cfg.delay_ba.markov_step_interval_us = 1000000;
+        cfg.delay_ab.markov_p_switch = 0.15;
+        cfg.delay_ba.markov_p_switch = 0.15;
+        cfg.delay_ab.markov_base_low_us = 30000;
+        cfg.delay_ab.markov_base_high_us = 60000;
+        cfg.delay_ba.markov_base_low_us = 30000;
+        cfg.delay_ba.markov_base_high_us = 60000;
+        cfg.delay_ab.markov_jitter_low_us = 2000;
+        cfg.delay_ab.markov_jitter_high_us = 7000;
+        cfg.delay_ba.markov_jitter_low_us = 2000;
+        cfg.delay_ba.markov_jitter_high_us = 7000;
+        sc.push_back(cfg);
+    }
+
+    // E152 Regime-switching path change (Markov RTT jump)
+    {
+        ScenarioConfig cfg = BaseScenario("E152_regime_markov_path");
+        cfg.duration_us = 90 * 1000 * 1000ULL;
+        cfg.delay_ab.markov_enabled = true;
+        cfg.delay_ba.markov_enabled = true;
+        cfg.delay_ab.markov_step_interval_us = 3000000;
+        cfg.delay_ba.markov_step_interval_us = 3000000;
+        cfg.delay_ab.markov_p_switch = 0.1;
+        cfg.delay_ba.markov_p_switch = 0.1;
+        cfg.delay_ab.markov_base_low_us = 20000;
+        cfg.delay_ab.markov_base_high_us = 80000;
+        cfg.delay_ba.markov_base_low_us = 20000;
+        cfg.delay_ba.markov_base_high_us = 80000;
+        cfg.delay_ab.markov_jitter_low_us = 1500;
+        cfg.delay_ab.markov_jitter_high_us = 6000;
+        cfg.delay_ba.markov_jitter_low_us = 1500;
+        cfg.delay_ba.markov_jitter_high_us = 6000;
+        sc.push_back(cfg);
+    }
+
+    for (auto& cfg : sc) {
+        if (ShouldExcludeFromCore(cfg)) {
+            cfg.core = false;
+        }
+    }
+
+    // Train/holdout split (stable by name)
+    const std::unordered_set<string> holdout = {
+        "E150_regime_markov_jitter",
+        "E151_regime_markov_congestion",
+        "E152_regime_markov_path",
+    };
+    for (auto& cfg : sc) {
+        cfg.train = (holdout.find(cfg.name) == holdout.end());
     }
 
     return sc;
@@ -2114,7 +13491,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             m.kind = kind;
             m.estimator = EstimatorKind::Median;
             m.discipline = DisciplineKind::Hybrid;
-            m.probe_rate_hz = 10.0;
+            m.probe_rate_hz = 1.0;
             add(m);
             return;
         }
@@ -2124,7 +13501,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
                 m.kind = kind;
                 m.estimator = est_list[ei];
                 m.discipline = disc_list[di];
-                m.probe_rate_hz = 10.0;
+                m.probe_rate_hz = 1.0;
                 add(m);
             }
         }
@@ -2141,6 +13518,6082 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
         m.estimator = EstimatorKind::Min;
         m.discipline = DisciplineKind::None;
         m.probe_rate_hz = 0.0;
+        add(m);
+    }
+    if (grid) {
+        const double neg_eps_list[] = {0.0, 50.0, 200.0};
+        const uint64_t max_list[] = {1000000, 2000000, 5000000};
+        const uint64_t min_list[] = {0, 25, 50};
+        for (size_t ni = 0; ni < sizeof(neg_eps_list) / sizeof(neg_eps_list[0]); ++ni) {
+            for (size_t mi = 0; mi < sizeof(max_list) / sizeof(max_list[0]); ++mi) {
+                for (size_t pi = 0; pi < sizeof(min_list) / sizeof(min_list[0]); ++pi) {
+                    MethodConfig m = base;
+                    m.kind = MethodKind::TimeSync;
+                    m.estimator = EstimatorKind::Min;
+                    m.discipline = DisciplineKind::None;
+                    m.probe_rate_hz = 0.0;
+                    m.ts24_plausibility = true;
+                    m.ts24_neg_eps_us = neg_eps_list[ni];
+                    m.ts24_delta_max_us = (double)max_list[mi];
+                    m.ts24_min_phys_us = (double)min_list[pi];
+                    const int max_s = (int)(max_list[mi] / 1000000);
+                    const int neg_us = (int)neg_eps_list[ni];
+                    const int min_us = (int)min_list[pi];
+                    m.variant_name = "plaus_n" + std::to_string(neg_us)
+                        + "_m" + std::to_string(max_s) + "s_p" + std::to_string(min_us);
+                    add(m);
+                }
+            }
+        }
+    }
+
+    // M4a1 - TimeSync quantile envelope
+    {
+        const double quantiles[] = {0.01, 0.05, 0.1};
+        for (size_t qi = 0; qi < sizeof(quantiles) / sizeof(quantiles[0]); ++qi) {
+            MethodConfig m = base;
+            m.kind = MethodKind::TimeSyncQuantile;
+            m.estimator = EstimatorKind::Min;
+            m.discipline = DisciplineKind::None;
+            m.probe_rate_hz = 0.0;
+            m.timesync_quantile = quantiles[qi];
+            if (quantiles[qi] <= 0.01) {
+                m.variant_name = "q01";
+            } else if (quantiles[qi] <= 0.05) {
+                m.variant_name = "q05";
+            } else {
+                m.variant_name = "q10";
+            }
+            add(m);
+        }
+
+        MethodConfig q01 = base;
+        q01.kind = MethodKind::TimeSyncQuantile;
+        q01.estimator = EstimatorKind::Min;
+        q01.discipline = DisciplineKind::None;
+        q01.probe_rate_hz = 0.0;
+        q01.timesync_quantile = 0.01;
+        q01.quantile_short = 0.05;
+        q01.stats_long_window_us = 60000000;
+        q01.stats_short_window_us = 2000000;
+
+        MethodConfig q01_cse = q01;
+        q01_cse.variant_name = "q01_cse";
+        q01_cse.quantile_use_cse = true;
+        q01_cse.quantile_cse_blend = 1.0;
+        q01_cse.cse_use_rtt_guard = false;
+        add(q01_cse);
+
+        MethodConfig q01_cse_blend = q01;
+        q01_cse_blend.variant_name = "q01_cse_blend";
+        q01_cse_blend.quantile_use_cse = true;
+        q01_cse_blend.quantile_cse_blend = 0.5;
+        q01_cse_blend.cse_use_rtt_guard = false;
+        add(q01_cse_blend);
+
+        MethodConfig q01_flip_reset = q01;
+        q01_flip_reset.variant_name = "q01_flip_reset";
+        q01_flip_reset.quantile_use_cse = true;
+        q01_flip_reset.quantile_flip_reset = true;
+        q01_flip_reset.quantile_flip_hold = true;
+        q01_flip_reset.quantile_flip_hold_us = 5000000;
+        q01_flip_reset.quantile_flip_n_consec = 2;
+        q01_flip_reset.quantile_flip_min_ppm = 10.0;
+        q01_flip_reset.cse_use_rtt_guard = false;
+        add(q01_flip_reset);
+
+        MethodConfig q01_flip_hold = q01;
+        q01_flip_hold.variant_name = "q01_flip_hold";
+        q01_flip_hold.quantile_use_cse = true;
+        q01_flip_hold.quantile_flip_hold = true;
+        q01_flip_hold.quantile_flip_hold_us = 5000000;
+        q01_flip_hold.quantile_flip_n_consec = 2;
+        q01_flip_hold.quantile_flip_min_ppm = 10.0;
+        q01_flip_hold.cse_use_rtt_guard = false;
+        add(q01_flip_hold);
+
+        MethodConfig q01_flip_shrink = q01;
+        q01_flip_shrink.variant_name = "q01_flip_shrink";
+        q01_flip_shrink.quantile_use_cse = true;
+        q01_flip_shrink.quantile_flip_shrink = true;
+        q01_flip_shrink.quantile_flip_window_us = 1000000;
+        q01_flip_shrink.quantile_flip_hold_us = 5000000;
+        q01_flip_shrink.quantile_flip_n_consec = 2;
+        q01_flip_shrink.quantile_flip_min_ppm = 10.0;
+        q01_flip_shrink.cse_use_rtt_guard = false;
+        add(q01_flip_shrink);
+
+        MethodConfig q01_flip_xor = q01;
+        q01_flip_xor.variant_name = "q01_flip_xor";
+        q01_flip_xor.quantile_use_cse = true;
+        q01_flip_xor.quantile_flip_reset = true;
+        q01_flip_xor.quantile_flip_use_xor = true;
+        q01_flip_xor.quantile_flip_hold_us = 5000000;
+        q01_flip_xor.quantile_flip_n_consec = 2;
+        q01_flip_xor.quantile_flip_min_ppm = 10.0;
+        q01_flip_xor.gsp_guard_min_us = 50.0;
+        q01_flip_xor.gsp_guard_k = 4.0;
+        q01_flip_xor.cse_use_rtt_guard = false;
+        add(q01_flip_xor);
+
+        MethodConfig q01_near_reset = q01;
+        q01_near_reset.variant_name = "q01_near_reset";
+        q01_near_reset.quantile_near_stale_reset = true;
+        q01_near_reset.quantile_near_stale_n_consec = 3;
+        q01_near_reset.quantile_flip_hold = true;
+        q01_near_reset.quantile_flip_hold_us = 5000000;
+        q01_near_reset.gsp_guard_min_us = 50.0;
+        q01_near_reset.gsp_guard_k = 4.0;
+        q01_near_reset.gsp_iqr_min_us = 200.0;
+        q01_near_reset.gsp_iqr_k = 10.0;
+        q01_near_reset.gsp_npkt_min = 20;
+        add(q01_near_reset);
+
+        MethodConfig q01_near_reset_cusum = q01_near_reset;
+        q01_near_reset_cusum.variant_name = "q01_near_reset_cusum";
+        q01_near_reset_cusum.quantile_cusum_gate = true;
+        q01_near_reset_cusum.cusum_k_us = 50.0;
+        q01_near_reset_cusum.cusum_h_us = 500.0;
+        q01_near_reset_cusum.cusum_hold_us = 5000000;
+        add(q01_near_reset_cusum);
+
+        MethodConfig q01_near_reset_cse = q01_near_reset;
+        q01_near_reset_cse.variant_name = "q01_near_reset_cse";
+        q01_near_reset_cse.quantile_use_cse = true;
+        q01_near_reset_cse.quantile_cse_blend = 1.0;
+        q01_near_reset_cse.cse_use_rtt_guard = false;
+        add(q01_near_reset_cse);
+
+        MethodConfig q01_near_reset_cse_blend = q01_near_reset;
+        q01_near_reset_cse_blend.variant_name = "q01_near_reset_cse_blend";
+        q01_near_reset_cse_blend.quantile_use_cse = true;
+        q01_near_reset_cse_blend.quantile_cse_blend = 0.5;
+        q01_near_reset_cse_blend.cse_use_rtt_guard = false;
+        add(q01_near_reset_cse_blend);
+
+        MethodConfig q01_near_reset_shrink = q01_near_reset;
+        q01_near_reset_shrink.variant_name = "q01_near_reset_shrink";
+        q01_near_reset_shrink.quantile_flip_shrink = true;
+        q01_near_reset_shrink.quantile_flip_window_us = 1000000;
+        q01_near_reset_shrink.quantile_flip_hold_us = 5000000;
+        add(q01_near_reset_shrink);
+
+        MethodConfig q01_near_reset_shrink_saw = q01_near_reset_shrink;
+        q01_near_reset_shrink_saw.variant_name = "q01_near_reset_shrink_saw";
+        q01_near_reset_shrink_saw.saw_use = true;
+        q01_near_reset_shrink_saw.saw_short_window_us = 10000000;
+        q01_near_reset_shrink_saw.saw_hold_us = 10000000;
+        add(q01_near_reset_shrink_saw);
+
+        MethodConfig q01_near_reset_shrink_rtt = q01_near_reset_shrink;
+        q01_near_reset_shrink_rtt.variant_name = "q01_near_reset_shrink_rtt";
+        q01_near_reset_shrink_rtt.gsp_use_rtt_guard = true;
+        add(q01_near_reset_shrink_rtt);
+
+        MethodConfig q01_near_reset_shrink_rtt_cse = q01_near_reset_shrink_rtt;
+        q01_near_reset_shrink_rtt_cse.variant_name = "q01_near_reset_shrink_rtt_cse";
+        q01_near_reset_shrink_rtt_cse.quantile_use_cse_gate = true;
+        add(q01_near_reset_shrink_rtt_cse);
+
+        MethodConfig q01_near_reset_shrink_xor = q01_near_reset_shrink;
+        q01_near_reset_shrink_xor.variant_name = "q01_near_reset_shrink_xor";
+        q01_near_reset_shrink_xor.quantile_flip_use_xor = true;
+        add(q01_near_reset_shrink_xor);
+
+        MethodConfig q01_near_reset_shrink_win5s = q01_near_reset_shrink;
+        q01_near_reset_shrink_win5s.variant_name = "q01_near_reset_shrink_win5s";
+        q01_near_reset_shrink_win5s.quantile_flip_window_us = 5000000;
+        q01_near_reset_shrink_win5s.quantile_flip_hold_us = 5000000;
+        add(q01_near_reset_shrink_win5s);
+
+        MethodConfig q01_near_reset_shrink_win10s = q01_near_reset_shrink;
+        q01_near_reset_shrink_win10s.variant_name = "q01_near_reset_shrink_win10s";
+        q01_near_reset_shrink_win10s.quantile_flip_window_us = 10000000;
+        q01_near_reset_shrink_win10s.quantile_flip_hold_us = 5000000;
+        add(q01_near_reset_shrink_win10s);
+
+        MethodConfig q01_near_reset_tilted = q01_near_reset;
+        q01_near_reset_tilted.variant_name = "q01_near_reset_tilted";
+        q01_near_reset_tilted.quantile_use_cse = true;
+        q01_near_reset_tilted.quantile_cse_blend = 1.0;
+        q01_near_reset_tilted.quantile_use_short_high = true;
+        q01_near_reset_tilted.quantile_short = 0.05;
+        q01_near_reset_tilted.quantile_flip_use_short = true;
+        q01_near_reset_tilted.quantile_flip_hold_us = 5000000;
+        q01_near_reset_tilted.cse_use_rtt_guard = false;
+        add(q01_near_reset_tilted);
+
+        MethodConfig q01_near_reset_flip_reset = q01_near_reset;
+        q01_near_reset_flip_reset.variant_name = "q01_near_reset_flip_reset";
+        q01_near_reset_flip_reset.quantile_use_cse = true;
+        q01_near_reset_flip_reset.quantile_flip_reset = true;
+        q01_near_reset_flip_reset.quantile_flip_hold = true;
+        q01_near_reset_flip_reset.quantile_flip_hold_us = 5000000;
+        q01_near_reset_flip_reset.quantile_flip_n_consec = 2;
+        q01_near_reset_flip_reset.quantile_flip_min_ppm = 10.0;
+        q01_near_reset_flip_reset.cse_use_rtt_guard = false;
+        add(q01_near_reset_flip_reset);
+
+        MethodConfig q01_near_reset_rttguard = q01_near_reset;
+        q01_near_reset_rttguard.variant_name = "q01_near_reset_rttguard";
+        q01_near_reset_rttguard.gsp_use_rtt_guard = true;
+        add(q01_near_reset_rttguard);
+
+        MethodConfig q01_near_reset_rttguard_strict = q01_near_reset_rttguard;
+        q01_near_reset_rttguard_strict.variant_name = "q01_near_reset_rttguard_strict";
+        q01_near_reset_rttguard_strict.rtt_guard_strict = true;
+        q01_near_reset_rttguard_strict.rtt_guard_min_window_us = 120000000;
+        q01_near_reset_rttguard_strict.rtt_guard_min_delta_us = 200.0;
+        add(q01_near_reset_rttguard_strict);
+
+        MethodConfig q01_near_reset_xor = q01_near_reset;
+        q01_near_reset_xor.variant_name = "q01_near_reset_xor";
+        q01_near_reset_xor.quantile_flip_use_xor = true;
+        add(q01_near_reset_xor);
+
+        MethodConfig q01_near_reset_timegate = q01_near_reset;
+        q01_near_reset_timegate.variant_name = "q01_near_reset_timegate";
+        q01_near_reset_timegate.quantile_near_stale_hold_us = 2000000;
+        add(q01_near_reset_timegate);
+
+        MethodConfig q01_near_reset_q05 = q01_near_reset;
+        q01_near_reset_q05.variant_name = "q01_near_reset_q05";
+        q01_near_reset_q05.quantile_use_short_high = true;
+        q01_near_reset_q05.quantile_short = 0.05;
+        q01_near_reset_q05.quantile_flip_use_short = true;
+        q01_near_reset_q05.quantile_flip_hold_us = 5000000;
+        add(q01_near_reset_q05);
+
+        MethodConfig q01_near_reset_win500 = q01_near_reset;
+        q01_near_reset_win500.variant_name = "q01_near_reset_win500";
+        q01_near_reset_win500.window_us = 500000;
+        add(q01_near_reset_win500);
+
+        MethodConfig q01_kbest = q01;
+        q01_kbest.variant_name = "q01_kbest";
+        q01_kbest.quantile_use_cse = true;
+        q01_kbest.quantile_use_short_high = true;
+        q01_kbest.quantile_flip_use_short = true;
+        q01_kbest.quantile_flip_hold_us = 5000000;
+        q01_kbest.quantile_flip_n_consec = 2;
+        q01_kbest.quantile_flip_min_ppm = 10.0;
+        q01_kbest.cse_use_rtt_guard = false;
+        add(q01_kbest);
+
+        MethodConfig q01_slope_reset = q01;
+        q01_slope_reset.variant_name = "q01_slope_reset";
+        q01_slope_reset.quantile_use_offset_slope = true;
+        q01_slope_reset.quantile_offset_slope_min_us_s = 50.0;
+        q01_slope_reset.quantile_flip_reset = true;
+        q01_slope_reset.quantile_flip_hold = true;
+        q01_slope_reset.quantile_flip_hold_us = 5000000;
+        q01_slope_reset.quantile_flip_n_consec = 2;
+        add(q01_slope_reset);
+    }
+
+    // M4a1b - TimeSync quantile swap (hysteresis)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncQuantileSwap;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.quantile_swap_low = 0.0;
+        m.quantile_swap_high = 0.1;
+        m.quantile_swap_jitter_enter_us = 200.0;
+        m.quantile_swap_jitter_exit_us = 120.0;
+        m.quantile_swap_iqr_enter_us = 400.0;
+        m.quantile_swap_iqr_exit_us = 250.0;
+        m.timesync_quantile = m.quantile_swap_low;
+        add(m);
+
+        MethodConfig hi05 = m;
+        hi05.variant_name = "hi0.05";
+        hi05.quantile_swap_high = 0.05;
+        add(hi05);
+
+        MethodConfig q01q05 = m;
+        q01q05.variant_name = "q01q05";
+        q01q05.quantile_swap_low = 0.01;
+        q01q05.quantile_swap_high = 0.05;
+        q01q05.timesync_quantile = q01q05.quantile_swap_low;
+        add(q01q05);
+
+        MethodConfig tight = m;
+        tight.variant_name = "tight";
+        tight.quantile_swap_jitter_enter_us = 150.0;
+        tight.quantile_swap_jitter_exit_us = 90.0;
+        tight.quantile_swap_iqr_enter_us = 300.0;
+        tight.quantile_swap_iqr_exit_us = 200.0;
+        add(tight);
+
+        MethodConfig env = m;
+        env.variant_name = "env_p05_p10";
+        env.quantile_swap_low = 0.05;
+        env.quantile_swap_high = 0.10;
+        env.timesync_quantile = env.quantile_swap_low;
+        add(env);
+
+        if (grid) {
+            struct SwapParams {
+                double jitter_enter;
+                double jitter_exit;
+                double iqr_enter;
+                double iqr_exit;
+                const char* tag;
+            };
+            const SwapParams params[] = {
+                {150.0, 90.0, 300.0, 200.0, "tight"},
+                {200.0, 120.0, 400.0, 250.0, "base"},
+                {250.0, 150.0, 500.0, 300.0, "loose"},
+            };
+            const double highs[] = {0.05, 0.10};
+            for (const auto& p : params) {
+                for (double hi : highs) {
+                    MethodConfig g = m;
+                    g.quantile_swap_jitter_enter_us = p.jitter_enter;
+                    g.quantile_swap_jitter_exit_us = p.jitter_exit;
+                    g.quantile_swap_iqr_enter_us = p.iqr_enter;
+                    g.quantile_swap_iqr_exit_us = p.iqr_exit;
+                    g.quantile_swap_high = hi;
+                    g.timesync_quantile = g.quantile_swap_low;
+                    g.variant_name = std::string("grid_") + p.tag + "_hi" + std::to_string(hi);
+                    add(g);
+                }
+            }
+        }
+    }
+
+    // M4a1d - TimeSync block-min quantile (clock-filter style)
+    {
+        const double quantiles[] = {0.01, 0.05, 0.10};
+        for (size_t qi = 0; qi < sizeof(quantiles) / sizeof(quantiles[0]); ++qi) {
+            MethodConfig m = base;
+            m.kind = MethodKind::TimeSyncBlockQuantile;
+            m.estimator = EstimatorKind::Min;
+            m.discipline = DisciplineKind::None;
+            m.probe_rate_hz = 0.0;
+            m.stats_long_window_us = 60000000;
+            m.stats_short_window_us = 0;
+            m.block_quantile = quantiles[qi];
+            m.block_min_bins = 5;
+            if (quantiles[qi] <= 0.01) {
+                m.variant_name = "q01";
+            } else if (quantiles[qi] <= 0.05) {
+                m.variant_name = "q05";
+            } else {
+                m.variant_name = "q10";
+            }
+            add(m);
+        }
+    }
+
+    // M4a1c - TimeSync adaptive quantile by near-hit ratio
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncQuantileNearHit;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.quantile_near_low = 0.0;
+        m.quantile_near_high = 0.1;
+        m.quantile_near_enter_ratio = 0.05;
+        m.quantile_near_exit_ratio = 0.20;
+        m.quantile_near_min_samples = 20;
+        m.timesync_quantile = m.quantile_near_low;
+        add(m);
+
+        MethodConfig hi05 = m;
+        hi05.variant_name = "hi0.05";
+        hi05.quantile_near_high = 0.05;
+        add(hi05);
+
+        MethodConfig looser = m;
+        looser.variant_name = "loose";
+        looser.quantile_near_enter_ratio = 0.02;
+        looser.quantile_near_exit_ratio = 0.30;
+        add(looser);
+
+        MethodConfig qnh_cse = hi05;
+        qnh_cse.variant_name = "qnh_cse";
+        qnh_cse.quantile_use_cse = true;
+        qnh_cse.quantile_cse_blend = 1.0;
+        qnh_cse.cse_use_rtt_guard = false;
+        add(qnh_cse);
+
+        MethodConfig qnh_cse_blend = hi05;
+        qnh_cse_blend.variant_name = "qnh_cse_blend";
+        qnh_cse_blend.quantile_use_cse = true;
+        qnh_cse_blend.quantile_cse_blend = 0.5;
+        qnh_cse_blend.cse_use_rtt_guard = false;
+        add(qnh_cse_blend);
+
+        MethodConfig qnh_near_reset = hi05;
+        qnh_near_reset.variant_name = "qnh_near_reset";
+        qnh_near_reset.quantile_near_stale_reset = true;
+        qnh_near_reset.quantile_near_stale_n_consec = 3;
+        qnh_near_reset.quantile_flip_hold = true;
+        qnh_near_reset.quantile_flip_hold_us = 5000000;
+        qnh_near_reset.gsp_guard_min_us = 50.0;
+        qnh_near_reset.gsp_guard_k = 4.0;
+        qnh_near_reset.gsp_iqr_min_us = 200.0;
+        qnh_near_reset.gsp_iqr_k = 10.0;
+        qnh_near_reset.gsp_npkt_min = 20;
+        add(qnh_near_reset);
+
+        MethodConfig qnh_near_reset_xor = qnh_near_reset;
+        qnh_near_reset_xor.variant_name = "qnh_near_reset_xor";
+        qnh_near_reset_xor.quantile_flip_use_xor = true;
+        add(qnh_near_reset_xor);
+
+        MethodConfig qnh_short1s = hi05;
+        qnh_short1s.variant_name = "qnh_short1s";
+        qnh_short1s.stats_short_window_us = 1000000;
+        add(qnh_short1s);
+
+        MethodConfig qnh_min100 = hi05;
+        qnh_min100.variant_name = "qnh_min100";
+        qnh_min100.quantile_near_min_samples = 100;
+        add(qnh_min100);
+
+        MethodConfig qnh_enter2_exit10 = hi05;
+        qnh_enter2_exit10.variant_name = "qnh_enter2_exit10";
+        qnh_enter2_exit10.quantile_near_enter_ratio = 0.02;
+        qnh_enter2_exit10.quantile_near_exit_ratio = 0.10;
+        add(qnh_enter2_exit10);
+
+        MethodConfig qnh_high10 = hi05;
+        qnh_high10.variant_name = "qnh_high0p10";
+        qnh_high10.quantile_near_high = 0.10;
+        add(qnh_high10);
+
+        MethodConfig qnh_low01 = hi05;
+        qnh_low01.variant_name = "qnh_low0p01";
+        qnh_low01.quantile_near_low = 0.01;
+        qnh_low01.timesync_quantile = 0.01;
+        add(qnh_low01);
+
+        MethodConfig qnh_hold_short = qnh_near_reset;
+        qnh_hold_short.variant_name = "qnh_hold_short";
+        qnh_hold_short.quantile_use_short_high = true;
+        qnh_hold_short.quantile_short = 0.05;
+        qnh_hold_short.quantile_flip_use_short = true;
+        qnh_hold_short.quantile_flip_hold_us = 5000000;
+        add(qnh_hold_short);
+    }
+
+    // M4a1d - TimeSync adaptive quantile by IQR
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncQuantileAdaptive;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.quantile_adapt_low = 0.01;
+        m.quantile_adapt_mid = 0.05;
+        m.quantile_adapt_high = 0.10;
+        m.quantile_adapt_iqr_low_us = 200.0;
+        m.quantile_adapt_iqr_high_us = 800.0;
+        m.timesync_quantile = m.quantile_adapt_low;
+        m.variant_name = "iqr_q01_q05_q10";
+        add(m);
+
+        MethodConfig tight = m;
+        tight.variant_name = "iqr_tight";
+        tight.quantile_adapt_iqr_low_us = 100.0;
+        tight.quantile_adapt_iqr_high_us = 400.0;
+        add(tight);
+
+        MethodConfig loose = m;
+        loose.variant_name = "iqr_loose";
+        loose.quantile_adapt_iqr_low_us = 300.0;
+        loose.quantile_adapt_iqr_high_us = 1000.0;
+        add(loose);
+
+        MethodConfig hold2s = m;
+        hold2s.variant_name = "iqr_hold2s";
+        hold2s.quantile_adapt_hold_us = 2000000;
+        hold2s.quantile_adapt_min_samples = 20;
+        add(hold2s);
+
+        MethodConfig hold5s = m;
+        hold5s.variant_name = "iqr_hold5s_min50";
+        hold5s.quantile_adapt_hold_us = 5000000;
+        hold5s.quantile_adapt_min_samples = 50;
+        add(hold5s);
+
+        MethodConfig hold5s_min100 = m;
+        hold5s_min100.variant_name = "iqr_hold5s_min100";
+        hold5s_min100.quantile_adapt_hold_us = 5000000;
+        hold5s_min100.quantile_adapt_min_samples = 100;
+        add(hold5s_min100);
+    }
+
+    // M4a1b - TimeSync hybrid baseline + drift detector (fast window switch)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncHybrid;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.short_window_us = 200000;
+        m.hybrid_trigger_us = 50.0;
+        m.hybrid_var_threshold_us2 = 10000.0;
+        m.hybrid_window_size = 20;
+        m.hybrid_sign_count = 3;
+        m.hybrid_hold_us = 1000000;
+        m.robust_delta_window_size = 0;
+        add(m);
+
+        MethodConfig strict = m;
+        strict.variant_name = "t50_s5";
+        strict.hybrid_sign_count = 5;
+        add(strict);
+
+        MethodConfig t25 = m;
+        t25.variant_name = "t25_s5";
+        t25.hybrid_trigger_us = 25.0;
+        t25.hybrid_sign_count = 5;
+        add(t25);
+
+        MethodConfig robust = m;
+        robust.variant_name = "robust";
+        robust.robust_delta_window_size = 20;
+        robust.robust_delta_z = 3.0;
+        robust.robust_delta_floor_us = 50.0;
+        add(robust);
+    }
+
+    // M4a1e - TimeSync multi-timescale ensemble (fast + slow blend)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncEnsemble;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.short_window_us = 200000;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.ensemble_blend = 0.5;
+        m.ensemble_use_confidence = true;
+        m.ensemble_npkt_min = 20;
+        m.ensemble_iqr_min_us = 200.0;
+        m.ensemble_iqr_k = 10.0;
+        add(m);
+
+        MethodConfig w02 = m;
+        w02.variant_name = "w02";
+        w02.ensemble_blend = 0.2;
+        add(w02);
+
+        MethodConfig w08 = m;
+        w08.variant_name = "w08";
+        w08.ensemble_blend = 0.8;
+        add(w08);
+
+        MethodConfig noconf = m;
+        noconf.variant_name = "noconf";
+        noconf.ensemble_use_confidence = false;
+        add(noconf);
+    }
+
+    // M4a1c - TimeSync sloped-floor skew estimate (min-delta regression)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncSloped;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.sloped_window_us = 5000000;
+        m.sloped_min_samples = 5;
+        m.sloped_clamp_ppm = 200.0;
+        add(m);
+
+        MethodConfig w2 = m;
+        w2.variant_name = "w2s";
+        w2.sloped_window_us = 2000000;
+        add(w2);
+
+        MethodConfig w10 = m;
+        w10.variant_name = "w10s";
+        w10.sloped_window_us = 10000000;
+        add(w10);
+
+        MethodConfig w10_gate = w10;
+        w10_gate.variant_name = "w10_gate";
+        w10_gate.stats_short_window_us = 2000000;
+        w10_gate.sloped_gate_iqr_us = 300.0;
+        w10_gate.sloped_gate_min_samples = 20;
+        add(w10_gate);
+
+        MethodConfig w2to10 = w2;
+        w2to10.variant_name = "w2to10";
+        w2to10.sloped_window_min_us = 2000000;
+        w2to10.sloped_window_max_us = 10000000;
+        w2to10.sloped_window_step_us = 1000000;
+        w2to10.sloped_window_adaptive_grow = true;
+        w2to10.sloped_window_adaptive_shrink = false;
+        w2to10.stats_short_window_us = 2000000;
+        w2to10.sloped_gate_iqr_us = 300.0;
+        w2to10.sloped_gate_min_samples = 20;
+        add(w2to10);
+
+        MethodConfig w2to10_shrink = w2to10;
+        w2to10_shrink.variant_name = "w2to10_shrink";
+        w2to10_shrink.sloped_window_adaptive_shrink = true;
+        add(w2to10_shrink);
+
+        MethodConfig blend_w2w10 = w10;
+        blend_w2w10.variant_name = "blend_w2w10";
+        blend_w2w10.sloped_blend_fast_us = 2000000;
+        blend_w2w10.sloped_blend_slow_us = 10000000;
+        blend_w2w10.sloped_blend_alpha = 0.6;
+        blend_w2w10.stats_short_window_us = 2000000;
+        add(blend_w2w10);
+    }
+
+    // M4a2 - TimeSync + skew discipline
+    {
+        // PLL is included for comparison; FLL/Hybrid/Kalman estimate skew.
+        const DisciplineKind skew_disc_list[] = {
+            DisciplineKind::PLL,
+            DisciplineKind::FLL,
+            DisciplineKind::Hybrid,
+            DisciplineKind::Kalman
+        };
+        if (!grid) {
+            MethodConfig m = base;
+            m.kind = MethodKind::TimeSyncSkew;
+            m.estimator = EstimatorKind::Median;
+            m.discipline = DisciplineKind::Hybrid;
+            m.probe_rate_hz = 0.0;
+            add(m);
+
+            MethodConfig kalman_ss = m;
+            kalman_ss.variant_name = "kalman_ss";
+            kalman_ss.discipline = DisciplineKind::StateSpace;
+            add(kalman_ss);
+        } else {
+            for (size_t di = 0; di < sizeof(skew_disc_list)/sizeof(skew_disc_list[0]); ++di) {
+                MethodConfig m = base;
+                m.kind = MethodKind::TimeSyncSkew;
+                m.estimator = EstimatorKind::Median;
+                m.discipline = skew_disc_list[di];
+                m.probe_rate_hz = 0.0;
+                add(m);
+            }
+        }
+    }
+
+    // M4a2b - Skew-aware baseline (fixed FLL)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncSkew;
+        m.estimator = EstimatorKind::Median;
+        m.discipline = DisciplineKind::FLL;
+        m.variant_name = "baseline_fll";
+        m.probe_rate_hz = 0.0;
+        add(m);
+    }
+
+    // M4a3 - TimeSync skew via regression on MinDelta samples
+    {
+        const DisciplineKind skew_reg_disc_list[] = {
+            DisciplineKind::None,
+            DisciplineKind::Hybrid,
+            DisciplineKind::Kalman
+        };
+        if (!grid) {
+            MethodConfig m = base;
+            m.kind = MethodKind::TimeSyncSkewReg;
+            m.estimator = EstimatorKind::Regression;
+            m.discipline = DisciplineKind::Hybrid;
+            m.probe_rate_hz = 0.0;
+            add(m);
+
+            MethodConfig kalman_ss = m;
+            kalman_ss.variant_name = "kalman_ss";
+            kalman_ss.discipline = DisciplineKind::StateSpace;
+            add(kalman_ss);
+
+            MethodConfig theilsen = m;
+            theilsen.variant_name = "theilsen";
+            theilsen.estimator = EstimatorKind::RobustRegression;
+            add(theilsen);
+        } else {
+            for (size_t di = 0; di < sizeof(skew_reg_disc_list)/sizeof(skew_reg_disc_list[0]); ++di) {
+                MethodConfig m = base;
+                m.kind = MethodKind::TimeSyncSkewReg;
+                m.estimator = EstimatorKind::Regression;
+                m.discipline = skew_reg_disc_list[di];
+                m.probe_rate_hz = 0.0;
+                add(m);
+            }
+        }
+    }
+
+    // M4a4 - TimeSync adaptive drift window
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncAdaptive;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        add(m);
+
+        MethodConfig robust = m;
+        robust.variant_name = "robust";
+        robust.robust_delta_window_size = 20;
+        robust.robust_delta_z = 3.0;
+        robust.robust_delta_floor_us = 50.0;
+        add(robust);
+
+        MethodConfig fast = m;
+        fast.variant_name = "t50";
+        fast.adaptive_trigger_us = 50.0;
+        add(fast);
+
+        MethodConfig at50_rtt_combo = fast;
+        at50_rtt_combo.variant_name = "at50_rtt_combo";
+        at50_rtt_combo.stats_long_window_us = 60000000;
+        at50_rtt_combo.stats_short_window_us = 2000000;
+        at50_rtt_combo.adaptive_use_rtt_delta = true;
+        at50_rtt_combo.adaptive_rtt_delta_us = 500.0;
+        at50_rtt_combo.adaptive_use_rtt_iqr = true;
+        at50_rtt_combo.adaptive_rtt_iqr_us = 800.0;
+        add(at50_rtt_combo);
+
+        MethodConfig at50_rtt_strict = fast;
+        at50_rtt_strict.variant_name = "at50_rtt_strict";
+        at50_rtt_strict.stats_long_window_us = 60000000;
+        at50_rtt_strict.stats_short_window_us = 2000000;
+        at50_rtt_strict.adaptive_use_rtt_delta = true;
+        at50_rtt_strict.adaptive_rtt_delta_us = 300.0;
+        at50_rtt_strict.adaptive_use_rtt_iqr = true;
+        at50_rtt_strict.adaptive_rtt_iqr_us = 500.0;
+        add(at50_rtt_strict);
+
+        MethodConfig at50_gsp = fast;
+        at50_gsp.variant_name = "at50_gsp";
+        at50_gsp.adaptive_use_gsp_trigger = true;
+        at50_gsp.gsp_guard_min_us = 50.0;
+        at50_gsp.gsp_guard_k = 4.0;
+        at50_gsp.gsp_iqr_min_us = 200.0;
+        at50_gsp.gsp_iqr_k = 10.0;
+        at50_gsp.gsp_gnear_min_us = 25.0;
+        at50_gsp.gsp_gnear_k = 2.0;
+        at50_gsp.gsp_npkt_min = 20;
+        at50_gsp.gsp_n_consec = 3;
+        at50_gsp.gsp_age_ok_us = 3000000;
+        add(at50_gsp);
+
+        MethodConfig at50_stepguard = fast;
+        at50_stepguard.variant_name = "at50_stepguard";
+        at50_stepguard.adaptive_use_stepguard = true;
+        at50_stepguard.step_threshold_us = 1000.0;
+        at50_stepguard.step_n_consec = 2;
+        at50_stepguard.step_npkt_min = 20;
+        at50_stepguard.step_iqr_min_us = 200.0;
+        at50_stepguard.step_iqr_k = 10.0;
+        at50_stepguard.step_gnear_min_us = 50.0;
+        at50_stepguard.step_gnear_k = 2.0;
+        at50_stepguard.step_use_rtt_guard = true;
+        add(at50_stepguard);
+
+        MethodConfig at50_jitter = fast;
+        at50_jitter.variant_name = "at50_jitter";
+        at50_jitter.adaptive_trigger_use_jitter = true;
+        at50_jitter.adaptive_trigger_jitter_min_us = 100.0;
+        at50_jitter.adaptive_trigger_jitter_k = 2.0;
+        add(at50_jitter);
+
+        MethodConfig at50_cnt3 = fast;
+        at50_cnt3.variant_name = "at50_cnt3";
+        at50_cnt3.adaptive_trigger_count_req = 3;
+        add(at50_cnt3);
+
+        MethodConfig at50_shrink = fast;
+        at50_shrink.variant_name = "at50_shrink0p5";
+        at50_shrink.adaptive_shrink_ratio = 0.5;
+        add(at50_shrink);
+
+        MethodConfig at50_grow = fast;
+        at50_grow.variant_name = "at50_grow1p5";
+        at50_grow.adaptive_expand_ratio = 1.5;
+        add(at50_grow);
+
+        MethodConfig at50_cse = fast;
+        at50_cse.variant_name = "at50_cse";
+        at50_cse.adaptive_use_cse_trigger = true;
+        at50_cse.adaptive_skew_trigger_ppm = 25.0;
+        at50_cse.adaptive_age_trigger_us = 2000000;
+        add(at50_cse);
+
+        MethodConfig at50_age = fast;
+        at50_age.variant_name = "at50_age";
+        at50_age.adaptive_use_cse_trigger = true;
+        at50_age.adaptive_skew_trigger_ppm = 10.0;
+        at50_age.adaptive_age_trigger_us = 5000000;
+        add(at50_age);
+
+        MethodConfig slow = m;
+        slow.variant_name = "t200";
+        slow.adaptive_trigger_us = 200.0;
+        add(slow);
+
+        MethodConfig trig500 = m;
+        trig500.variant_name = "t500";
+        trig500.adaptive_trigger_us = 500.0;
+        add(trig500);
+
+        MethodConfig min500 = m;
+        min500.variant_name = "min500ms";
+        min500.min_window_floor_us = 500000;
+        add(min500);
+
+        MethodConfig stationary = m;
+        stationary.variant_name = "stationary";
+        stationary.stationary_var_max_us2 = 25000.0;
+        stationary.stationary_delta_max_us = 500.0;
+        stationary.stationary_window_size = 20;
+        add(stationary);
+
+        MethodConfig rtt = min500;
+        rtt.variant_name = "rtt500";
+        rtt.stats_long_window_us = 60000000;
+        rtt.stats_short_window_us = 2000000;
+        rtt.adaptive_use_rtt_delta = true;
+        rtt.adaptive_rtt_delta_us = 500.0;
+        add(rtt);
+
+        MethodConfig rttiqr = min500;
+        rttiqr.variant_name = "rttiqr800";
+        rttiqr.stats_long_window_us = 60000000;
+        rttiqr.stats_short_window_us = 2000000;
+        rttiqr.adaptive_use_rtt_iqr = true;
+        rttiqr.adaptive_rtt_iqr_us = 800.0;
+        add(rttiqr);
+
+        MethodConfig rttiqr600 = rttiqr;
+        rttiqr600.variant_name = "rttiqr600";
+        rttiqr600.adaptive_rtt_iqr_us = 600.0;
+        add(rttiqr600);
+
+        MethodConfig rttiqr700 = rttiqr;
+        rttiqr700.variant_name = "rttiqr700";
+        rttiqr700.adaptive_rtt_iqr_us = 700.0;
+        add(rttiqr700);
+
+        MethodConfig rttiqr900 = rttiqr;
+        rttiqr900.variant_name = "rttiqr900";
+        rttiqr900.adaptive_rtt_iqr_us = 900.0;
+        add(rttiqr900);
+
+        MethodConfig rttiqr1000 = rttiqr;
+        rttiqr1000.variant_name = "rttiqr1000";
+        rttiqr1000.adaptive_rtt_iqr_us = 1000.0;
+        add(rttiqr1000);
+
+        MethodConfig rttiqr_combo = rttiqr;
+        rttiqr_combo.variant_name = "rttiqr_combo";
+        rttiqr_combo.adaptive_use_rtt_delta = true;
+        rttiqr_combo.adaptive_rtt_delta_us = 500.0;
+        add(rttiqr_combo);
+
+        MethodConfig rttiqr_jit = rttiqr;
+        rttiqr_jit.variant_name = "rttiqr_jitk3";
+        rttiqr_jit.adaptive_trigger_use_jitter = true;
+        rttiqr_jit.adaptive_trigger_jitter_min_us = 100.0;
+        rttiqr_jit.adaptive_trigger_jitter_k = 3.0;
+        add(rttiqr_jit);
+
+        MethodConfig rttiqr_cnt3 = rttiqr;
+        rttiqr_cnt3.variant_name = "rttiqr_cnt3";
+        rttiqr_cnt3.adaptive_trigger_count_req = 3;
+        add(rttiqr_cnt3);
+
+        MethodConfig rttiqr_cnt3_combo = rttiqr_cnt3;
+        rttiqr_cnt3_combo.variant_name = "rttiqr_cnt3_combo";
+        rttiqr_cnt3_combo.adaptive_use_rtt_delta = true;
+        rttiqr_cnt3_combo.adaptive_rtt_delta_us = 500.0;
+        add(rttiqr_cnt3_combo);
+
+        MethodConfig rttiqr_cnt3_jit = rttiqr_cnt3;
+        rttiqr_cnt3_jit.variant_name = "rttiqr_cnt3_jitk3";
+        rttiqr_cnt3_jit.adaptive_trigger_use_jitter = true;
+        rttiqr_cnt3_jit.adaptive_trigger_jitter_min_us = 100.0;
+        rttiqr_cnt3_jit.adaptive_trigger_jitter_k = 3.0;
+        add(rttiqr_cnt3_jit);
+
+        MethodConfig rttiqr_cnt3_short1s = rttiqr_cnt3;
+        rttiqr_cnt3_short1s.variant_name = "rttiqr_cnt3_short1s";
+        rttiqr_cnt3_short1s.stats_short_window_us = 1000000;
+        add(rttiqr_cnt3_short1s);
+
+        MethodConfig rttiqr_cnt3_short4s = rttiqr_cnt3;
+        rttiqr_cnt3_short4s.variant_name = "rttiqr_cnt3_short4s";
+        rttiqr_cnt3_short4s.stats_short_window_us = 4000000;
+        add(rttiqr_cnt3_short4s);
+
+        MethodConfig rttiqr_cnt3_stepguard = rttiqr_cnt3;
+        rttiqr_cnt3_stepguard.variant_name = "rttiqr_cnt3_stepguard";
+        rttiqr_cnt3_stepguard.adaptive_use_stepguard = true;
+        rttiqr_cnt3_stepguard.step_threshold_us = 1000.0;
+        rttiqr_cnt3_stepguard.step_n_consec = 2;
+        rttiqr_cnt3_stepguard.step_npkt_min = 20;
+        rttiqr_cnt3_stepguard.step_iqr_min_us = 200.0;
+        rttiqr_cnt3_stepguard.step_iqr_k = 10.0;
+        rttiqr_cnt3_stepguard.step_gnear_min_us = 50.0;
+        rttiqr_cnt3_stepguard.step_gnear_k = 2.0;
+        rttiqr_cnt3_stepguard.step_use_rtt_guard = true;
+        add(rttiqr_cnt3_stepguard);
+
+        MethodConfig rttiqr_cnt3_gsp = rttiqr_cnt3;
+        rttiqr_cnt3_gsp.variant_name = "rttiqr_cnt3_gsp";
+        rttiqr_cnt3_gsp.adaptive_use_gsp_trigger = true;
+        rttiqr_cnt3_gsp.gsp_guard_min_us = 50.0;
+        rttiqr_cnt3_gsp.gsp_guard_k = 4.0;
+        rttiqr_cnt3_gsp.gsp_iqr_min_us = 200.0;
+        rttiqr_cnt3_gsp.gsp_iqr_k = 10.0;
+        rttiqr_cnt3_gsp.gsp_gnear_min_us = 25.0;
+        rttiqr_cnt3_gsp.gsp_gnear_k = 2.0;
+        rttiqr_cnt3_gsp.gsp_npkt_min = 20;
+        rttiqr_cnt3_gsp.gsp_n_consec = 3;
+        rttiqr_cnt3_gsp.gsp_age_ok_us = 3000000;
+        add(rttiqr_cnt3_gsp);
+
+        MethodConfig rttiqr_cnt3_shrink = rttiqr_cnt3;
+        rttiqr_cnt3_shrink.variant_name = "rttiqr_cnt3_shrink0p5";
+        rttiqr_cnt3_shrink.adaptive_shrink_ratio = 0.5;
+        add(rttiqr_cnt3_shrink);
+
+        MethodConfig rttiqr_cnt3_grow = rttiqr_cnt3;
+        rttiqr_cnt3_grow.variant_name = "rttiqr_cnt3_grow1p25";
+        rttiqr_cnt3_grow.adaptive_expand_ratio = 1.25;
+        add(rttiqr_cnt3_grow);
+
+        MethodConfig rttiqr_short1s = rttiqr;
+        rttiqr_short1s.variant_name = "rttiqr_short1s";
+        rttiqr_short1s.stats_short_window_us = 1000000;
+        add(rttiqr_short1s);
+
+        MethodConfig rttiqr_short4s = rttiqr;
+        rttiqr_short4s.variant_name = "rttiqr_short4s";
+        rttiqr_short4s.stats_short_window_us = 4000000;
+        add(rttiqr_short4s);
+
+        MethodConfig rttiqr_step = rttiqr;
+        rttiqr_step.variant_name = "rttiqr_stepguard";
+        rttiqr_step.adaptive_use_stepguard = true;
+        rttiqr_step.step_threshold_us = 1000.0;
+        rttiqr_step.step_n_consec = 2;
+        rttiqr_step.step_npkt_min = 20;
+        rttiqr_step.step_iqr_min_us = 200.0;
+        rttiqr_step.step_iqr_k = 10.0;
+        rttiqr_step.step_gnear_min_us = 50.0;
+        rttiqr_step.step_gnear_k = 2.0;
+        rttiqr_step.step_use_rtt_guard = true;
+        add(rttiqr_step);
+
+        MethodConfig rttiqr_gsp = rttiqr;
+        rttiqr_gsp.variant_name = "rttiqr_gsp";
+        rttiqr_gsp.adaptive_use_gsp_trigger = true;
+        rttiqr_gsp.gsp_guard_min_us = 50.0;
+        rttiqr_gsp.gsp_guard_k = 4.0;
+        rttiqr_gsp.gsp_iqr_min_us = 200.0;
+        rttiqr_gsp.gsp_iqr_k = 10.0;
+        rttiqr_gsp.gsp_gnear_min_us = 25.0;
+        rttiqr_gsp.gsp_gnear_k = 2.0;
+        rttiqr_gsp.gsp_npkt_min = 20;
+        rttiqr_gsp.gsp_n_consec = 3;
+        rttiqr_gsp.gsp_age_ok_us = 3000000;
+        add(rttiqr_gsp);
+
+        MethodConfig rttiqr_shrink = rttiqr;
+        rttiqr_shrink.variant_name = "rttiqr_shrink0p5";
+        rttiqr_shrink.adaptive_shrink_ratio = 0.5;
+        add(rttiqr_shrink);
+
+        MethodConfig rttiqr_grow = rttiqr;
+        rttiqr_grow.variant_name = "rttiqr_grow1p25";
+        rttiqr_grow.adaptive_expand_ratio = 1.25;
+        add(rttiqr_grow);
+
+        MethodConfig gsp = min500;
+        gsp.variant_name = "gsp";
+        gsp.stats_long_window_us = 60000000;
+        gsp.stats_short_window_us = 2000000;
+        gsp.adaptive_use_gsp_trigger = true;
+        gsp.gsp_guard_min_us = 50.0;
+        gsp.gsp_guard_k = 4.0;
+        gsp.gsp_iqr_min_us = 200.0;
+        gsp.gsp_iqr_k = 10.0;
+        gsp.gsp_gnear_min_us = 25.0;
+        gsp.gsp_gnear_k = 2.0;
+        gsp.gsp_npkt_min = 20;
+        gsp.gsp_n_consec = 3;
+        gsp.gsp_age_ok_us = 3000000;
+        add(gsp);
+
+        MethodConfig stepguard = min500;
+        stepguard.variant_name = "stepguard";
+        stepguard.stats_long_window_us = 60000000;
+        stepguard.stats_short_window_us = 2000000;
+        stepguard.adaptive_use_stepguard = true;
+        stepguard.step_threshold_us = 1000.0;
+        stepguard.step_n_consec = 2;
+        stepguard.step_npkt_min = 20;
+        stepguard.step_iqr_min_us = 200.0;
+        stepguard.step_iqr_k = 10.0;
+        stepguard.step_gnear_min_us = 50.0;
+        stepguard.step_gnear_k = 2.0;
+        stepguard.step_use_rtt_guard = true;
+        add(stepguard);
+
+        MethodConfig qswap = min500;
+        qswap.variant_name = "qswap";
+        qswap.stats_long_window_us = 60000000;
+        qswap.stats_short_window_us = 2000000;
+        qswap.adaptive_use_quantile_swap = true;
+        qswap.quantile_swap_low = 0.0;
+        qswap.quantile_swap_high = 0.1;
+        qswap.quantile_swap_jitter_enter_us = 200.0;
+        qswap.quantile_swap_jitter_exit_us = 120.0;
+        qswap.quantile_swap_iqr_enter_us = 400.0;
+        qswap.quantile_swap_iqr_exit_us = 250.0;
+        qswap.timesync_quantile = qswap.quantile_swap_low;
+        add(qswap);
+
+        MethodConfig skewage = min500;
+        skewage.variant_name = "skewage";
+        skewage.stats_long_window_us = 60000000;
+        skewage.stats_short_window_us = 2000000;
+        skewage.adaptive_use_cse_trigger = true;
+        skewage.adaptive_skew_trigger_ppm = 20.0;
+        skewage.adaptive_age_trigger_us = 2000000;
+        skewage.cse_window_us = 30000000;
+        skewage.cse_min_samples = 8;
+        skewage.cse_beta = 0.05;
+        skewage.cse_max_ppm = 500.0;
+        skewage.cse_net_slope_max = 5.0;
+        skewage.cse_iqr_min_us = 200.0;
+        skewage.cse_iqr_k = 10.0;
+        skewage.cse_use_rtt_guard = true;
+        add(skewage);
+
+        MethodConfig count3 = min500;
+        count3.variant_name = "count3";
+        count3.adaptive_trigger_count_req = 3;
+        add(count3);
+
+        MethodConfig shrink = min500;
+        shrink.variant_name = "shrink0p5";
+        shrink.adaptive_shrink_ratio = 0.5;
+        add(shrink);
+
+        MethodConfig grow = min500;
+        grow.variant_name = "grow1p25";
+        grow.adaptive_expand_ratio = 1.25;
+        add(grow);
+
+        MethodConfig jitterk3 = min500;
+        jitterk3.variant_name = "jitterk3";
+        jitterk3.stats_long_window_us = 60000000;
+        jitterk3.stats_short_window_us = 2000000;
+        jitterk3.adaptive_trigger_use_jitter = true;
+        jitterk3.adaptive_trigger_jitter_k = 3.0;
+        jitterk3.adaptive_trigger_jitter_min_us = 50.0;
+        add(jitterk3);
+    }
+
+    // M4a4g - TimeSync adaptive drift window with variance/sign guard
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncAdaptiveGuard;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        add(m);
+
+        MethodConfig strict = m;
+        strict.variant_name = "s5";
+        strict.adaptive_guard_sign_count = 5;
+        add(strict);
+    }
+
+    // M4a4h - TimeSync adaptive bins (short-stat gated window)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncAdaptiveBins;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.adaptive_bins_min_window_us = 2000000;
+        m.adaptive_bins_max_window_us = 60000000;
+        m.adaptive_bins_hold_us = 60000000;
+        m.gsp_guard_min_us = 50.0;
+        m.gsp_guard_k = 4.0;
+        m.gsp_iqr_min_us = 200.0;
+        m.gsp_iqr_k = 10.0;
+        m.gsp_gnear_min_us = 25.0;
+        m.gsp_gnear_k = 2.0;
+        m.gsp_npkt_min = 20;
+        m.gsp_n_consec = 3;
+        m.gsp_age_ok_us = 3000000;
+        add(m);
+
+        MethodConfig xor_gate = m;
+        xor_gate.variant_name = "xor";
+        xor_gate.gsp_use_xor_gate = true;
+        add(xor_gate);
+
+        MethodConfig rtt = m;
+        rtt.variant_name = "rtt";
+        rtt.gsp_use_rtt_guard = true;
+        add(rtt);
+
+        MethodConfig rtt_cse = m;
+        rtt_cse.variant_name = "rtt_cse";
+        rtt_cse.gsp_use_rtt_guard = true;
+        rtt_cse.promo_use_cse_gate = true;
+        rtt_cse.cse_use_rtt_guard = true;
+        add(rtt_cse);
+
+        MethodConfig fast2 = m;
+        fast2.variant_name = "fast2";
+        fast2.gsp_n_consec = 2;
+        fast2.gsp_age_ok_us = 1000000;
+        add(fast2);
+    }
+
+    // M4a4b - TimeSync dual-window skew (short window for skew tracking)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncDualWindow;
+        m.estimator = EstimatorKind::Regression;
+        m.discipline = DisciplineKind::Hybrid;
+        m.short_window_us = 200000;
+        m.probe_rate_hz = 0.0;
+        add(m);
+
+        MethodConfig fast = m;
+        fast.variant_name = "w50k";
+        fast.short_window_us = 50000;
+        add(fast);
+
+        MethodConfig med = m;
+        med.variant_name = "w100k";
+        med.short_window_us = 100000;
+        add(med);
+
+        MethodConfig slow = m;
+        slow.variant_name = "w500k";
+        slow.short_window_us = 500000;
+        add(slow);
+    }
+
+    // M4a4c - TimeSync hysteresis window
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncHysteresis;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        add(m);
+
+        MethodConfig sensitive = m;
+        sensitive.variant_name = "t100_c1";
+        sensitive.hysteresis_trigger_us = 100.0;
+        sensitive.hysteresis_trigger_count = 1;
+        add(sensitive);
+
+        MethodConfig sensitive_h200 = sensitive;
+        sensitive_h200.variant_name = "t100_c1_h200ms";
+        sensitive_h200.hysteresis_hold_us = 200000;
+        add(sensitive_h200);
+
+        MethodConfig sensitive_h500 = sensitive;
+        sensitive_h500.variant_name = "t100_c1_h500ms";
+        sensitive_h500.hysteresis_hold_us = 500000;
+        add(sensitive_h500);
+
+        MethodConfig gsp = sensitive;
+        gsp.variant_name = "t100_c1_gsp";
+        gsp.hyst_use_gsp = true;
+        gsp.stats_long_window_us = 60000000;
+        gsp.stats_short_window_us = 2000000;
+        gsp.gsp_guard_min_us = 50.0;
+        gsp.gsp_guard_k = 4.0;
+        gsp.gsp_iqr_min_us = 200.0;
+        gsp.gsp_iqr_k = 10.0;
+        gsp.gsp_gnear_min_us = 25.0;
+        gsp.gsp_gnear_k = 2.0;
+        gsp.gsp_npkt_min = 20;
+        gsp.gsp_n_consec = 3;
+        gsp.gsp_age_ok_us = 3000000;
+        gsp.gsp_use_rtt_guard = true;
+        add(gsp);
+
+        MethodConfig step = sensitive;
+        step.variant_name = "t100_c1_stepguard";
+        step.hyst_use_stepguard = true;
+        step.stats_long_window_us = 60000000;
+        step.stats_short_window_us = 2000000;
+        step.step_threshold_us = 1000.0;
+        step.step_n_consec = 2;
+        step.step_npkt_min = 20;
+        step.step_iqr_min_us = 200.0;
+        step.step_iqr_k = 10.0;
+        step.step_gnear_min_us = 50.0;
+        step.step_gnear_k = 2.0;
+        step.step_use_rtt_guard = true;
+        add(step);
+
+        MethodConfig qswap = sensitive;
+        qswap.variant_name = "t100_c1_qswap";
+        qswap.hyst_use_quantile_swap = true;
+        qswap.stats_long_window_us = 60000000;
+        qswap.stats_short_window_us = 2000000;
+        qswap.quantile_swap_low = 0.0;
+        qswap.quantile_swap_high = 0.1;
+        qswap.quantile_swap_jitter_enter_us = 200.0;
+        qswap.quantile_swap_jitter_exit_us = 120.0;
+        qswap.quantile_swap_iqr_enter_us = 400.0;
+        qswap.quantile_swap_iqr_exit_us = 250.0;
+        qswap.timesync_quantile = qswap.quantile_swap_low;
+        add(qswap);
+    }
+
+    // M4a4d - TimeSync CUSUM window
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncCUSUM;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        add(m);
+
+        MethodConfig stable = m;
+        stable.variant_name = "k75_h750";
+        stable.cusum_k_us = 75.0;
+        stable.cusum_h_us = 750.0;
+        add(stable);
+
+        MethodConfig k50 = m;
+        k50.variant_name = "k50_h300";
+        k50.cusum_k_us = 50.0;
+        k50.cusum_h_us = 300.0;
+        add(k50);
+
+        MethodConfig k50_h200 = k50;
+        k50_h200.variant_name = "k50_h300_h200ms";
+        k50_h200.cusum_hold_us = 200000;
+        add(k50_h200);
+
+        MethodConfig k75_h200 = stable;
+        k75_h200.variant_name = "k75_h750_h200ms";
+        k75_h200.cusum_hold_us = 200000;
+        add(k75_h200);
+    }
+
+    // M4a4e - TimeSync variance-gated window
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncVarGate;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        add(m);
+
+        MethodConfig robust = m;
+        robust.variant_name = "robust";
+        robust.robust_delta_window_size = 20;
+        robust.robust_delta_z = 3.0;
+        robust.robust_delta_floor_us = 50.0;
+        add(robust);
+
+        MethodConfig fast = m;
+        fast.variant_name = "t50_v5k_w10";
+        fast.vargate_trigger_us = 50.0;
+        fast.vargate_var_threshold_us2 = 5000.0;
+        fast.vargate_window_size = 10;
+        add(fast);
+
+        MethodConfig loose = m;
+        loose.variant_name = "t100_v20k_w20";
+        loose.vargate_trigger_us = 100.0;
+        loose.vargate_var_threshold_us2 = 20000.0;
+        loose.vargate_window_size = 20;
+        add(loose);
+
+        MethodConfig stable = m;
+        stable.variant_name = "t150_v50k_w40";
+        stable.vargate_trigger_us = 150.0;
+        stable.vargate_var_threshold_us2 = 50000.0;
+        stable.vargate_window_size = 40;
+        add(stable);
+
+        MethodConfig hold200 = m;
+        hold200.variant_name = "hold200ms";
+        hold200.vargate_hold_us = 200000;
+        add(hold200);
+
+        MethodConfig hold500 = m;
+        hold500.variant_name = "hold500ms";
+        hold500.vargate_hold_us = 500000;
+        add(hold500);
+
+        MethodConfig v25 = m;
+        v25.variant_name = "t25_v2k_w10";
+        v25.vargate_trigger_us = 25.0;
+        v25.vargate_var_threshold_us2 = 2000.0;
+        v25.vargate_window_size = 10;
+        add(v25);
+
+        MethodConfig var200k = m;
+        var200k.variant_name = "t100_v200k_w20";
+        var200k.vargate_trigger_us = 100.0;
+        var200k.vargate_var_threshold_us2 = 200000.0;
+        var200k.vargate_window_size = 20;
+        add(var200k);
+
+        MethodConfig min500 = m;
+        min500.variant_name = "min500ms";
+        min500.min_window_floor_us = 500000;
+        add(min500);
+
+        MethodConfig stationary = m;
+        stationary.variant_name = "stationary";
+        stationary.stationary_var_max_us2 = 25000.0;
+        stationary.stationary_delta_max_us = 500.0;
+        stationary.stationary_window_size = 20;
+        add(stationary);
+
+        MethodConfig e51_v500k = m;
+        e51_v500k.variant_name = "e51_v500k_w10";
+        e51_v500k.vargate_trigger_us = 50.0;
+        e51_v500k.vargate_var_threshold_us2 = 500000.0;
+        e51_v500k.vargate_window_size = 10;
+        add(e51_v500k);
+
+        MethodConfig e51_v1m = m;
+        e51_v1m.variant_name = "e51_v1m_w10";
+        e51_v1m.vargate_trigger_us = 50.0;
+        e51_v1m.vargate_var_threshold_us2 = 1000000.0;
+        e51_v1m.vargate_window_size = 10;
+        add(e51_v1m);
+
+        MethodConfig e51_w5 = m;
+        e51_w5.variant_name = "e51_v200k_w5";
+        e51_w5.vargate_trigger_us = 50.0;
+        e51_w5.vargate_var_threshold_us2 = 200000.0;
+        e51_w5.vargate_window_size = 5;
+        add(e51_w5);
+
+        MethodConfig e51_w5_hold = e51_w5;
+        e51_w5_hold.variant_name = "e51_v200k_w5_hold200";
+        e51_w5_hold.vargate_hold_us = 200000;
+        add(e51_w5_hold);
+
+        MethodConfig e51_win1s = m;
+        e51_win1s.variant_name = "e51_win1s";
+        e51_win1s.window_us = 1000000;
+        e51_win1s.vargate_trigger_us = 50.0;
+        e51_win1s.vargate_var_threshold_us2 = 200000.0;
+        e51_win1s.vargate_window_size = 10;
+        add(e51_win1s);
+
+        MethodConfig e51_win500 = m;
+        e51_win500.variant_name = "e51_win500ms";
+        e51_win500.window_us = 500000;
+        e51_win500.vargate_trigger_us = 50.0;
+        e51_win500.vargate_var_threshold_us2 = 200000.0;
+        e51_win500.vargate_window_size = 10;
+        add(e51_win500);
+
+        MethodConfig e51_q01 = m;
+        e51_q01.variant_name = "e51_q01";
+        e51_q01.timesync_quantile = 0.01;
+        e51_q01.vargate_trigger_us = 50.0;
+        e51_q01.vargate_var_threshold_us2 = 200000.0;
+        e51_q01.vargate_window_size = 10;
+        add(e51_q01);
+
+        MethodConfig e51_q05 = m;
+        e51_q05.variant_name = "e51_q05";
+        e51_q05.timesync_quantile = 0.05;
+        e51_q05.vargate_trigger_us = 50.0;
+        e51_q05.vargate_var_threshold_us2 = 200000.0;
+        e51_q05.vargate_window_size = 10;
+        add(e51_q05);
+
+        MethodConfig e51_robust = m;
+        e51_robust.variant_name = "e51_robust_v200k";
+        e51_robust.robust_delta_window_size = 20;
+        e51_robust.robust_delta_z = 3.0;
+        e51_robust.robust_delta_floor_us = 50.0;
+        e51_robust.vargate_trigger_us = 50.0;
+        e51_robust.vargate_var_threshold_us2 = 200000.0;
+        e51_robust.vargate_window_size = 10;
+        add(e51_robust);
+
+        MethodConfig e51_t25 = m;
+        e51_t25.variant_name = "e51_t25_v200k_w10";
+        e51_t25.vargate_trigger_us = 25.0;
+        e51_t25.vargate_var_threshold_us2 = 200000.0;
+        e51_t25.vargate_window_size = 10;
+        add(e51_t25);
+
+        MethodConfig e51_min500_hold500 = min500;
+        e51_min500_hold500.variant_name = "e51_min500_hold500";
+        e51_min500_hold500.vargate_hold_us = 500000;
+        add(e51_min500_hold500);
+
+        MethodConfig e51_min500_hold200 = min500;
+        e51_min500_hold200.variant_name = "e51_min500_hold200";
+        e51_min500_hold200.vargate_hold_us = 200000;
+        add(e51_min500_hold200);
+
+        MethodConfig e51_min500_robust = min500;
+        e51_min500_robust.variant_name = "e51_min500_robust";
+        e51_min500_robust.robust_delta_window_size = 20;
+        e51_min500_robust.robust_delta_z = 3.0;
+        e51_min500_robust.robust_delta_floor_us = 50.0;
+        add(e51_min500_robust);
+
+        MethodConfig e51_min500_t25 = min500;
+        e51_min500_t25.variant_name = "e51_min500_t25_v2k";
+        e51_min500_t25.vargate_trigger_us = 25.0;
+        e51_min500_t25.vargate_var_threshold_us2 = 2000.0;
+        e51_min500_t25.vargate_window_size = 10;
+        add(e51_min500_t25);
+
+        MethodConfig e51_min500_v50k = min500;
+        e51_min500_v50k.variant_name = "e51_min500_v50k";
+        e51_min500_v50k.vargate_trigger_us = 50.0;
+        e51_min500_v50k.vargate_var_threshold_us2 = 50000.0;
+        e51_min500_v50k.vargate_window_size = 10;
+        add(e51_min500_v50k);
+
+        MethodConfig e51_hold500_t25 = hold500;
+        e51_hold500_t25.variant_name = "e51_hold500_t25_v2k";
+        e51_hold500_t25.vargate_trigger_us = 25.0;
+        e51_hold500_t25.vargate_var_threshold_us2 = 2000.0;
+        e51_hold500_t25.vargate_window_size = 10;
+        add(e51_hold500_t25);
+
+        MethodConfig e51_hold500_v50k = hold500;
+        e51_hold500_v50k.variant_name = "e51_hold500_v50k";
+        e51_hold500_v50k.vargate_trigger_us = 50.0;
+        e51_hold500_v50k.vargate_var_threshold_us2 = 50000.0;
+        e51_hold500_v50k.vargate_window_size = 10;
+        add(e51_hold500_v50k);
+
+        MethodConfig e51_hold500_robust = hold500;
+        e51_hold500_robust.variant_name = "e51_hold500_robust";
+        e51_hold500_robust.robust_delta_window_size = 20;
+        e51_hold500_robust.robust_delta_z = 3.0;
+        e51_hold500_robust.robust_delta_floor_us = 50.0;
+        add(e51_hold500_robust);
+
+        MethodConfig e51_stationary_hold500 = stationary;
+        e51_stationary_hold500.variant_name = "e51_stationary_hold500";
+        e51_stationary_hold500.vargate_hold_us = 500000;
+        add(e51_stationary_hold500);
+
+        MethodConfig e51_stationary_t25 = stationary;
+        e51_stationary_t25.variant_name = "e51_stationary_t25_v2k";
+        e51_stationary_t25.vargate_trigger_us = 25.0;
+        e51_stationary_t25.vargate_var_threshold_us2 = 2000.0;
+        e51_stationary_t25.vargate_window_size = 10;
+        add(e51_stationary_t25);
+    }
+
+    // M4a4f - TimeSync skew-corrected offset
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncSkewCorrected;
+        m.estimator = EstimatorKind::Regression;
+        m.discipline = DisciplineKind::Hybrid;
+        m.probe_rate_hz = 0.0;
+        add(m);
+
+        MethodConfig kalman_ss = m;
+        kalman_ss.variant_name = "kalman_ss";
+        kalman_ss.discipline = DisciplineKind::StateSpace;
+        add(kalman_ss);
+
+        MethodConfig theilsen = m;
+        theilsen.variant_name = "theilsen";
+        theilsen.estimator = EstimatorKind::RobustRegression;
+        add(theilsen);
+
+        MethodConfig probe_skew = m;
+        probe_skew.variant_name = "probe_skew_0p2hz";
+        probe_skew.enable_probes = true;
+        probe_skew.probe_rate_hz = 0.2;
+        probe_skew.probe_skew_only = true;
+        probe_skew.window_us = 30000000ULL;
+        probe_skew.discipline = DisciplineKind::None;
+        add(probe_skew);
+    }
+
+    // M4a4g - TimeSync per-direction skew exchange
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncPerDirSkew;
+        m.estimator = EstimatorKind::Regression;
+        m.discipline = DisciplineKind::Hybrid;
+        m.extra_mindelta_bytes = 8.0;
+        m.perdir_skew_gate_ppm = 200.0;
+        m.perdir_skew_blend = 0.5;
+        m.probe_rate_hz = 0.0;
+        add(m);
+
+        MethodConfig peer_only = m;
+        peer_only.variant_name = "peer_only";
+        peer_only.perdir_skew_blend = 1.0;
+        add(peer_only);
+
+        MethodConfig gate50 = m;
+        gate50.variant_name = "gate50";
+        gate50.perdir_skew_gate_ppm = 50.0;
+        add(gate50);
+
+        MethodConfig q1ppm = m;
+        q1ppm.variant_name = "q1ppm_2B";
+        q1ppm.perdir_skew_quantize_ppm = 1.0;
+        q1ppm.extra_mindelta_bytes = 2.0;
+        add(q1ppm);
+
+        MethodConfig q01ppm = m;
+        q01ppm.variant_name = "q0.1ppm_4B";
+        q01ppm.perdir_skew_quantize_ppm = 0.1;
+        q01ppm.extra_mindelta_bytes = 4.0;
+        add(q01ppm);
+    }
+
+    // M4a5 - TimeSync step reset
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncStepReset;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stepreset_use_rtt_guard = true;
+        add(m);
+
+        MethodConfig guard_xor = m;
+        guard_xor.variant_name = "guard_xor";
+        guard_xor.stepreset_use_rtt_guard = true;
+        guard_xor.stepreset_use_xor_gate = true;
+        add(guard_xor);
+
+        MethodConfig sticky = m;
+        sticky.variant_name = "sticky";
+        sticky.stepreset_use_rtt_guard = true;
+        sticky.stepreset_use_xor_gate = true;
+        sticky.stepreset_use_sticky_gate = true;
+        add(sticky);
+
+        MethodConfig hold0 = m;
+        hold0.variant_name = "hold0p1s";
+        hold0.stepreset_hold_us = 100000;
+        add(hold0);
+
+        MethodConfig hold1 = m;
+        hold1.variant_name = "hold1s";
+        hold1.stepreset_hold_us = 1000000;
+        add(hold1);
+
+        MethodConfig hold5 = m;
+        hold5.variant_name = "hold5s";
+        hold5.stepreset_hold_us = 5000000;
+        add(hold5);
+
+        MethodConfig hold10 = m;
+        hold10.variant_name = "hold10s";
+        hold10.stepreset_hold_us = 10000000;
+        add(hold10);
+    }
+
+    // M4a6 - TimeSync guarded shadow promotion (GSP)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncShadow;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.gsp_use_rtt_guard = true;
+        m.gsp_guard_min_us = 50.0;
+        m.gsp_guard_k = 4.0;
+        m.gsp_iqr_min_us = 200.0;
+        m.gsp_iqr_k = 10.0;
+        m.gsp_gnear_min_us = 25.0;
+        m.gsp_gnear_k = 2.0;
+        m.gsp_npkt_min = 20;
+        m.gsp_n_consec = 3;
+        m.gsp_age_ok_us = 3000000;
+        add(m);
+
+        MethodConfig xor_gate = m;
+        xor_gate.variant_name = "xor";
+        xor_gate.gsp_use_xor_gate = true;
+        add(xor_gate);
+
+        MethodConfig rtt = m;
+        rtt.variant_name = "rtt";
+        rtt.gsp_use_rtt_guard = true;
+        add(rtt);
+
+        MethodConfig both = m;
+        both.variant_name = "xor_rtt";
+        both.gsp_use_xor_gate = true;
+        both.gsp_use_rtt_guard = true;
+        add(both);
+
+        MethodConfig cse_rtt = m;
+        cse_rtt.variant_name = "cse_rtt";
+        cse_rtt.promo_use_cse_gate = true;
+        cse_rtt.gsp_use_rtt_guard = true;
+        cse_rtt.cse_use_rtt_guard = true;
+        add(cse_rtt);
+
+        MethodConfig fast2 = m;
+        fast2.variant_name = "fast2";
+        fast2.gsp_n_consec = 2;
+        fast2.gsp_age_ok_us = 1000000;
+        add(fast2);
+
+        MethodConfig fast2_w1s = fast2;
+        fast2_w1s.variant_name = "fast2_w1s";
+        fast2_w1s.stats_short_window_us = 1000000;
+        add(fast2_w1s);
+
+        MethodConfig age0 = m;
+        age0.variant_name = "age0";
+        age0.gsp_age_ok_us = 0;
+        add(age0);
+
+        MethodConfig jitter_ewma = m;
+        jitter_ewma.variant_name = "jitter_ewma";
+        jitter_ewma.jitter_guard_use_ewma = true;
+        jitter_ewma.jitter_guard_alpha = 0.2;
+        add(jitter_ewma);
+
+        MethodConfig age1 = m;
+        age1.variant_name = "age1s";
+        age1.gsp_age_ok_us = 1000000;
+        add(age1);
+
+        MethodConfig age5 = m;
+        age5.variant_name = "age5s";
+        age5.gsp_age_ok_us = 5000000;
+        add(age5);
+
+        MethodConfig age10 = m;
+        age10.variant_name = "age10s";
+        age10.gsp_age_ok_us = 10000000;
+        add(age10);
+
+        MethodConfig step = m;
+        step.variant_name = "step";
+        step.shadow_use_stepguard = true;
+        add(step);
+
+        MethodConfig step_xor = step;
+        step_xor.variant_name = "step_xor";
+        step_xor.gsp_use_xor_gate = true;
+        add(step_xor);
+
+        MethodConfig step_xor_rtt = step;
+        step_xor_rtt.variant_name = "step_xor_rtt";
+        step_xor_rtt.gsp_use_xor_gate = true;
+        step_xor_rtt.gsp_use_rtt_guard = true;
+        add(step_xor_rtt);
+
+        if (grid) {
+            const double guard_ks[] = {2.0, 4.0, 8.0};
+            const double iqr_ks[] = {5.0, 10.0, 20.0};
+            for (double gk : guard_ks) {
+                for (double ik : iqr_ks) {
+                    MethodConfig g = m;
+                    g.gsp_guard_k = gk;
+                    g.gsp_iqr_k = ik;
+                    g.variant_name = "grid_g" + std::to_string((int)gk)
+                        + "_i" + std::to_string((int)ik);
+                    add(g);
+                }
+            }
+        }
+    }
+
+    // M4a6b - TimeSync shadow promotion + skew compensation
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncShadowSkew;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.gsp_use_rtt_guard = true;
+        m.gsp_guard_min_us = 50.0;
+        m.gsp_guard_k = 4.0;
+        m.gsp_iqr_min_us = 200.0;
+        m.gsp_iqr_k = 10.0;
+        m.gsp_gnear_min_us = 25.0;
+        m.gsp_gnear_k = 2.0;
+        m.gsp_npkt_min = 20;
+        m.gsp_n_consec = 3;
+        m.gsp_age_ok_us = 3000000;
+        m.shadow_skew_window_us = 30000000;
+        m.shadow_skew_min_samples = 8;
+        m.shadow_skew_clamp_ppm = 100.0;
+        m.shadow_skew_alpha = 0.10;
+        m.shadow_skew_use_rtt_guard = true;
+        add(m);
+
+        MethodConfig a05 = m;
+        a05.variant_name = "a0.05";
+        a05.shadow_skew_alpha = 0.05;
+        add(a05);
+
+        MethodConfig a20 = m;
+        a20.variant_name = "a0.2";
+        a20.shadow_skew_alpha = 0.20;
+        add(a20);
+
+        MethodConfig clamp50 = m;
+        clamp50.variant_name = "clamp50";
+        clamp50.shadow_skew_clamp_ppm = 50.0;
+        add(clamp50);
+
+        MethodConfig cse = m;
+        cse.variant_name = "cse";
+        cse.shadow_use_cse = true;
+        add(cse);
+
+        MethodConfig cse_step = cse;
+        cse_step.variant_name = "cse_step";
+        cse_step.shadow_use_stepguard = true;
+        add(cse_step);
+
+        MethodConfig cse_gate = m;
+        cse_gate.variant_name = "cse_gate";
+        cse_gate.promo_use_cse_gate = true;
+        cse_gate.gsp_use_rtt_guard = true;
+        cse_gate.cse_use_rtt_guard = true;
+        add(cse_gate);
+    }
+
+    // M4a7 - TimeSync NFHS staleness invalidation
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncNFHS;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.nfhs_age_us = 5000000;
+        m.nfhs_miss_us = 4000000;
+        m.nfhs_n_consec = 2;
+        m.nfhs_npkt_min = 20;
+        m.nfhs_iqr_min_us = 200.0;
+        m.nfhs_iqr_k = 10.0;
+        m.nfhs_gnear_min_us = 50.0;
+        m.nfhs_gnear_k = 2.0;
+        m.nfhs_use_rtt_guard = true;
+        add(m);
+
+        MethodConfig miss8 = m;
+        miss8.variant_name = "miss8s";
+        miss8.nfhs_miss_us = 8000000;
+        add(miss8);
+
+        MethodConfig cse_rtt = m;
+        cse_rtt.variant_name = "cse_rtt";
+        cse_rtt.promo_use_cse_gate = true;
+        cse_rtt.nfhs_use_rtt_guard = true;
+        cse_rtt.cse_use_rtt_guard = true;
+        add(cse_rtt);
+
+        MethodConfig age10 = m;
+        age10.variant_name = "age10s";
+        age10.nfhs_age_us = 10000000;
+        add(age10);
+
+        MethodConfig near = m;
+        near.variant_name = "near0p1";
+        near.nfhs_use_near_ratio = true;
+        near.nfhs_near_ratio_max = 0.1;
+        add(near);
+    }
+
+    // M4a8 - TimeSync step detection + RTT-guarded reset
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncStepGuard;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.step_threshold_us = 1000.0;
+        m.step_n_consec = 2;
+        m.step_npkt_min = 20;
+        m.step_iqr_min_us = 200.0;
+        m.step_iqr_k = 10.0;
+        m.step_gnear_min_us = 50.0;
+        m.step_gnear_k = 2.0;
+        m.step_use_rtt_guard = true;
+        add(m);
+
+        MethodConfig th0p5 = m;
+        th0p5.variant_name = "th0p5ms";
+        th0p5.step_threshold_us = 500.0;
+        add(th0p5);
+
+        MethodConfig th2 = m;
+        th2.variant_name = "th2ms";
+        th2.step_threshold_us = 2000.0;
+        add(th2);
+
+        MethodConfig iqr5 = m;
+        iqr5.variant_name = "iqr5";
+        iqr5.step_threshold_us = 0.0;
+        iqr5.step_threshold_k = 5.0;
+        add(iqr5);
+
+        MethodConfig iqr10 = m;
+        iqr10.variant_name = "iqr10";
+        iqr10.step_threshold_us = 0.0;
+        iqr10.step_threshold_k = 10.0;
+        add(iqr10);
+
+        MethodConfig jitter_ewma = m;
+        jitter_ewma.variant_name = "jitter_ewma";
+        jitter_ewma.jitter_guard_use_ewma = true;
+        jitter_ewma.jitter_guard_alpha = 0.2;
+        add(jitter_ewma);
+
+        MethodConfig xor_gate = m;
+        xor_gate.variant_name = "xor";
+        xor_gate.step_use_xor_gate = true;
+        add(xor_gate);
+
+        MethodConfig sym_gate = m;
+        sym_gate.variant_name = "sym";
+        sym_gate.step_use_sym_gate = true;
+        add(sym_gate);
+
+        MethodConfig gnear_iqr = m;
+        gnear_iqr.variant_name = "gn_iqr";
+        gnear_iqr.step_gnear_use_iqr = true;
+        gnear_iqr.step_gnear_k = 0.5;
+        add(gnear_iqr);
+
+        MethodConfig nonear_p10 = m;
+        nonear_p10.variant_name = "nonear_p10";
+        nonear_p10.step_nonear_use_p10 = true;
+        add(nonear_p10);
+
+        MethodConfig rtt_step = m;
+        rtt_step.variant_name = "rtt_step";
+        rtt_step.step_rtt_guard_delta_us = 1000.0;
+        rtt_step.step_rtt_guard_iqr_us = 1000.0;
+        add(rtt_step);
+
+        MethodConfig near_ratio = m;
+        near_ratio.variant_name = "near_ratio";
+        near_ratio.step_use_near_ratio = true;
+        near_ratio.step_near_ratio_max = 0.05;
+        add(near_ratio);
+
+        MethodConfig single_dir = m;
+        single_dir.variant_name = "single_dir";
+        single_dir.step_single_dir_reset = true;
+        add(single_dir);
+
+        MethodConfig binreset = m;
+        binreset.variant_name = "binreset";
+        binreset.step_guard_reset_bins = true;
+        binreset.step_single_dir_reset = true;
+        add(binreset);
+
+        MethodConfig mad8 = m;
+        mad8.variant_name = "mad8";
+        mad8.step_innov_window_size = 20;
+        mad8.step_innov_k = 8.0;
+        add(mad8);
+
+        MethodConfig probe = m;
+        probe.variant_name = "probe";
+        probe.enable_probes = true;
+        probe.probe_rate_hz = 1.0;
+        probe.step_use_probe_offset = true;
+        add(probe);
+
+        MethodConfig probe_low = m;
+        probe_low.variant_name = "probe_lowrate";
+        probe_low.enable_probes = true;
+        probe_low.probe_rate_hz = 1.0;
+        probe_low.step_use_probe_offset = true;
+        probe_low.step_npkt_min = 0;
+        add(probe_low);
+
+        MethodConfig probe_relax = m;
+        probe_relax.variant_name = "probe_relax";
+        probe_relax.enable_probes = true;
+        probe_relax.probe_rate_hz = 1.0;
+        probe_relax.step_use_probe_offset = true;
+        probe_relax.step_npkt_min = 0;
+        probe_relax.step_probe_relax = true;
+        probe_relax.step_probe_relax_nonear = true;
+        add(probe_relax);
+
+        MethodConfig probe_only = m;
+        probe_only.variant_name = "probe_only";
+        probe_only.enable_probes = true;
+        probe_only.probe_rate_hz = 1.0;
+        probe_only.step_use_probe_offset = true;
+        probe_only.step_npkt_min = 0;
+        probe_only.step_probe_relax = true;
+        probe_only.step_probe_relax_nonear = true;
+        probe_only.step_probe_only = true;
+        add(probe_only);
+
+        MethodConfig probe_hard = probe_only;
+        probe_hard.variant_name = "probe_hard";
+        probe_hard.step_probe_hard = true;
+        add(probe_hard);
+
+        MethodConfig probe_hard_t100 = probe_hard;
+        probe_hard_t100.variant_name = "probe_hard_t100";
+        probe_hard_t100.step_threshold_us = 100.0;
+        add(probe_hard_t100);
+
+        MethodConfig probe_hard_t5ms = probe_hard;
+        probe_hard_t5ms.variant_name = "probe_hard_t5ms";
+        probe_hard_t5ms.step_threshold_us = 5000.0;
+        add(probe_hard_t5ms);
+
+        MethodConfig probe_innov = probe_only;
+        probe_innov.variant_name = "probe_innov";
+        probe_innov.step_innov_window_size = 20;
+        probe_innov.step_innov_k = 8.0;
+        probe_innov.step_probe_innov = true;
+        add(probe_innov);
+
+        MethodConfig probe_mad4 = probe_innov;
+        probe_mad4.variant_name = "probe_mad4";
+        probe_mad4.step_innov_k = 4.0;
+        add(probe_mad4);
+
+        MethodConfig probe_mad6 = probe_innov;
+        probe_mad6.variant_name = "probe_mad6";
+        probe_mad6.step_innov_k = 6.0;
+        add(probe_mad6);
+
+        MethodConfig probe_mad10 = probe_innov;
+        probe_mad10.variant_name = "probe_mad10";
+        probe_mad10.step_innov_k = 10.0;
+        add(probe_mad10);
+    }
+
+    // M4a9 - TimeSync consensus-slope filter
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncConsensus;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.consensus_buffer_size = 64;
+        m.consensus_min_samples = 8;
+        m.consensus_candidate_frac = 0.10;
+        m.consensus_candidate_floor_us = 25.0;
+        m.consensus_slope_bin_ppm = 2.0;
+        m.consensus_slope_max_ppm = 500.0;
+        m.consensus_percentile = 0.05;
+        m.consensus_iqr_min_us = 200.0;
+        m.consensus_iqr_k = 10.0;
+        m.consensus_use_rtt_guard = true;
+        add(m);
+
+        MethodConfig k32 = m;
+        k32.variant_name = "k32";
+        k32.consensus_buffer_size = 32;
+        add(k32);
+
+        MethodConfig k128 = m;
+        k128.variant_name = "k128";
+        k128.consensus_buffer_size = 128;
+        add(k128);
+
+        MethodConfig cand5 = m;
+        cand5.variant_name = "cand5";
+        cand5.consensus_candidate_frac = 0.05;
+        add(cand5);
+
+        MethodConfig cand20 = m;
+        cand20.variant_name = "cand20";
+        cand20.consensus_candidate_frac = 0.20;
+        add(cand20);
+
+        MethodConfig bin1 = m;
+        bin1.variant_name = "bin1";
+        bin1.consensus_slope_bin_ppm = 1.0;
+        add(bin1);
+
+        MethodConfig bin5 = m;
+        bin5.variant_name = "bin5";
+        bin5.consensus_slope_bin_ppm = 5.0;
+        add(bin5);
+
+        MethodConfig p1 = m;
+        p1.variant_name = "p1";
+        p1.consensus_percentile = 0.01;
+        add(p1);
+
+        MethodConfig p10 = m;
+        p10.variant_name = "p10";
+        p10.consensus_percentile = 0.10;
+        add(p10);
+
+        MethodConfig noguard = m;
+        noguard.variant_name = "noguard";
+        noguard.consensus_use_rtt_guard = false;
+        add(noguard);
+
+        MethodConfig loose = m;
+        loose.variant_name = "loose";
+        loose.consensus_candidate_frac = 0.50;
+        loose.consensus_candidate_floor_us = 0.0;
+        add(loose);
+
+        MethodConfig shortbase = m;
+        shortbase.variant_name = "shortbase";
+        shortbase.consensus_use_short_baseline = true;
+        add(shortbase);
+
+        MethodConfig guard_tight = noguard;
+        guard_tight.variant_name = "cng_guard_tight";
+        guard_tight.consensus_use_rtt_guard = true;
+        guard_tight.rtt_guard_delta_us = 500.0;
+        guard_tight.rtt_guard_iqr_us = 200.0;
+        guard_tight.consensus_iqr_min_us = 150.0;
+        guard_tight.consensus_iqr_k = 5.0;
+        add(guard_tight);
+
+        MethodConfig shortbase_bin1 = noguard;
+        shortbase_bin1.variant_name = "cng_shortbase_bin1";
+        shortbase_bin1.consensus_use_short_baseline = true;
+        shortbase_bin1.consensus_slope_bin_ppm = 1.0;
+        shortbase_bin1.consensus_slope_max_ppm = 1000.0;
+        add(shortbase_bin1);
+
+        MethodConfig shortbuf32 = noguard;
+        shortbuf32.variant_name = "cng_shortbuf32";
+        shortbuf32.consensus_buffer_size = 32;
+        shortbuf32.consensus_min_samples = 6;
+        add(shortbuf32);
+
+        MethodConfig shortbuf16 = noguard;
+        shortbuf16.variant_name = "cng_shortbuf16";
+        shortbuf16.consensus_buffer_size = 16;
+        shortbuf16.consensus_min_samples = 4;
+        add(shortbuf16);
+
+        MethodConfig floor50 = noguard;
+        floor50.variant_name = "cng_floor50";
+        floor50.consensus_candidate_floor_us = 50.0;
+        add(floor50);
+
+        MethodConfig floor100 = noguard;
+        floor100.variant_name = "cng_floor100";
+        floor100.consensus_candidate_floor_us = 100.0;
+        add(floor100);
+
+        MethodConfig frac05_floor50 = noguard;
+        frac05_floor50.variant_name = "cng_frac05_floor50";
+        frac05_floor50.consensus_candidate_frac = 0.05;
+        frac05_floor50.consensus_candidate_floor_us = 50.0;
+        add(frac05_floor50);
+
+        MethodConfig frac02_floor100 = noguard;
+        frac02_floor100.variant_name = "cng_frac02_floor100";
+        frac02_floor100.consensus_candidate_frac = 0.02;
+        frac02_floor100.consensus_candidate_floor_us = 100.0;
+        add(frac02_floor100);
+
+        MethodConfig p01_bin1 = noguard;
+        p01_bin1.variant_name = "cng_p01_bin1";
+        p01_bin1.consensus_percentile = 0.01;
+        p01_bin1.consensus_slope_bin_ppm = 1.0;
+        p01_bin1.consensus_slope_max_ppm = 1000.0;
+        add(p01_bin1);
+
+        MethodConfig p10_bin1 = noguard;
+        p10_bin1.variant_name = "cng_p10_bin1";
+        p10_bin1.consensus_percentile = 0.10;
+        p10_bin1.consensus_slope_bin_ppm = 1.0;
+        p10_bin1.consensus_slope_max_ppm = 1000.0;
+        add(p10_bin1);
+    }
+
+    // M4a10 - TimeSync tilted-min (sloped floor)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncTilted;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.cse_window_us = 30000000;
+        m.cse_min_samples = 8;
+        m.cse_beta = 0.05;
+        m.cse_max_ppm = 500.0;
+        m.cse_net_slope_max = 5.0;
+        m.cse_iqr_min_us = 200.0;
+        m.cse_iqr_k = 10.0;
+        m.cse_use_rtt_guard = true;
+        add(m);
+
+        MethodConfig b02 = m;
+        b02.variant_name = "b0.02";
+        b02.cse_beta = 0.02;
+        add(b02);
+
+        MethodConfig b10 = m;
+        b10.variant_name = "b0.10";
+        b10.cse_beta = 0.10;
+        add(b10);
+
+        MethodConfig max200 = m;
+        max200.variant_name = "max200";
+        max200.cse_max_ppm = 200.0;
+        add(max200);
+
+        MethodConfig net2 = m;
+        net2.variant_name = "net2";
+        net2.cse_net_slope_max = 2.0;
+        add(net2);
+
+        MethodConfig noguard = m;
+        noguard.variant_name = "noguard";
+        noguard.cse_use_rtt_guard = false;
+        noguard.cse_net_slope_max = 10.0;
+        add(noguard);
+
+        MethodConfig noguard_strict = m;
+        noguard_strict.variant_name = "noguard_strict";
+        noguard_strict.cse_use_rtt_guard = false;
+        noguard_strict.cse_iqr_min_us = 100.0;
+        noguard_strict.cse_iqr_k = 5.0;
+        noguard_strict.cse_net_slope_max = 5.0;
+        add(noguard_strict);
+
+        MethodConfig noguard_net2 = m;
+        noguard_net2.variant_name = "noguard_net2";
+        noguard_net2.cse_use_rtt_guard = false;
+        noguard_net2.cse_net_slope_max = 2.0;
+        add(noguard_net2);
+
+        MethodConfig guard500 = m;
+        guard500.variant_name = "guard500";
+        guard500.cse_use_rtt_guard = true;
+        guard500.rtt_guard_delta_us = 500.0;
+        guard500.rtt_guard_iqr_us = 500.0;
+        guard500.cse_net_slope_max = 10.0;
+        add(guard500);
+
+        MethodConfig guard1000 = m;
+        guard1000.variant_name = "guard1ms";
+        guard1000.cse_use_rtt_guard = true;
+        guard1000.rtt_guard_delta_us = 1000.0;
+        guard1000.rtt_guard_iqr_us = 1000.0;
+        guard1000.cse_net_slope_max = 10.0;
+        add(guard1000);
+
+        MethodConfig step = m;
+        step.variant_name = "step";
+        step.tilted_use_stepguard = true;
+        add(step);
+
+        MethodConfig shadow = m;
+        shadow.variant_name = "shadow_rtt";
+        shadow.tilted_use_shadow = true;
+        shadow.gsp_use_rtt_guard = true;
+        add(shadow);
+    }
+
+    // M4a10b - TimeSync slope de-trend (Theil-Sen on raw deltas)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncSlope;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.sloped_window_us = 10000000;
+        m.sloped_min_samples = 20;
+        m.sloped_clamp_ppm = 200.0;
+        m.sloped_gate_iqr_us = 300.0;
+        m.sloped_gate_min_samples = 20;
+        m.variant_name = "robust_theil_sen";
+        add(m);
+    }
+
+    // M4a11 - TimeSync age-compensated minima
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncAgeComp;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.cse_window_us = 30000000;
+        m.cse_min_samples = 8;
+        m.cse_beta = 0.05;
+        m.cse_max_ppm = 500.0;
+        m.cse_net_slope_max = 5.0;
+        m.cse_iqr_min_us = 200.0;
+        m.cse_iqr_k = 10.0;
+        m.cse_use_rtt_guard = true;
+        m.age_comp_max_age_us = 10000000;
+        m.age_comp_min_ppm = 0.0;
+        m.age_comp_use_rtt_guard = true;
+        add(m);
+
+        MethodConfig hyst = m;
+        hyst.variant_name = "hyst_agecomp";
+        add(hyst);
+
+        MethodConfig age5 = m;
+        age5.variant_name = "age5s";
+        age5.age_comp_max_age_us = 5000000;
+        add(age5);
+
+        MethodConfig age30 = m;
+        age30.variant_name = "age30s";
+        age30.age_comp_max_age_us = 30000000;
+        add(age30);
+
+        MethodConfig beta02 = m;
+        beta02.variant_name = "b0.02";
+        beta02.cse_beta = 0.02;
+        add(beta02);
+
+        MethodConfig beta10 = m;
+        beta10.variant_name = "b0.10";
+        beta10.cse_beta = 0.10;
+        add(beta10);
+
+        MethodConfig clamp05 = m;
+        clamp05.variant_name = "clampiqr0p5";
+        clamp05.age_comp_clamp_margin_us = 50.0;
+        clamp05.age_comp_clamp_k = 0.5;
+        add(clamp05);
+
+        MethodConfig clamp10 = m;
+        clamp10.variant_name = "clampiqr1p0";
+        clamp10.age_comp_clamp_margin_us = 100.0;
+        clamp10.age_comp_clamp_k = 1.0;
+        add(clamp10);
+
+        MethodConfig decay50 = m;
+        decay50.variant_name = "decay50ppm";
+        decay50.age_comp_fixed_ppm = 50.0;
+        add(decay50);
+
+        MethodConfig decay100 = m;
+        decay100.variant_name = "decay100ppm";
+        decay100.age_comp_fixed_ppm = 100.0;
+        add(decay100);
+
+        MethodConfig step = m;
+        step.variant_name = "step";
+        step.age_comp_use_stepguard = true;
+        add(step);
+    }
+
+    // M4a11a - TimeSync dual-slope skew estimator + age comp
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncDualSlope;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.cse_window_us = 30000000;
+        m.cse_min_samples = 8;
+        m.cse_beta = 0.05;
+        m.cse_max_ppm = 500.0;
+        m.cse_net_slope_max = 5.0;
+        m.cse_iqr_min_us = 200.0;
+        m.cse_iqr_k = 10.0;
+        m.cse_use_rtt_guard = true;
+        m.age_comp_max_age_us = 10000000;
+        m.age_comp_min_ppm = 0.0;
+        m.age_comp_use_rtt_guard = true;
+        add(m);
+
+        MethodConfig fast = m;
+        fast.variant_name = "beta0p1";
+        fast.cse_beta = 0.10;
+        add(fast);
+    }
+
+    // M4a11b - TimeSync state-machine (baseline vs drift/step)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncStateMachine;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.gsp_guard_min_us = 50.0;
+        m.gsp_guard_k = 4.0;
+        m.gsp_iqr_min_us = 200.0;
+        m.gsp_iqr_k = 10.0;
+        m.gsp_gnear_min_us = 25.0;
+        m.gsp_gnear_k = 2.0;
+        m.gsp_npkt_min = 20;
+        m.cse_window_us = 30000000;
+        m.cse_min_samples = 8;
+        m.cse_beta = 0.05;
+        m.cse_max_ppm = 500.0;
+        m.cse_net_slope_max = 5.0;
+        m.cse_iqr_min_us = 200.0;
+        m.cse_iqr_k = 10.0;
+        m.cse_use_rtt_guard = true;
+        m.age_comp_max_age_us = 10000000;
+        m.age_comp_min_ppm = 0.0;
+        m.age_comp_use_rtt_guard = true;
+        m.step_threshold_us = 1000.0;
+        m.step_n_consec = 2;
+        m.step_npkt_min = 20;
+        m.step_iqr_min_us = 200.0;
+        m.step_iqr_k = 10.0;
+        m.step_gnear_min_us = 50.0;
+        m.step_gnear_k = 2.0;
+        m.step_use_rtt_guard = true;
+        m.step_use_xor_gate = true;
+        m.state_drift_hold_us = 5000000;
+        m.state_step_hold_us = 3000000;
+        add(m);
+
+        MethodConfig hold10 = m;
+        hold10.variant_name = "hold10s";
+        hold10.state_drift_hold_us = 10000000;
+        add(hold10);
+
+        MethodConfig hold1 = m;
+        hold1.variant_name = "hold1s";
+        hold1.state_drift_hold_us = 1000000;
+        add(hold1);
+    }
+
+    // M4a11f - TimeSync policy switcher (multiwindow + tilted + quantile + decay)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncPolicy;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.timesync_quantile = 0.01;
+        m.quantile_short = 0.05;
+        m.window_us = 500000;
+        m.quantile_near_stale_reset = true;
+        m.quantile_near_stale_n_consec = 3;
+        m.quantile_flip_hold = true;
+        m.quantile_flip_hold_us = 5000000;
+        m.gsp_use_rtt_guard = true;
+        m.gsp_guard_min_us = 50.0;
+        m.gsp_guard_k = 4.0;
+        m.gsp_iqr_min_us = 200.0;
+        m.gsp_iqr_k = 10.0;
+        m.gsp_npkt_min = 20;
+        m.policy_use_quantile = true;
+        m.policy_use_tilted = true;
+        m.policy_use_decay = true;
+        m.policy_use_multiwin = true;
+        m.policy_use_local_skew = true;
+        m.rtt_guard_delta_us = 100000.0;
+        m.rtt_guard_iqr_us = 100000.0;
+        m.policy_near_ratio_low = 0.15;
+        m.policy_iqr_high_us = 8000.0;
+        m.policy_rtt_step_us = 1000.0;
+        m.policy_skew_min_ppm = 10.0;
+        m.policy_skew_window_us = 30000000;
+        m.policy_skew_min_samples = 4;
+        m.policy_skew_beta = 0.05;
+        m.policy_skew_max_ppm = 500.0;
+        m.policy_skew_net_max = 50.0;
+        m.policy_skew_iqr_max_us = 50000.0;
+        m.policy_skew_use_rtt_guard = false;
+        m.policy_min_samples = 10;
+        m.policy_hold_us = 5000000;
+        m.policy_switch_n = 2;
+        m.policy_require_rtt_guard = true;
+        m.multiwin_short_us = 1000000;
+        m.multiwin_mid_us = 5000000;
+        m.multiwin_long_us = 60000000;
+        m.decay_rate_us_per_s = 100.0;
+        m.cse_window_us = 30000000;
+        m.cse_min_samples = 4;
+        m.cse_beta = 0.05;
+        m.cse_max_ppm = 500.0;
+        m.cse_net_slope_max = 50.0;
+        m.cse_iqr_min_us = 50000.0;
+        m.cse_iqr_k = 10.0;
+        m.cse_use_rtt_guard = true;
+        m.saw_use = true;
+        add(m);
+
+        MethodConfig no_decay = m;
+        no_decay.variant_name = "no_decay";
+        no_decay.policy_use_decay = false;
+        add(no_decay);
+
+        MethodConfig no_local_skew = m;
+        no_local_skew.variant_name = "no_local_skew";
+        no_local_skew.policy_use_local_skew = false;
+        add(no_local_skew);
+
+        MethodConfig no_tilted = m;
+        no_tilted.variant_name = "no_tilted";
+        no_tilted.policy_use_tilted = false;
+        add(no_tilted);
+
+        MethodConfig no_quantile = m;
+        no_quantile.variant_name = "no_quantile";
+        no_quantile.policy_use_quantile = false;
+        add(no_quantile);
+
+        MethodConfig no_multi = m;
+        no_multi.variant_name = "no_multiwin";
+        no_multi.policy_use_multiwin = false;
+        add(no_multi);
+
+        MethodConfig rtt500 = m;
+        rtt500.variant_name = "rtt500";
+        rtt500.policy_rtt_step_us = 500.0;
+        add(rtt500);
+
+        MethodConfig rtt1500 = m;
+        rtt1500.variant_name = "rtt1500";
+        rtt1500.policy_rtt_step_us = 1500.0;
+        add(rtt1500);
+
+        MethodConfig guard_off = m;
+        guard_off.variant_name = "guard_off";
+        guard_off.policy_require_rtt_guard = false;
+        guard_off.cse_use_rtt_guard = false;
+        guard_off.gsp_use_rtt_guard = false;
+        add(guard_off);
+
+        MethodConfig skew0 = m;
+        skew0.variant_name = "skew0";
+        skew0.policy_skew_min_ppm = 0.0;
+        add(skew0);
+
+        MethodConfig skew25 = m;
+        skew25.variant_name = "skew25";
+        skew25.policy_skew_min_ppm = 25.0;
+        add(skew25);
+
+        MethodConfig skew50 = m;
+        skew50.variant_name = "skew50";
+        skew50.policy_skew_min_ppm = 50.0;
+        add(skew50);
+
+        MethodConfig iqr400 = m;
+        iqr400.variant_name = "iqr400";
+        iqr400.policy_iqr_high_us = 400.0;
+        add(iqr400);
+
+        MethodConfig iqr1200 = m;
+        iqr1200.variant_name = "iqr1200";
+        iqr1200.policy_iqr_high_us = 1200.0;
+        add(iqr1200);
+
+        MethodConfig iqr4000 = m;
+        iqr4000.variant_name = "iqr4000";
+        iqr4000.policy_iqr_high_us = 4000.0;
+        add(iqr4000);
+
+        MethodConfig iqr16000 = m;
+        iqr16000.variant_name = "iqr16000";
+        iqr16000.policy_iqr_high_us = 16000.0;
+        add(iqr16000);
+
+        MethodConfig near02 = m;
+        near02.variant_name = "near0p02";
+        near02.policy_near_ratio_low = 0.02;
+        add(near02);
+
+        MethodConfig near05 = m;
+        near05.variant_name = "near0p05";
+        near05.policy_near_ratio_low = 0.05;
+        add(near05);
+
+        MethodConfig near10 = m;
+        near10.variant_name = "near0p10";
+        near10.policy_near_ratio_low = 0.10;
+        add(near10);
+
+        MethodConfig near30 = m;
+        near30.variant_name = "near0p30";
+        near30.policy_near_ratio_low = 0.30;
+        add(near30);
+
+        MethodConfig hold2 = m;
+        hold2.variant_name = "hold2s";
+        hold2.policy_hold_us = 2000000;
+        add(hold2);
+
+        MethodConfig hold10 = m;
+        hold10.variant_name = "hold10s";
+        hold10.policy_hold_us = 10000000;
+        add(hold10);
+
+        MethodConfig qshrink_w1 = m;
+        qshrink_w1.variant_name = "qshrink_w1s";
+        qshrink_w1.quantile_flip_shrink = true;
+        qshrink_w1.quantile_flip_window_us = 1000000;
+        qshrink_w1.quantile_flip_hold_us = 5000000;
+        qshrink_w1.window_us = 1000000;
+        add(qshrink_w1);
+
+        MethodConfig qshrink_w2 = m;
+        qshrink_w2.variant_name = "qshrink_w2s";
+        qshrink_w2.quantile_flip_shrink = true;
+        qshrink_w2.quantile_flip_window_us = 1000000;
+        qshrink_w2.quantile_flip_hold_us = 5000000;
+        qshrink_w2.window_us = 2000000;
+        add(qshrink_w2);
+
+        MethodConfig qshrink_w5 = m;
+        qshrink_w5.variant_name = "qshrink_w5s";
+        qshrink_w5.quantile_flip_shrink = true;
+        qshrink_w5.quantile_flip_window_us = 1000000;
+        qshrink_w5.quantile_flip_hold_us = 5000000;
+        qshrink_w5.window_us = 5000000;
+        add(qshrink_w5);
+
+        MethodConfig qshrink_w10 = m;
+        qshrink_w10.variant_name = "qshrink_w10s";
+        qshrink_w10.quantile_flip_shrink = true;
+        qshrink_w10.quantile_flip_window_us = 1000000;
+        qshrink_w10.quantile_flip_hold_us = 5000000;
+        qshrink_w10.window_us = 10000000;
+        add(qshrink_w10);
+
+        MethodConfig qshrink_hold10 = m;
+        qshrink_hold10.variant_name = "qshrink_hold10";
+        qshrink_hold10.quantile_flip_shrink = true;
+        qshrink_hold10.quantile_flip_window_us = 1000000;
+        qshrink_hold10.quantile_flip_hold_us = 10000000;
+        add(qshrink_hold10);
+
+        MethodConfig qshrink_only = m;
+        qshrink_only.variant_name = "qshrink_only";
+        qshrink_only.quantile_flip_shrink = true;
+        qshrink_only.quantile_flip_window_us = 1000000;
+        qshrink_only.quantile_flip_hold_us = 5000000;
+        qshrink_only.policy_use_decay = false;
+        qshrink_only.policy_use_multiwin = false;
+        add(qshrink_only);
+
+        MethodConfig qshrink_only_noguard = qshrink_only;
+        qshrink_only_noguard.variant_name = "qshrink_only_noguard";
+        qshrink_only_noguard.policy_require_rtt_guard = false;
+        add(qshrink_only_noguard);
+
+        MethodConfig qshrink_only_w2 = qshrink_only;
+        qshrink_only_w2.variant_name = "qshrink_only_w2s";
+        qshrink_only_w2.window_us = 2000000;
+        add(qshrink_only_w2);
+
+        MethodConfig qshrink_only_w5 = qshrink_only;
+        qshrink_only_w5.variant_name = "qshrink_only_w5s";
+        qshrink_only_w5.window_us = 5000000;
+        add(qshrink_only_w5);
+
+        MethodConfig qshrink_only_multi = qshrink_only;
+        qshrink_only_multi.variant_name = "qshrink_only_multi";
+        qshrink_only_multi.policy_use_multiwin = true;
+        add(qshrink_only_multi);
+
+        MethodConfig qshrink_only_decay = qshrink_only;
+        qshrink_only_decay.variant_name = "qshrink_only_decay";
+        qshrink_only_decay.policy_use_decay = true;
+        qshrink_only_decay.policy_iqr_high_us = 20000.0;
+        add(qshrink_only_decay);
+
+        MethodConfig qshrink_only_decay_multi = qshrink_only;
+        qshrink_only_decay_multi.variant_name = "qshrink_only_decay_multi";
+        qshrink_only_decay_multi.policy_use_decay = true;
+        qshrink_only_decay_multi.policy_use_multiwin = true;
+        qshrink_only_decay_multi.policy_iqr_high_us = 20000.0;
+        add(qshrink_only_decay_multi);
+
+        MethodConfig qshrink_only_saw = qshrink_only;
+        qshrink_only_saw.variant_name = "qshrink_only_saw";
+        qshrink_only_saw.saw_use = true;
+        qshrink_only_saw.saw_short_window_us = 10000000;
+        qshrink_only_saw.saw_hold_us = 10000000;
+        qshrink_only_saw.policy_use_multiwin = true;
+        add(qshrink_only_saw);
+
+        MethodConfig qshrink_only_saw5 = qshrink_only_saw;
+        qshrink_only_saw5.variant_name = "qshrink_only_saw5";
+        qshrink_only_saw5.saw_short_window_us = 5000000;
+        qshrink_only_saw5.saw_hold_us = 5000000;
+        add(qshrink_only_saw5);
+
+        MethodConfig qshrink_only_saw2 = qshrink_only_saw;
+        qshrink_only_saw2.variant_name = "qshrink_only_saw2";
+        qshrink_only_saw2.saw_short_window_us = 2000000;
+        qshrink_only_saw2.saw_hold_us = 5000000;
+        add(qshrink_only_saw2);
+
+        MethodConfig qshrink_only_hold10 = qshrink_only;
+        qshrink_only_hold10.variant_name = "qshrink_only_hold10";
+        qshrink_only_hold10.policy_hold_us = 10000000;
+        add(qshrink_only_hold10);
+
+        MethodConfig qshrink_only_switch3 = qshrink_only;
+        qshrink_only_switch3.variant_name = "qshrink_only_switch3";
+        qshrink_only_switch3.policy_switch_n = 3;
+        add(qshrink_only_switch3);
+
+        MethodConfig qshrink_only_switch5 = qshrink_only;
+        qshrink_only_switch5.variant_name = "qshrink_only_switch5";
+        qshrink_only_switch5.policy_switch_n = 5;
+        add(qshrink_only_switch5);
+
+        MethodConfig qshrink_only_switch5_hold10 = qshrink_only_switch5;
+        qshrink_only_switch5_hold10.variant_name = "qshrink_only_switch5_hold10";
+        qshrink_only_switch5_hold10.policy_hold_us = 10000000;
+        add(qshrink_only_switch5_hold10);
+
+        MethodConfig qshrink_only_switch5_hold2 = qshrink_only_switch5;
+        qshrink_only_switch5_hold2.variant_name = "qshrink_only_switch5_hold2";
+        qshrink_only_switch5_hold2.policy_hold_us = 2000000;
+        add(qshrink_only_switch5_hold2);
+
+        MethodConfig qshrink_only_switch5_min30 = qshrink_only_switch5;
+        qshrink_only_switch5_min30.variant_name = "qshrink_only_switch5_min30";
+        qshrink_only_switch5_min30.policy_min_samples = 30;
+        add(qshrink_only_switch5_min30);
+
+        MethodConfig qshrink_only_switch5_min5 = qshrink_only_switch5;
+        qshrink_only_switch5_min5.variant_name = "qshrink_only_switch5_min5";
+        qshrink_only_switch5_min5.policy_min_samples = 5;
+        add(qshrink_only_switch5_min5);
+
+        MethodConfig qshrink_only_switch5_rtt2000 = qshrink_only_switch5;
+        qshrink_only_switch5_rtt2000.variant_name = "qshrink_only_switch5_rtt2000";
+        qshrink_only_switch5_rtt2000.policy_rtt_step_us = 2000.0;
+        add(qshrink_only_switch5_rtt2000);
+
+        MethodConfig qshrink_only_switch5_near10 = qshrink_only_switch5;
+        qshrink_only_switch5_near10.variant_name = "qshrink_only_switch5_near0p10";
+        qshrink_only_switch5_near10.policy_near_ratio_low = 0.10;
+        add(qshrink_only_switch5_near10);
+
+        MethodConfig qshrink_only_switch5_near30 = qshrink_only_switch5;
+        qshrink_only_switch5_near30.variant_name = "qshrink_only_switch5_near0p30";
+        qshrink_only_switch5_near30.policy_near_ratio_low = 0.30;
+        add(qshrink_only_switch5_near30);
+
+        MethodConfig qshrink_only_switch5_skew25 = qshrink_only_switch5;
+        qshrink_only_switch5_skew25.variant_name = "qshrink_only_switch5_skew25";
+        qshrink_only_switch5_skew25.policy_skew_min_ppm = 25.0;
+        add(qshrink_only_switch5_skew25);
+
+        MethodConfig qshrink_only_switch5_skew50 = qshrink_only_switch5;
+        qshrink_only_switch5_skew50.variant_name = "qshrink_only_switch5_skew50";
+        qshrink_only_switch5_skew50.policy_skew_min_ppm = 50.0;
+        add(qshrink_only_switch5_skew50);
+
+        MethodConfig qshrink_only_switch5_w5s = qshrink_only_switch5;
+        qshrink_only_switch5_w5s.variant_name = "qshrink_only_switch5_w5s";
+        qshrink_only_switch5_w5s.window_us = 5000000;
+        add(qshrink_only_switch5_w5s);
+
+        MethodConfig qshrink_only_switch5_npkt50 = qshrink_only_switch5;
+        qshrink_only_switch5_npkt50.variant_name = "qshrink_only_switch5_npkt50";
+        qshrink_only_switch5_npkt50.gsp_npkt_min = 50;
+        add(qshrink_only_switch5_npkt50);
+
+        MethodConfig qshrink_only_switch5_iqrmin2k = qshrink_only_switch5;
+        qshrink_only_switch5_iqrmin2k.variant_name = "qshrink_only_switch5_iqrmin2k";
+        qshrink_only_switch5_iqrmin2k.gsp_iqr_min_us = 2000.0;
+        add(qshrink_only_switch5_iqrmin2k);
+
+        MethodConfig qshrink_only_switch5_guard200 = qshrink_only_switch5;
+        qshrink_only_switch5_guard200.variant_name = "qshrink_only_switch5_guard200";
+        qshrink_only_switch5_guard200.gsp_guard_min_us = 200.0;
+        add(qshrink_only_switch5_guard200);
+
+        MethodConfig qshrink_only_switch5_stale5 = qshrink_only_switch5;
+        qshrink_only_switch5_stale5.variant_name = "qshrink_only_switch5_stale5";
+        qshrink_only_switch5_stale5.quantile_near_stale_n_consec = 5;
+        add(qshrink_only_switch5_stale5);
+
+        MethodConfig qshrink_only_switch5_stalehold5 = qshrink_only_switch5;
+        qshrink_only_switch5_stalehold5.variant_name = "qshrink_only_switch5_stalehold5";
+        qshrink_only_switch5_stalehold5.quantile_near_stale_hold_us = 5000000;
+        add(qshrink_only_switch5_stalehold5);
+
+        MethodConfig qshrink_only_switch5_cse = qshrink_only_switch5;
+        qshrink_only_switch5_cse.variant_name = "qshrink_only_switch5_cse";
+        qshrink_only_switch5_cse.quantile_use_cse_gate = true;
+        add(qshrink_only_switch5_cse);
+
+        MethodConfig qshrink_only_switch5_cusum = qshrink_only_switch5;
+        qshrink_only_switch5_cusum.variant_name = "qshrink_only_switch5_cusum";
+        qshrink_only_switch5_cusum.quantile_cusum_gate = true;
+        qshrink_only_switch5_cusum.cusum_k_us = 50.0;
+        qshrink_only_switch5_cusum.cusum_h_us = 500.0;
+        qshrink_only_switch5_cusum.cusum_hold_us = 5000000;
+        add(qshrink_only_switch5_cusum);
+
+        MethodConfig qshrink_only_switch5_promo100 = qshrink_only_switch5;
+        qshrink_only_switch5_promo100.variant_name = "qshrink_only_switch5_promo100";
+        qshrink_only_switch5_promo100.promo_max_ppm = 100.0;
+        add(qshrink_only_switch5_promo100);
+
+        MethodConfig qshrink_only_switch5_promok1 = qshrink_only_switch5;
+        qshrink_only_switch5_promok1.variant_name = "qshrink_only_switch5_promok1";
+        qshrink_only_switch5_promok1.promo_max_k = 1.0;
+        add(qshrink_only_switch5_promok1);
+
+        MethodConfig qshrink_only_switch5_rttguard = qshrink_only_switch5;
+        qshrink_only_switch5_rttguard.variant_name = "qshrink_only_switch5_rttguard";
+        qshrink_only_switch5_rttguard.gsp_use_rtt_guard = true;
+        qshrink_only_switch5_rttguard.rtt_guard_delta_us = 20000.0;
+        qshrink_only_switch5_rttguard.rtt_guard_iqr_us = 20000.0;
+        add(qshrink_only_switch5_rttguard);
+
+        MethodConfig qshrink_only_switch5_rttguard_10 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_10.variant_name = "qshrink_only_switch5_rttguard_10ms";
+        qshrink_only_switch5_rttguard_10.rtt_guard_delta_us = 10000.0;
+        qshrink_only_switch5_rttguard_10.rtt_guard_iqr_us = 10000.0;
+        add(qshrink_only_switch5_rttguard_10);
+
+        MethodConfig qshrink_only_switch5_rttguard_40 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_40.variant_name = "qshrink_only_switch5_rttguard_40ms";
+        qshrink_only_switch5_rttguard_40.rtt_guard_delta_us = 40000.0;
+        qshrink_only_switch5_rttguard_40.rtt_guard_iqr_us = 40000.0;
+        add(qshrink_only_switch5_rttguard_40);
+
+        MethodConfig qshrink_only_switch5_rttguard_80 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_80.variant_name = "qshrink_only_switch5_rttguard_80ms";
+        qshrink_only_switch5_rttguard_80.rtt_guard_delta_us = 80000.0;
+        qshrink_only_switch5_rttguard_80.rtt_guard_iqr_us = 80000.0;
+        add(qshrink_only_switch5_rttguard_80);
+
+        MethodConfig qshrink_only_switch5_rttguard_stale5 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_stale5.variant_name = "qshrink_only_switch5_rttguard_stale5";
+        qshrink_only_switch5_rttguard_stale5.quantile_near_stale_n_consec = 5;
+        add(qshrink_only_switch5_rttguard_stale5);
+
+        MethodConfig qshrink_only_switch5_rttguard_stalehold5 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_stalehold5.variant_name = "qshrink_only_switch5_rttguard_stalehold5";
+        qshrink_only_switch5_rttguard_stalehold5.quantile_near_stale_hold_us = 5000000;
+        add(qshrink_only_switch5_rttguard_stalehold5);
+
+        MethodConfig qshrink_only_switch5_rttguard_npkt50 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_npkt50.variant_name = "qshrink_only_switch5_rttguard_npkt50";
+        qshrink_only_switch5_rttguard_npkt50.gsp_npkt_min = 50;
+        add(qshrink_only_switch5_rttguard_npkt50);
+
+        MethodConfig qshrink_only_switch5_rttguard_guard200 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_guard200.variant_name = "qshrink_only_switch5_rttguard_guard200";
+        qshrink_only_switch5_rttguard_guard200.gsp_guard_min_us = 200.0;
+        add(qshrink_only_switch5_rttguard_guard200);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_promo100.variant_name = "qshrink_only_switch5_rttguard_promo100";
+        qshrink_only_switch5_rttguard_promo100.promo_max_ppm = 100.0;
+        add(qshrink_only_switch5_rttguard_promo100);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo50 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_promo50.variant_name = "qshrink_only_switch5_rttguard_promo50";
+        qshrink_only_switch5_rttguard_promo50.promo_max_ppm = 50.0;
+        add(qshrink_only_switch5_rttguard_promo50);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo150 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_promo150.variant_name = "qshrink_only_switch5_rttguard_promo150";
+        qshrink_only_switch5_rttguard_promo150.promo_max_ppm = 150.0;
+        add(qshrink_only_switch5_rttguard_promo150);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo200 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_promo200.variant_name = "qshrink_only_switch5_rttguard_promo200";
+        qshrink_only_switch5_rttguard_promo200.promo_max_ppm = 200.0;
+        add(qshrink_only_switch5_rttguard_promo200);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_10ms = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_10ms.variant_name = "qshrink_only_switch5_rttguard_promo100_10ms";
+        qshrink_only_switch5_rttguard_promo100_10ms.rtt_guard_delta_us = 10000.0;
+        qshrink_only_switch5_rttguard_promo100_10ms.rtt_guard_iqr_us = 10000.0;
+        add(qshrink_only_switch5_rttguard_promo100_10ms);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_40ms = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_40ms.variant_name = "qshrink_only_switch5_rttguard_promo100_40ms";
+        qshrink_only_switch5_rttguard_promo100_40ms.rtt_guard_delta_us = 40000.0;
+        qshrink_only_switch5_rttguard_promo100_40ms.rtt_guard_iqr_us = 40000.0;
+        add(qshrink_only_switch5_rttguard_promo100_40ms);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skew10 = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skew10.variant_name = "qshrink_only_switch5_rttguard_promo100_skew10";
+        qshrink_only_switch5_rttguard_promo100_skew10.quantile_use_policy_skew_gate = true;
+        qshrink_only_switch5_rttguard_promo100_skew10.quantile_policy_skew_min_ppm = 10.0;
+        add(qshrink_only_switch5_rttguard_promo100_skew10);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_cd5 = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_cd5.variant_name = "qshrink_only_switch5_rttguard_promo100_cd5";
+        qshrink_only_switch5_rttguard_promo100_cd5.quantile_near_cooldown_us = 5000000;
+        add(qshrink_only_switch5_rttguard_promo100_cd5);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qswap_q01q05 = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_qswap_q01q05.variant_name = "qshrink_only_switch5_rttguard_promo100_qswap_q01q05";
+        qshrink_only_switch5_rttguard_promo100_qswap_q01q05.adaptive_use_quantile_swap = true;
+        qshrink_only_switch5_rttguard_promo100_qswap_q01q05.quantile_swap_low = 0.01;
+        qshrink_only_switch5_rttguard_promo100_qswap_q01q05.quantile_swap_high = 0.05;
+        qshrink_only_switch5_rttguard_promo100_qswap_q01q05.timesync_quantile =
+            qshrink_only_switch5_rttguard_promo100_qswap_q01q05.quantile_swap_low;
+        add(qshrink_only_switch5_rttguard_promo100_qswap_q01q05);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qswap_tight =
+            qshrink_only_switch5_rttguard_promo100_qswap_q01q05;
+        qshrink_only_switch5_rttguard_promo100_qswap_tight.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qswap_tight";
+        qshrink_only_switch5_rttguard_promo100_qswap_tight.quantile_swap_jitter_enter_us = 150.0;
+        qshrink_only_switch5_rttguard_promo100_qswap_tight.quantile_swap_jitter_exit_us = 90.0;
+        qshrink_only_switch5_rttguard_promo100_qswap_tight.quantile_swap_iqr_enter_us = 300.0;
+        qshrink_only_switch5_rttguard_promo100_qswap_tight.quantile_swap_iqr_exit_us = 200.0;
+        add(qshrink_only_switch5_rttguard_promo100_qswap_tight);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_stalehold2 = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_stalehold2.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_stalehold2";
+        qshrink_only_switch5_rttguard_promo100_stalehold2.quantile_near_stale_hold_us = 2000000;
+        add(qshrink_only_switch5_rttguard_promo100_stalehold2);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qreq = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_qreq.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qrequireskew";
+        qshrink_only_switch5_rttguard_promo100_qreq.policy_quantile_requires_skew = true;
+        add(qshrink_only_switch5_rttguard_promo100_qreq);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qblockiqr = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_qblockiqr.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qblockiqr";
+        qshrink_only_switch5_rttguard_promo100_qblockiqr.policy_quantile_block_high_iqr = true;
+        add(qshrink_only_switch5_rttguard_promo100_qblockiqr);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qreq_block = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_qreq_block.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qreq_blockiqr";
+        qshrink_only_switch5_rttguard_promo100_qreq_block.policy_quantile_requires_skew = true;
+        qshrink_only_switch5_rttguard_promo100_qreq_block.policy_quantile_block_high_iqr = true;
+        add(qshrink_only_switch5_rttguard_promo100_qreq_block);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_decayfirst = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_decayfirst.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_decayfirst";
+        qshrink_only_switch5_rttguard_promo100_decayfirst.policy_prioritize_decay = true;
+        add(qshrink_only_switch5_rttguard_promo100_decayfirst);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_decayfirst_qreq =
+            qshrink_only_switch5_rttguard_promo100_decayfirst;
+        qshrink_only_switch5_rttguard_promo100_decayfirst_qreq.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_decayfirst_qrequireskew";
+        qshrink_only_switch5_rttguard_promo100_decayfirst_qreq.policy_quantile_requires_skew = true;
+        add(qshrink_only_switch5_rttguard_promo100_decayfirst_qreq);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_decayfirst_qblock =
+            qshrink_only_switch5_rttguard_promo100_decayfirst;
+        qshrink_only_switch5_rttguard_promo100_decayfirst_qblock.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_decayfirst_qblockiqr";
+        qshrink_only_switch5_rttguard_promo100_decayfirst_qblock.policy_quantile_block_high_iqr = true;
+        add(qshrink_only_switch5_rttguard_promo100_decayfirst_qblock);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_decayfirst_qreq_block =
+            qshrink_only_switch5_rttguard_promo100_decayfirst;
+        qshrink_only_switch5_rttguard_promo100_decayfirst_qreq_block.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_decayfirst_qreq_blockiqr";
+        qshrink_only_switch5_rttguard_promo100_decayfirst_qreq_block.policy_quantile_requires_skew = true;
+        qshrink_only_switch5_rttguard_promo100_decayfirst_qreq_block.policy_quantile_block_high_iqr = true;
+        add(qshrink_only_switch5_rttguard_promo100_decayfirst_qreq_block);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_qprefer.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer";
+        qshrink_only_switch5_rttguard_promo100_qprefer.policy_quantile_prefer_low_near = true;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer_qreq =
+            qshrink_only_switch5_rttguard_promo100_qprefer;
+        qshrink_only_switch5_rttguard_promo100_qprefer_qreq.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer_qrequireskew";
+        qshrink_only_switch5_rttguard_promo100_qprefer_qreq.policy_quantile_requires_skew = true;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer_qreq);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer_qblock =
+            qshrink_only_switch5_rttguard_promo100_qprefer;
+        qshrink_only_switch5_rttguard_promo100_qprefer_qblock.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer_qblockiqr";
+        qshrink_only_switch5_rttguard_promo100_qprefer_qblock.policy_quantile_block_high_iqr = true;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer_qblock);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_notilted = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_notilted.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_notilted";
+        qshrink_only_switch5_rttguard_promo100_notilted.policy_use_tilted = false;
+        add(qshrink_only_switch5_rttguard_promo100_notilted);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_noquantile = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_noquantile.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_noquantile";
+        qshrink_only_switch5_rttguard_promo100_noquantile.policy_use_quantile = false;
+        add(qshrink_only_switch5_rttguard_promo100_noquantile);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_near80 = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_near80.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_near0p80";
+        qshrink_only_switch5_rttguard_promo100_near80.policy_near_ratio_low = 0.80;
+        add(qshrink_only_switch5_rttguard_promo100_near80);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_near95 = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_near95.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_near0p95";
+        qshrink_only_switch5_rttguard_promo100_near95.policy_near_ratio_low = 0.95;
+        add(qshrink_only_switch5_rttguard_promo100_near95);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_near99 = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_near99.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_near0p99";
+        qshrink_only_switch5_rttguard_promo100_near99.policy_near_ratio_low = 0.99;
+        add(qshrink_only_switch5_rttguard_promo100_near99);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_near100 = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_near100.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_near1p0";
+        qshrink_only_switch5_rttguard_promo100_near100.policy_near_ratio_low = 1.0;
+        add(qshrink_only_switch5_rttguard_promo100_near100);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_near100_min5 = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_near100_min5.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_near1p0_min5";
+        qshrink_only_switch5_rttguard_promo100_near100_min5.policy_near_ratio_low = 1.0;
+        qshrink_only_switch5_rttguard_promo100_near100_min5.policy_min_samples = 5;
+        add(qshrink_only_switch5_rttguard_promo100_near100_min5);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_decay_on = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_decay_on.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_decay_on";
+        qshrink_only_switch5_rttguard_promo100_decay_on.policy_use_decay = true;
+        qshrink_only_switch5_rttguard_promo100_decay_on.policy_iqr_high_us = 8000.0;
+        add(qshrink_only_switch5_rttguard_promo100_decay_on);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_multi_on = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_multi_on.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_multi_on";
+        qshrink_only_switch5_rttguard_promo100_multi_on.policy_use_multiwin = true;
+        add(qshrink_only_switch5_rttguard_promo100_multi_on);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_decay_multi = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_decay_multi.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_decay_multi";
+        qshrink_only_switch5_rttguard_promo100_decay_multi.policy_use_decay = true;
+        qshrink_only_switch5_rttguard_promo100_decay_multi.policy_use_multiwin = true;
+        qshrink_only_switch5_rttguard_promo100_decay_multi.policy_iqr_high_us = 8000.0;
+        add(qshrink_only_switch5_rttguard_promo100_decay_multi);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer_near30 =
+            qshrink_only_switch5_rttguard_promo100_qprefer;
+        qshrink_only_switch5_rttguard_promo100_qprefer_near30.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer_near0p30";
+        qshrink_only_switch5_rttguard_promo100_qprefer_near30.policy_near_ratio_low = 0.30;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer_near30);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer_near50 =
+            qshrink_only_switch5_rttguard_promo100_qprefer;
+        qshrink_only_switch5_rttguard_promo100_qprefer_near50.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer_near0p50";
+        qshrink_only_switch5_rttguard_promo100_qprefer_near50.policy_near_ratio_low = 0.50;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer_near50);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer_near80 =
+            qshrink_only_switch5_rttguard_promo100_qprefer;
+        qshrink_only_switch5_rttguard_promo100_qprefer_near80.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer_near0p80";
+        qshrink_only_switch5_rttguard_promo100_qprefer_near80.policy_near_ratio_low = 0.80;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer_near80);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer_near95 =
+            qshrink_only_switch5_rttguard_promo100_qprefer;
+        qshrink_only_switch5_rttguard_promo100_qprefer_near95.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer_near0p95";
+        qshrink_only_switch5_rttguard_promo100_qprefer_near95.policy_near_ratio_low = 0.95;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer_near95);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer_near100 =
+            qshrink_only_switch5_rttguard_promo100_qprefer;
+        qshrink_only_switch5_rttguard_promo100_qprefer_near100.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer_near1p0";
+        qshrink_only_switch5_rttguard_promo100_qprefer_near100.policy_near_ratio_low = 1.0;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer_near100);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer_near100_min5 =
+            qshrink_only_switch5_rttguard_promo100_qprefer_near100;
+        qshrink_only_switch5_rttguard_promo100_qprefer_near100_min5.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer_near1p0_min5";
+        qshrink_only_switch5_rttguard_promo100_qprefer_near100_min5.policy_min_samples = 5;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer_near100_min5);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer_near100_skew25 =
+            qshrink_only_switch5_rttguard_promo100_qprefer_near100;
+        qshrink_only_switch5_rttguard_promo100_qprefer_near100_skew25.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer_near1p0_skew25";
+        qshrink_only_switch5_rttguard_promo100_qprefer_near100_skew25.policy_skew_min_ppm = 25.0;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer_near100_skew25);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer_near80_skew25 =
+            qshrink_only_switch5_rttguard_promo100_qprefer_near80;
+        qshrink_only_switch5_rttguard_promo100_qprefer_near80_skew25.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer_near0p80_skew25";
+        qshrink_only_switch5_rttguard_promo100_qprefer_near80_skew25.policy_skew_min_ppm = 25.0;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer_near80_skew25);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer_near50_skew25 =
+            qshrink_only_switch5_rttguard_promo100_qprefer_near50;
+        qshrink_only_switch5_rttguard_promo100_qprefer_near50_skew25.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer_near0p50_skew25";
+        qshrink_only_switch5_rttguard_promo100_qprefer_near50_skew25.policy_skew_min_ppm = 25.0;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer_near50_skew25);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer_near80_min5 =
+            qshrink_only_switch5_rttguard_promo100_qprefer_near80;
+        qshrink_only_switch5_rttguard_promo100_qprefer_near80_min5.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer_near0p80_min5";
+        qshrink_only_switch5_rttguard_promo100_qprefer_near80_min5.policy_min_samples = 5;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer_near80_min5);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_near30_nostable =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_near30_nostable.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_near0p30_nostable";
+        qshrink_only_switch5_rttguard_promo100_near30_nostable.policy_near_ratio_low = 0.30;
+        qshrink_only_switch5_rttguard_promo100_near30_nostable.policy_near_ignore_stable = true;
+        add(qshrink_only_switch5_rttguard_promo100_near30_nostable);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_near50_nostable =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_near50_nostable.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_near0p50_nostable";
+        qshrink_only_switch5_rttguard_promo100_near50_nostable.policy_near_ratio_low = 0.50;
+        qshrink_only_switch5_rttguard_promo100_near50_nostable.policy_near_ignore_stable = true;
+        add(qshrink_only_switch5_rttguard_promo100_near50_nostable);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_near80_nostable =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_near80_nostable.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_near0p80_nostable";
+        qshrink_only_switch5_rttguard_promo100_near80_nostable.policy_near_ratio_low = 0.80;
+        qshrink_only_switch5_rttguard_promo100_near80_nostable.policy_near_ignore_stable = true;
+        add(qshrink_only_switch5_rttguard_promo100_near80_nostable);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_near100_nostable =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_near100_nostable.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_near1p0_nostable";
+        qshrink_only_switch5_rttguard_promo100_near100_nostable.policy_near_ratio_low = 1.0;
+        qshrink_only_switch5_rttguard_promo100_near100_nostable.policy_near_ignore_stable = true;
+        add(qshrink_only_switch5_rttguard_promo100_near100_nostable);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_near100_min5_nostable =
+            qshrink_only_switch5_rttguard_promo100_near100_nostable;
+        qshrink_only_switch5_rttguard_promo100_near100_min5_nostable.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_near1p0_min5_nostable";
+        qshrink_only_switch5_rttguard_promo100_near100_min5_nostable.policy_min_samples = 5;
+        add(qshrink_only_switch5_rttguard_promo100_near100_min5_nostable);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer_near50_nostable =
+            qshrink_only_switch5_rttguard_promo100_qprefer_near50;
+        qshrink_only_switch5_rttguard_promo100_qprefer_near50_nostable.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer_near0p50_nostable";
+        qshrink_only_switch5_rttguard_promo100_qprefer_near50_nostable.policy_near_ignore_stable = true;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer_near50_nostable);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer_near80_nostable =
+            qshrink_only_switch5_rttguard_promo100_qprefer_near80;
+        qshrink_only_switch5_rttguard_promo100_qprefer_near80_nostable.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer_near0p80_nostable";
+        qshrink_only_switch5_rttguard_promo100_qprefer_near80_nostable.policy_near_ignore_stable = true;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer_near80_nostable);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer_near100_nostable =
+            qshrink_only_switch5_rttguard_promo100_qprefer_near100;
+        qshrink_only_switch5_rttguard_promo100_qprefer_near100_nostable.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer_near1p0_nostable";
+        qshrink_only_switch5_rttguard_promo100_qprefer_near100_nostable.policy_near_ignore_stable = true;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer_near100_nostable);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer_near100_min5_nostable =
+            qshrink_only_switch5_rttguard_promo100_qprefer_near100_nostable;
+        qshrink_only_switch5_rttguard_promo100_qprefer_near100_min5_nostable.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer_near1p0_min5_nostable";
+        qshrink_only_switch5_rttguard_promo100_qprefer_near100_min5_nostable.policy_min_samples = 5;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer_near100_min5_nostable);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_qprefer_near100_skew25_nostable =
+            qshrink_only_switch5_rttguard_promo100_qprefer_near100_nostable;
+        qshrink_only_switch5_rttguard_promo100_qprefer_near100_skew25_nostable.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_qprefer_near1p0_skew25_nostable";
+        qshrink_only_switch5_rttguard_promo100_qprefer_near100_skew25_nostable.policy_skew_min_ppm = 25.0;
+        add(qshrink_only_switch5_rttguard_promo100_qprefer_near100_skew25_nostable);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_noguard = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_noguard.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_noguard";
+        qshrink_only_switch5_rttguard_promo100_noguard.policy_require_rtt_guard = false;
+        add(qshrink_only_switch5_rttguard_promo100_noguard);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_noguard_qprefer =
+            qshrink_only_switch5_rttguard_promo100_noguard;
+        qshrink_only_switch5_rttguard_promo100_noguard_qprefer.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_noguard_qprefer";
+        qshrink_only_switch5_rttguard_promo100_noguard_qprefer.policy_quantile_prefer_low_near = true;
+        add(qshrink_only_switch5_rttguard_promo100_noguard_qprefer);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_noguard_near30 =
+            qshrink_only_switch5_rttguard_promo100_noguard;
+        qshrink_only_switch5_rttguard_promo100_noguard_near30.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_noguard_near0p30";
+        qshrink_only_switch5_rttguard_promo100_noguard_near30.policy_near_ratio_low = 0.30;
+        add(qshrink_only_switch5_rttguard_promo100_noguard_near30);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_noguard_near80 =
+            qshrink_only_switch5_rttguard_promo100_noguard;
+        qshrink_only_switch5_rttguard_promo100_noguard_near80.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_noguard_near0p80";
+        qshrink_only_switch5_rttguard_promo100_noguard_near80.policy_near_ratio_low = 0.80;
+        add(qshrink_only_switch5_rttguard_promo100_noguard_near80);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_noguard_near100 =
+            qshrink_only_switch5_rttguard_promo100_noguard;
+        qshrink_only_switch5_rttguard_promo100_noguard_near100.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_noguard_near1p0";
+        qshrink_only_switch5_rttguard_promo100_noguard_near100.policy_near_ratio_low = 1.0;
+        add(qshrink_only_switch5_rttguard_promo100_noguard_near100);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_noguard_qprefer_near80 =
+            qshrink_only_switch5_rttguard_promo100_noguard_qprefer;
+        qshrink_only_switch5_rttguard_promo100_noguard_qprefer_near80.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_noguard_qprefer_near0p80";
+        qshrink_only_switch5_rttguard_promo100_noguard_qprefer_near80.policy_near_ratio_low = 0.80;
+        add(qshrink_only_switch5_rttguard_promo100_noguard_qprefer_near80);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_noguard_qprefer_near100 =
+            qshrink_only_switch5_rttguard_promo100_noguard_qprefer;
+        qshrink_only_switch5_rttguard_promo100_noguard_qprefer_near100.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_noguard_qprefer_near1p0";
+        qshrink_only_switch5_rttguard_promo100_noguard_qprefer_near100.policy_near_ratio_low = 1.0;
+        add(qshrink_only_switch5_rttguard_promo100_noguard_qprefer_near100);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_noguard_qprefer_near100_min5 =
+            qshrink_only_switch5_rttguard_promo100_noguard_qprefer_near100;
+        qshrink_only_switch5_rttguard_promo100_noguard_qprefer_near100_min5.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_noguard_qprefer_near1p0_min5";
+        qshrink_only_switch5_rttguard_promo100_noguard_qprefer_near100_min5.policy_min_samples = 5;
+        add(qshrink_only_switch5_rttguard_promo100_noguard_qprefer_near100_min5);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_noguard_notilted =
+            qshrink_only_switch5_rttguard_promo100_noguard;
+        qshrink_only_switch5_rttguard_promo100_noguard_notilted.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_noguard_notilted";
+        qshrink_only_switch5_rttguard_promo100_noguard_notilted.policy_use_tilted = false;
+        add(qshrink_only_switch5_rttguard_promo100_noguard_notilted);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_noguard_noquantile =
+            qshrink_only_switch5_rttguard_promo100_noguard;
+        qshrink_only_switch5_rttguard_promo100_noguard_noquantile.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_noguard_noquantile";
+        qshrink_only_switch5_rttguard_promo100_noguard_noquantile.policy_use_quantile = false;
+        add(qshrink_only_switch5_rttguard_promo100_noguard_noquantile);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_tiltreq_skew200 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew200.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_tiltreq_skew200";
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew200.policy_tilted_requires_skew = true;
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew200.policy_skew_min_ppm = 200.0;
+        add(qshrink_only_switch5_rttguard_promo100_tiltreq_skew200);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_tiltreq_skew400 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew400.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_tiltreq_skew400";
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew400.policy_tilted_requires_skew = true;
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew400.policy_skew_min_ppm = 400.0;
+        add(qshrink_only_switch5_rttguard_promo100_tiltreq_skew400);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_tiltreq_skew800 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew800.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_tiltreq_skew800";
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew800.policy_tilted_requires_skew = true;
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew800.policy_skew_min_ppm = 800.0;
+        add(qshrink_only_switch5_rttguard_promo100_tiltreq_skew800);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_tiltreq_skew200_qprefer =
+            qshrink_only_switch5_rttguard_promo100_tiltreq_skew200;
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew200_qprefer.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_tiltreq_skew200_qprefer";
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew200_qprefer.policy_quantile_prefer_low_near = true;
+        add(qshrink_only_switch5_rttguard_promo100_tiltreq_skew200_qprefer);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_tiltreq_skew400_qprefer =
+            qshrink_only_switch5_rttguard_promo100_tiltreq_skew400;
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew400_qprefer.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_tiltreq_skew400_qprefer";
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew400_qprefer.policy_quantile_prefer_low_near = true;
+        add(qshrink_only_switch5_rttguard_promo100_tiltreq_skew400_qprefer);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_tiltreq_skew800_qprefer =
+            qshrink_only_switch5_rttguard_promo100_tiltreq_skew800;
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew800_qprefer.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_tiltreq_skew800_qprefer";
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew800_qprefer.policy_quantile_prefer_low_near = true;
+        add(qshrink_only_switch5_rttguard_promo100_tiltreq_skew800_qprefer);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_tiltreq_skew200_qblock =
+            qshrink_only_switch5_rttguard_promo100_tiltreq_skew200;
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew200_qblock.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_tiltreq_skew200_qblockiqr";
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew200_qblock.policy_quantile_block_high_iqr = true;
+        add(qshrink_only_switch5_rttguard_promo100_tiltreq_skew200_qblock);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_tiltreq_skew400_qblock =
+            qshrink_only_switch5_rttguard_promo100_tiltreq_skew400;
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew400_qblock.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_tiltreq_skew400_qblockiqr";
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew400_qblock.policy_quantile_block_high_iqr = true;
+        add(qshrink_only_switch5_rttguard_promo100_tiltreq_skew400_qblock);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_tiltreq_skew800_qblock =
+            qshrink_only_switch5_rttguard_promo100_tiltreq_skew800;
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew800_qblock.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_tiltreq_skew800_qblockiqr";
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew800_qblock.policy_quantile_block_high_iqr = true;
+        add(qshrink_only_switch5_rttguard_promo100_tiltreq_skew800_qblock);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_tiltreq_skew800_decayfirst =
+            qshrink_only_switch5_rttguard_promo100_tiltreq_skew800;
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew800_decayfirst.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_tiltreq_skew800_decayfirst";
+        qshrink_only_switch5_rttguard_promo100_tiltreq_skew800_decayfirst.policy_prioritize_decay = true;
+        add(qshrink_only_switch5_rttguard_promo100_tiltreq_skew800_decayfirst);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewwin10 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewwin10.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewwin10s";
+        qshrink_only_switch5_rttguard_promo100_skewwin10.policy_skew_window_us = 10000000;
+        add(qshrink_only_switch5_rttguard_promo100_skewwin10);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewwin60 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewwin60.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewwin60s";
+        qshrink_only_switch5_rttguard_promo100_skewwin60.policy_skew_window_us = 60000000;
+        add(qshrink_only_switch5_rttguard_promo100_skewwin60);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewbeta02 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewbeta02.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewbeta0p02";
+        qshrink_only_switch5_rttguard_promo100_skewbeta02.policy_skew_beta = 0.02;
+        add(qshrink_only_switch5_rttguard_promo100_skewbeta02);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewbeta10 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewbeta10.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewbeta0p10";
+        qshrink_only_switch5_rttguard_promo100_skewbeta10.policy_skew_beta = 0.10;
+        add(qshrink_only_switch5_rttguard_promo100_skewbeta10);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewminsamples2";
+        qshrink_only_switch5_rttguard_promo100_skewmin2.policy_skew_min_samples = 2;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin8 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin8.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewminsamples8";
+        qshrink_only_switch5_rttguard_promo100_skewmin8.policy_skew_min_samples = 8;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin8);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmax200 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmax200.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmax200";
+        qshrink_only_switch5_rttguard_promo100_skewmax200.policy_skew_max_ppm = 200.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmax200);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmax800 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmax800.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmax800";
+        qshrink_only_switch5_rttguard_promo100_skewmax800.policy_skew_max_ppm = 800.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmax800);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewnet10 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewnet10.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewnet10";
+        qshrink_only_switch5_rttguard_promo100_skewnet10.policy_skew_net_max = 10.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewnet10);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewnet100 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewnet100.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewnet100";
+        qshrink_only_switch5_rttguard_promo100_skewnet100.policy_skew_net_max = 100.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewnet100);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_beta02 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_beta02.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_beta0p02";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_beta02.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_beta02.policy_skew_beta = 0.02;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_beta02);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_beta10 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_beta10.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_beta0p10";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_beta10.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_beta10.policy_skew_beta = 0.10;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_beta10);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_win10 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_win10.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_win10s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_win10.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_win10.policy_skew_window_us = 10000000;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_win10);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_win60 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_win60.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_win60s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_win60.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_win60.policy_skew_window_us = 60000000;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_win60);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800.policy_skew_max_ppm = 800.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_net100 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_net100.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_net100";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_net100.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_net100.policy_skew_net_max = 100.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_net100);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_net50 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_net50.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_net50";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_net50.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_net50.policy_skew_net_max = 50.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_net50);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max200 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max200.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max200";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max200.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max200.policy_skew_max_ppm = 200.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max200);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_min0 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_min0.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_skewmin0";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_min0.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_min0.policy_skew_min_ppm = 0.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_min0);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_min25 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_min25.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_skewmin25";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_min25.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_min25.policy_skew_min_ppm = 25.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_min25);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta10 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta10.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta0p10";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta10.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta10.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta10.policy_skew_beta = 0.10;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta10);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta02 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta02.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta0p02";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta02.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta02.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta02.policy_skew_beta = 0.02;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta02);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win10 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win10.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win10s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win10.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win10.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win10.policy_skew_window_us = 10000000;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win10);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win60 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win60.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win60s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win60.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win60.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win60.policy_skew_window_us = 60000000;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win60);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net100 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net100.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net100";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net100.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net100.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net100.policy_skew_net_max = 100.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net100);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net50 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net50.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net50";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net50.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net50.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net50.policy_skew_net_max = 50.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net50);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_min0 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_min0.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_skewmin0";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_min0.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_min0.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_min0.policy_skew_min_ppm = 0.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_min0);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_min25 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_min25.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_skewmin25";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_min25.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_min25.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_min25.policy_skew_min_ppm = 25.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_min25);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin1_max800 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max800.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin1_max800";
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max800.policy_skew_min_samples = 1;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max800.policy_skew_max_ppm = 800.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin1_max800);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin3_max800 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max800.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin3_max800";
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max800.policy_skew_min_samples = 3;
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max800.policy_skew_max_ppm = 800.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin3_max800);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr10k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr10k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr10k";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr10k.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr10k.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr10k.policy_skew_iqr_max_us = 10000.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr10k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr20k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr20k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr20k";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr20k.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr20k.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr20k.policy_skew_iqr_max_us = 20000.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr20k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k.policy_skew_iqr_max_us = 100000.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net200 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net200.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net200";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net200.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net200.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net200.policy_skew_net_max = 200.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net200);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net300 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net300.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net300";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net300.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net300.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net300.policy_skew_net_max = 300.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_net300);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta08 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta08.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta0p08";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta08.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta08.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta08.policy_skew_beta = 0.08;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta08);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta20 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta20.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta0p20";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta20.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta20.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta20.policy_skew_beta = 0.20;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_beta20);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_rttguard =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_rttguard.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_rttguard";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_rttguard.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_rttguard.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_rttguard.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_rttguard);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_localoff =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_localoff.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_localoff";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_localoff.policy_use_local_skew = false;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_localoff.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_localoff.policy_skew_max_ppm = 800.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_localoff);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win20 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win20.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win20s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win20.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win20.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win20.policy_skew_window_us = 20000000;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_win20);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta0p08";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08.policy_skew_beta = 0.08;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta06 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta06.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta0p06";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta06.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta06.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta06.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta06.policy_skew_beta = 0.06;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta06);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta0p12";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12.policy_skew_beta = 0.12;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr80k_beta08 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr80k_beta08.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr80k_beta0p08";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr80k_beta08.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr80k_beta08.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr80k_beta08.policy_skew_iqr_max_us = 80000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr80k_beta08.policy_skew_beta = 0.08;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr80k_beta08);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr120k_beta08 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr120k_beta08.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr120k_beta0p08";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr120k_beta08.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr120k_beta08.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr120k_beta08.policy_skew_iqr_max_us = 120000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr120k_beta08.policy_skew_beta = 0.08;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr120k_beta08);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p08";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08.policy_skew_beta = 0.08;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta06 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta06.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p06";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta06.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta06.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta06.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta06.policy_skew_beta = 0.06;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta06);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta10 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta10.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p10";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta10.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta10.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta10.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta10.policy_skew_beta = 0.10;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta10);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p12";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12.policy_skew_beta = 0.12;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr80k_beta08 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr80k_beta08.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr80k_beta0p08";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr80k_beta08.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr80k_beta08.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr80k_beta08.policy_skew_iqr_max_us = 80000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr80k_beta08.policy_skew_beta = 0.08;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr80k_beta08);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr120k_beta08 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr120k_beta08.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr120k_beta0p08";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr120k_beta08.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr120k_beta08.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr120k_beta08.policy_skew_iqr_max_us = 120000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr120k_beta08.policy_skew_beta = 0.08;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr120k_beta08);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta08 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta08.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta0p08";
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta08.policy_skew_min_samples = 1;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta08.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta08.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta08.policy_skew_beta = 0.08;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta08);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta0p08";
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08.policy_skew_min_samples = 3;
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08.policy_skew_beta = 0.08;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_win20 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_win20.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p08_win20s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_win20.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_win20.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_win20.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_win20.policy_skew_beta = 0.08;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_win20.policy_skew_window_us = 20000000;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_win20);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_win40 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_win40.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p08_win40s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_win40.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_win40.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_win40.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_win40.policy_skew_beta = 0.08;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_win40.policy_skew_window_us = 40000000;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_win40);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p08_rttguard";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard.policy_skew_beta = 0.08;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_base =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_base.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p08_rttguard_s2_base";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_base.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_base.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_base.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_base.policy_skew_beta = 0.08;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_base.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_base);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta06 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta06.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p08_rttguard_s2_beta0p06";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta06.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta06.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta06.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta06.policy_skew_beta = 0.06;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta06.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta06);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta10 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta10.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p08_rttguard_s2_beta0p10";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta10.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta10.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta10.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta10.policy_skew_beta = 0.10;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta10.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta10);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta12 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta12.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p08_rttguard_s2_beta0p12";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta12.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta12.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta12.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta12.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta12.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_beta12);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_iqr80k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_iqr80k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p08_rttguard_s2_iqr80k";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_iqr80k.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_iqr80k.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_iqr80k.policy_skew_iqr_max_us = 80000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_iqr80k.policy_skew_beta = 0.08;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_iqr80k.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_iqr80k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_iqr120k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_iqr120k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p08_rttguard_s2_iqr120k";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_iqr120k.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_iqr120k.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_iqr120k.policy_skew_iqr_max_us = 120000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_iqr120k.policy_skew_beta = 0.08;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_iqr120k.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_iqr120k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta08_rttguard_s2_min1 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta08_rttguard_s2_min1.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta0p08_rttguard_s2_min1";
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta08_rttguard_s2_min1.policy_skew_min_samples = 1;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta08_rttguard_s2_min1.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta08_rttguard_s2_min1.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta08_rttguard_s2_min1.policy_skew_beta = 0.08;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta08_rttguard_s2_min1.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta08_rttguard_s2_min1);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta08_rttguard_s2_max500 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta08_rttguard_s2_max500.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta0p08_rttguard_s2_max500";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta08_rttguard_s2_max500.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta08_rttguard_s2_max500.policy_skew_max_ppm = 500.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta08_rttguard_s2_max500.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta08_rttguard_s2_max500.policy_skew_beta = 0.08;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta08_rttguard_s2_max500.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta08_rttguard_s2_max500);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta08_rttguard_s2_max700 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta08_rttguard_s2_max700.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p08_rttguard_s2_max700";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta08_rttguard_s2_max700.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta08_rttguard_s2_max700.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta08_rttguard_s2_max700.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta08_rttguard_s2_max700.policy_skew_beta = 0.08;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta08_rttguard_s2_max700.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta08_rttguard_s2_max700);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win20 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win20.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p08_rttguard_s2_win20s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win20.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win20.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win20.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win20.policy_skew_beta = 0.08;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win20.policy_skew_window_us = 20000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win20.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win20);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win40 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win40.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p08_rttguard_s2_win40s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win40.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win40.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win40.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win40.policy_skew_beta = 0.08;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win40.policy_skew_window_us = 40000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win40.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_rttguard_s2_win40);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_base =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_base.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p12_rttguard_s3_base";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_base.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_base.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_base.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_base.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_base.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_base);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta10 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta10.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p12_rttguard_s3_beta0p10";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta10.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta10.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta10.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta10.policy_skew_beta = 0.10;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta10.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta10);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta14 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta14.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p12_rttguard_s3_beta0p14";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta14.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta14.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta14.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta14.policy_skew_beta = 0.14;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta14.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta14);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta16 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta16.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p12_rttguard_s3_beta0p16";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta16.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta16.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta16.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta16.policy_skew_beta = 0.16;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta16.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_beta16);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_iqr80k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_iqr80k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p12_rttguard_s3_iqr80k";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_iqr80k.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_iqr80k.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_iqr80k.policy_skew_iqr_max_us = 80000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_iqr80k.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_iqr80k.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_iqr80k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_iqr120k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_iqr120k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p12_rttguard_s3_iqr120k";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_iqr120k.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_iqr120k.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_iqr120k.policy_skew_iqr_max_us = 120000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_iqr120k.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_iqr120k.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_iqr120k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta12_rttguard_s3_min1 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta12_rttguard_s3_min1.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta0p12_rttguard_s3_min1";
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta12_rttguard_s3_min1.policy_skew_min_samples = 1;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta12_rttguard_s3_min1.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta12_rttguard_s3_min1.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta12_rttguard_s3_min1.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta12_rttguard_s3_min1.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin1_max600_iqr100k_beta12_rttguard_s3_min1);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta12_rttguard_s3_max500 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta12_rttguard_s3_max500.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta0p12_rttguard_s3_max500";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta12_rttguard_s3_max500.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta12_rttguard_s3_max500.policy_skew_max_ppm = 500.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta12_rttguard_s3_max500.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta12_rttguard_s3_max500.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta12_rttguard_s3_max500.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max500_iqr100k_beta12_rttguard_s3_max500);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s3_max700 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s3_max700.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s3_max700";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s3_max700.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s3_max700.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s3_max700.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s3_max700.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s3_max700.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s3_max700);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win20 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win20.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p12_rttguard_s3_win20s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win20.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win20.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win20.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win20.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win20.policy_skew_window_us = 20000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win20.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win20);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win40 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win40.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p12_rttguard_s3_win40s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win40.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win40.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win40.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win40.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win40.policy_skew_window_us = 40000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win40.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s3_win40);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_base =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_base.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4_base";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_base.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_base.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_base.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_base.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_base.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_base);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta10 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta10.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4_beta0p10";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta10.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta10.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta10.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta10.policy_skew_beta = 0.10;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta10.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta10);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta14 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta14.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4_beta0p14";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta14.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta14.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta14.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta14.policy_skew_beta = 0.14;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta14.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta14);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta16 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta16.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4_beta0p16";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta16.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta16.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta16.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta16.policy_skew_beta = 0.16;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta16.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_beta16);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_iqr80k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_iqr80k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4_iqr80k";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_iqr80k.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_iqr80k.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_iqr80k.policy_skew_iqr_max_us = 80000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_iqr80k.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_iqr80k.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_iqr80k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_iqr120k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_iqr120k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4_iqr120k";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_iqr120k.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_iqr120k.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_iqr120k.policy_skew_iqr_max_us = 120000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_iqr120k.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_iqr120k.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_iqr120k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4_min1 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4_min1.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta0p12_rttguard_s4_min1";
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4_min1.policy_skew_min_samples = 1;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4_min1.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4_min1.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4_min1.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4_min1.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4_min1);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12_rttguard_s4_max800 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12_rttguard_s4_max800.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta0p12_rttguard_s4_max800";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12_rttguard_s4_max800.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12_rttguard_s4_max800.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12_rttguard_s4_max800.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12_rttguard_s4_max800.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12_rttguard_s4_max800.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12_rttguard_s4_max800);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s4_max600 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s4_max600.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p12_rttguard_s4_max600";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s4_max600.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s4_max600.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s4_max600.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s4_max600.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s4_max600.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s4_max600);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win20 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win20.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4_win20s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win20.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win20.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win20.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win20.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win20.policy_skew_window_us = 20000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win20.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win20);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win40 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win40.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4_win40s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win40.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win40.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win40.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win40.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win40.policy_skew_window_us = 40000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win40.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4_win40);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_base =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_base.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s5_base";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_base.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_base.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_base.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_base.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_base.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_base);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta10 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta10.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s5_beta0p10";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta10.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta10.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta10.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta10.policy_skew_beta = 0.10;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta10.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta10);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta14 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta14.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s5_beta0p14";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta14.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta14.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta14.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta14.policy_skew_beta = 0.14;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta14.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta14);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta16 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta16.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s5_beta0p16";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta16.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta16.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta16.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta16.policy_skew_beta = 0.16;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta16.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_beta16);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win30 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win30.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s5_win30s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win30.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win30.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win30.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win30.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win30.policy_skew_window_us = 30000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win30.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win30);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win50 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win50.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s5_win50s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win50.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win50.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win50.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win50.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win50.policy_skew_window_us = 50000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win50.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win50);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win60 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win60.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s5_win60s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win60.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win60.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win60.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win60.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win60.policy_skew_window_us = 60000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win60.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_win60);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s5_max600 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s5_max600.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta0p12_rttguard_s5_max600";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s5_max600.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s5_max600.policy_skew_max_ppm = 600.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s5_max600.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s5_max600.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s5_max600.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta12_rttguard_s5_max600);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12_rttguard_s5_max800 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12_rttguard_s5_max800.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta0p12_rttguard_s5_max800";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12_rttguard_s5_max800.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12_rttguard_s5_max800.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12_rttguard_s5_max800.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12_rttguard_s5_max800.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12_rttguard_s5_max800.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta12_rttguard_s5_max800);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net75 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net75.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s5_net75";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net75.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net75.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net75.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net75.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net75.policy_skew_net_max = 75.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net75.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net75);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net100 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net100.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s5_net100";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net100.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net100.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net100.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net100.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net100.policy_skew_net_max = 100.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net100.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s5_net100);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win35 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win35.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4t_win35s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win35.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win35.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win35.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win35.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win35.policy_skew_window_us = 35000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win35.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win35);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win45 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win45.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4t_win45s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win45.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win45.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win45.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win45.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win45.policy_skew_window_us = 45000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win45.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_win45);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max650_iqr100k_beta12_rttguard_s4t_max650 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max650_iqr100k_beta12_rttguard_s4t_max650.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max650_iqr100k_beta0p12_rttguard_s4t_max650";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max650_iqr100k_beta12_rttguard_s4t_max650.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max650_iqr100k_beta12_rttguard_s4t_max650.policy_skew_max_ppm = 650.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max650_iqr100k_beta12_rttguard_s4t_max650.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max650_iqr100k_beta12_rttguard_s4t_max650.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max650_iqr100k_beta12_rttguard_s4t_max650.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max650_iqr100k_beta12_rttguard_s4t_max650);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max750_iqr100k_beta12_rttguard_s4t_max750 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max750_iqr100k_beta12_rttguard_s4t_max750.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max750_iqr100k_beta0p12_rttguard_s4t_max750";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max750_iqr100k_beta12_rttguard_s4t_max750.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max750_iqr100k_beta12_rttguard_s4t_max750.policy_skew_max_ppm = 750.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max750_iqr100k_beta12_rttguard_s4t_max750.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max750_iqr100k_beta12_rttguard_s4t_max750.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max750_iqr100k_beta12_rttguard_s4t_max750.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max750_iqr100k_beta12_rttguard_s4t_max750);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_beta13 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_beta13.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4t_beta0p13";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_beta13.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_beta13.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_beta13.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_beta13.policy_skew_beta = 0.13;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_beta13.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_beta13);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_beta15 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_beta15.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4t_beta0p15";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_beta15.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_beta15.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_beta15.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_beta15.policy_skew_beta = 0.15;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_beta15.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_beta15);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr90k_beta12_rttguard_s4t_iqr90k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr90k_beta12_rttguard_s4t_iqr90k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr90k_beta0p12_rttguard_s4t_iqr90k";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr90k_beta12_rttguard_s4t_iqr90k.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr90k_beta12_rttguard_s4t_iqr90k.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr90k_beta12_rttguard_s4t_iqr90k.policy_skew_iqr_max_us = 90000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr90k_beta12_rttguard_s4t_iqr90k.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr90k_beta12_rttguard_s4t_iqr90k.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr90k_beta12_rttguard_s4t_iqr90k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr110k_beta12_rttguard_s4t_iqr110k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr110k_beta12_rttguard_s4t_iqr110k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr110k_beta0p12_rttguard_s4t_iqr110k";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr110k_beta12_rttguard_s4t_iqr110k.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr110k_beta12_rttguard_s4t_iqr110k.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr110k_beta12_rttguard_s4t_iqr110k.policy_skew_iqr_max_us = 110000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr110k_beta12_rttguard_s4t_iqr110k.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr110k_beta12_rttguard_s4t_iqr110k.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr110k_beta12_rttguard_s4t_iqr110k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin3_max700_iqr100k_beta12_rttguard_s4t_min3 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max700_iqr100k_beta12_rttguard_s4t_min3.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin3_max700_iqr100k_beta0p12_rttguard_s4t_min3";
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max700_iqr100k_beta12_rttguard_s4t_min3.policy_skew_min_samples = 3;
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max700_iqr100k_beta12_rttguard_s4t_min3.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max700_iqr100k_beta12_rttguard_s4t_min3.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max700_iqr100k_beta12_rttguard_s4t_min3.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max700_iqr100k_beta12_rttguard_s4t_min3.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin3_max700_iqr100k_beta12_rttguard_s4t_min3);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_net100 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_net100.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4t_net100";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_net100.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_net100.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_net100.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_net100.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_net100.policy_skew_net_max = 100.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_net100.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4t_net100);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win38 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win38.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4u_win38s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win38.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win38.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win38.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win38.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win38.policy_skew_window_us = 38000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win38.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win38);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4u_win42s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42.policy_skew_window_us = 42000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win44 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win44.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4u_win44s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win44.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win44.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win44.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win44.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win44.policy_skew_window_us = 44000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win44.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win44);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta11_rttguard_s4u_beta11 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta11_rttguard_s4u_beta11.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p11_rttguard_s4u_beta0p11";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta11_rttguard_s4u_beta11.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta11_rttguard_s4u_beta11.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta11_rttguard_s4u_beta11.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta11_rttguard_s4u_beta11.policy_skew_beta = 0.11;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta11_rttguard_s4u_beta11.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta11_rttguard_s4u_beta11);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta13_rttguard_s4u_beta13 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta13_rttguard_s4u_beta13.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p13_rttguard_s4u_beta0p13";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta13_rttguard_s4u_beta13.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta13_rttguard_s4u_beta13.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta13_rttguard_s4u_beta13.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta13_rttguard_s4u_beta13.policy_skew_beta = 0.13;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta13_rttguard_s4u_beta13.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta13_rttguard_s4u_beta13);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max680_iqr100k_beta12_rttguard_s4u_max680 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max680_iqr100k_beta12_rttguard_s4u_max680.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max680_iqr100k_beta0p12_rttguard_s4u_max680";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max680_iqr100k_beta12_rttguard_s4u_max680.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max680_iqr100k_beta12_rttguard_s4u_max680.policy_skew_max_ppm = 680.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max680_iqr100k_beta12_rttguard_s4u_max680.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max680_iqr100k_beta12_rttguard_s4u_max680.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max680_iqr100k_beta12_rttguard_s4u_max680.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max680_iqr100k_beta12_rttguard_s4u_max680);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max720_iqr100k_beta12_rttguard_s4u_max720 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max720_iqr100k_beta12_rttguard_s4u_max720.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max720_iqr100k_beta0p12_rttguard_s4u_max720";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max720_iqr100k_beta12_rttguard_s4u_max720.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max720_iqr100k_beta12_rttguard_s4u_max720.policy_skew_max_ppm = 720.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max720_iqr100k_beta12_rttguard_s4u_max720.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max720_iqr100k_beta12_rttguard_s4u_max720.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max720_iqr100k_beta12_rttguard_s4u_max720.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max720_iqr100k_beta12_rttguard_s4u_max720);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr95k_beta12_rttguard_s4u_iqr95k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr95k_beta12_rttguard_s4u_iqr95k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr95k_beta0p12_rttguard_s4u_iqr95k";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr95k_beta12_rttguard_s4u_iqr95k.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr95k_beta12_rttguard_s4u_iqr95k.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr95k_beta12_rttguard_s4u_iqr95k.policy_skew_iqr_max_us = 95000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr95k_beta12_rttguard_s4u_iqr95k.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr95k_beta12_rttguard_s4u_iqr95k.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr95k_beta12_rttguard_s4u_iqr95k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr105k_beta12_rttguard_s4u_iqr105k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr105k_beta12_rttguard_s4u_iqr105k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr105k_beta0p12_rttguard_s4u_iqr105k";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr105k_beta12_rttguard_s4u_iqr105k.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr105k_beta12_rttguard_s4u_iqr105k.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr105k_beta12_rttguard_s4u_iqr105k.policy_skew_iqr_max_us = 105000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr105k_beta12_rttguard_s4u_iqr105k.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr105k_beta12_rttguard_s4u_iqr105k.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr105k_beta12_rttguard_s4u_iqr105k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4u_min1 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4u_min1.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta0p12_rttguard_s4u_min1";
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4u_min1.policy_skew_min_samples = 1;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4u_min1.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4u_min1.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4u_min1.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4u_min1.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4u_min1);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win41 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win41.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4v_win41s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win41.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win41.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win41.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win41.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win41.policy_skew_window_us = 41000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win41.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win41);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win43 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win43.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4v_win43s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win43.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win43.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win43.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win43.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win43.policy_skew_window_us = 43000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win43.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win43);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win45 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win45.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4v_win45s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win45.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win45.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win45.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win45.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win45.policy_skew_window_us = 45000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win45.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4v_win45);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta115_rttguard_s4v_beta115 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta115_rttguard_s4v_beta115.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p115_rttguard_s4v_beta0p115";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta115_rttguard_s4v_beta115.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta115_rttguard_s4v_beta115.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta115_rttguard_s4v_beta115.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta115_rttguard_s4v_beta115.policy_skew_beta = 0.115;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta115_rttguard_s4v_beta115.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta115_rttguard_s4v_beta115);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta125_rttguard_s4v_beta125 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta125_rttguard_s4v_beta125.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p125_rttguard_s4v_beta0p125";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta125_rttguard_s4v_beta125.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta125_rttguard_s4v_beta125.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta125_rttguard_s4v_beta125.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta125_rttguard_s4v_beta125.policy_skew_beta = 0.125;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta125_rttguard_s4v_beta125.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta125_rttguard_s4v_beta125);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max690_iqr100k_beta12_rttguard_s4v_max690 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max690_iqr100k_beta12_rttguard_s4v_max690.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max690_iqr100k_beta0p12_rttguard_s4v_max690";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max690_iqr100k_beta12_rttguard_s4v_max690.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max690_iqr100k_beta12_rttguard_s4v_max690.policy_skew_max_ppm = 690.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max690_iqr100k_beta12_rttguard_s4v_max690.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max690_iqr100k_beta12_rttguard_s4v_max690.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max690_iqr100k_beta12_rttguard_s4v_max690.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max690_iqr100k_beta12_rttguard_s4v_max690);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max710_iqr100k_beta12_rttguard_s4v_max710 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max710_iqr100k_beta12_rttguard_s4v_max710.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max710_iqr100k_beta0p12_rttguard_s4v_max710";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max710_iqr100k_beta12_rttguard_s4v_max710.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max710_iqr100k_beta12_rttguard_s4v_max710.policy_skew_max_ppm = 710.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max710_iqr100k_beta12_rttguard_s4v_max710.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max710_iqr100k_beta12_rttguard_s4v_max710.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max710_iqr100k_beta12_rttguard_s4v_max710.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max710_iqr100k_beta12_rttguard_s4v_max710);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr98k_beta12_rttguard_s4v_iqr98k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr98k_beta12_rttguard_s4v_iqr98k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr98k_beta0p12_rttguard_s4v_iqr98k";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr98k_beta12_rttguard_s4v_iqr98k.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr98k_beta12_rttguard_s4v_iqr98k.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr98k_beta12_rttguard_s4v_iqr98k.policy_skew_iqr_max_us = 98000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr98k_beta12_rttguard_s4v_iqr98k.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr98k_beta12_rttguard_s4v_iqr98k.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr98k_beta12_rttguard_s4v_iqr98k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr102k_beta12_rttguard_s4v_iqr102k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr102k_beta12_rttguard_s4v_iqr102k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr102k_beta0p12_rttguard_s4v_iqr102k";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr102k_beta12_rttguard_s4v_iqr102k.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr102k_beta12_rttguard_s4v_iqr102k.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr102k_beta12_rttguard_s4v_iqr102k.policy_skew_iqr_max_us = 102000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr102k_beta12_rttguard_s4v_iqr102k.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr102k_beta12_rttguard_s4v_iqr102k.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr102k_beta12_rttguard_s4v_iqr102k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4v_min1 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4v_min1.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta0p12_rttguard_s4v_min1";
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4v_min1.policy_skew_min_samples = 1;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4v_min1.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4v_min1.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4v_min1.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4v_min1.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin1_max700_iqr100k_beta12_rttguard_s4v_min1);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win420 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win420.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4x_win420s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win420.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win420.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win420.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win420.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win420.policy_skew_window_us = 42000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win420.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win420);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win421 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win421.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4x_win421s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win421.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win421.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win421.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win421.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win421.policy_skew_window_us = 42100000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win421.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win421);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win422 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win422.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4x_win422s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win422.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win422.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win422.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win422.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win422.policy_skew_window_us = 42200000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win422.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win422);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win423 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win423.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4x_win423s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win423.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win423.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win423.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win423.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win423.policy_skew_window_us = 42300000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win423.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win423);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win424 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win424.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4x_win424s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win424.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win424.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win424.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win424.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win424.policy_skew_window_us = 42400000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win424.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win424);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win426 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win426.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4x_win426s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win426.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win426.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win426.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win426.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win426.policy_skew_window_us = 42600000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win426.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win426);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win427 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win427.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4x_win427s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win427.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win427.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win427.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win427.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win427.policy_skew_window_us = 42700000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win427.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win427);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win428 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win428.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4x_win428s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win428.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win428.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win428.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win428.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win428.policy_skew_window_us = 42800000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win428.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win428);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win429 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win429.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4x_win429s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win429.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win429.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win429.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win429.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win429.policy_skew_window_us = 42900000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win429.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win429);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win430 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win430.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4x_win430s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win430.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win430.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win430.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win430.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win430.policy_skew_window_us = 43000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win430.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4x_win430);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4u_win42s_qprefer";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer.policy_skew_window_us = 42000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer.policy_skew_use_rtt_guard = true;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer.policy_quantile_prefer_low_near =
+            true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4u_win42s_qreq";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq.policy_skew_window_us = 42000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq.policy_skew_use_rtt_guard = true;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq.policy_quantile_requires_skew =
+            true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qblock =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qblock.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4u_win42s_qblock";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qblock.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qblock.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qblock.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qblock.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qblock.policy_skew_window_us = 42000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qblock.policy_skew_use_rtt_guard = true;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qblock.policy_quantile_block_high_iqr =
+            true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qblock);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq_block =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq_block.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4u_win42s_qreq_block";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq_block.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq_block.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq_block.policy_skew_iqr_max_us =
+            100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq_block.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq_block.policy_skew_window_us =
+            42000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq_block.policy_skew_use_rtt_guard =
+            true;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq_block.policy_quantile_requires_skew =
+            true;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq_block.policy_quantile_block_high_iqr =
+            true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qreq_block);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qreq =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qreq.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4u_win42s_qprefer_qreq";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qreq.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qreq.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qreq.policy_skew_iqr_max_us =
+            100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qreq.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qreq.policy_skew_window_us =
+            42000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qreq.policy_skew_use_rtt_guard =
+            true;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qreq.policy_quantile_prefer_low_near =
+            true;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qreq.policy_quantile_requires_skew =
+            true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qreq);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qblock =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qblock.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4u_win42s_qprefer_qblock";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qblock.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qblock.policy_skew_max_ppm =
+            700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qblock.policy_skew_iqr_max_us =
+            100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qblock.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qblock.policy_skew_window_us =
+            42000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qblock.policy_skew_use_rtt_guard =
+            true;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qblock.policy_quantile_prefer_low_near =
+            true;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qblock.policy_quantile_block_high_iqr =
+            true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_qblock);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near80 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near80.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4u_win42s_qprefer_near0p80";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near80.policy_skew_min_samples =
+            2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near80.policy_skew_max_ppm =
+            700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near80.policy_skew_iqr_max_us =
+            100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near80.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near80.policy_skew_window_us =
+            42000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near80.policy_skew_use_rtt_guard =
+            true;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near80
+            .policy_quantile_prefer_low_near = true;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near80
+            .policy_near_ratio_low = 0.80;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near80);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near50 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near50.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4u_win42s_qprefer_near0p50";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near50.policy_skew_min_samples =
+            2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near50.policy_skew_max_ppm =
+            700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near50.policy_skew_iqr_max_us =
+            100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near50.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near50.policy_skew_window_us =
+            42000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near50.policy_skew_use_rtt_guard =
+            true;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near50
+            .policy_quantile_prefer_low_near = true;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near50
+            .policy_near_ratio_low = 0.50;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_qprefer_near50);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_min5 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_min5.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4u_win42s_min5";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_min5.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_min5.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_min5.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_min5.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_min5.policy_skew_window_us = 42000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_min5.policy_skew_use_rtt_guard = true;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_min5.policy_min_samples = 5;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_min5);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_notilted =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_notilted.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4u_win42s_notilted";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_notilted.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_notilted.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_notilted.policy_skew_iqr_max_us =
+            100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_notilted.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_notilted.policy_skew_window_us =
+            42000000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_notilted.policy_skew_use_rtt_guard =
+            true;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_notilted.policy_use_tilted = false;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4u_win42_notilted);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win405 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win405.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4w_win405s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win405.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win405.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win405.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win405.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win405.policy_skew_window_us = 40500000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win405.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win405);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win415 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win415.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4w_win415s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win415.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win415.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win415.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win415.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win415.policy_skew_window_us = 41500000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win415.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win415);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win425 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win425.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4w_win425s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win425.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win425.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win425.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win425.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win425.policy_skew_window_us = 42500000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win425.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win425);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win435 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win435.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p12_rttguard_s4w_win435s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win435.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win435.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win435.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win435.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win435.policy_skew_window_us = 43500000;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win435.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta12_rttguard_s4w_win435);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta118_rttguard_s4w_beta118 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta118_rttguard_s4w_beta118.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p118_rttguard_s4w_beta0p118";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta118_rttguard_s4w_beta118.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta118_rttguard_s4w_beta118.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta118_rttguard_s4w_beta118.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta118_rttguard_s4w_beta118.policy_skew_beta = 0.118;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta118_rttguard_s4w_beta118.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta118_rttguard_s4w_beta118);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta122_rttguard_s4w_beta122 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta122_rttguard_s4w_beta122.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta0p122_rttguard_s4w_beta0p122";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta122_rttguard_s4w_beta122.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta122_rttguard_s4w_beta122.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta122_rttguard_s4w_beta122.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta122_rttguard_s4w_beta122.policy_skew_beta = 0.122;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta122_rttguard_s4w_beta122.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr100k_beta122_rttguard_s4w_beta122);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max695_iqr100k_beta12_rttguard_s4w_max695 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max695_iqr100k_beta12_rttguard_s4w_max695.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max695_iqr100k_beta0p12_rttguard_s4w_max695";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max695_iqr100k_beta12_rttguard_s4w_max695.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max695_iqr100k_beta12_rttguard_s4w_max695.policy_skew_max_ppm = 695.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max695_iqr100k_beta12_rttguard_s4w_max695.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max695_iqr100k_beta12_rttguard_s4w_max695.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max695_iqr100k_beta12_rttguard_s4w_max695.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max695_iqr100k_beta12_rttguard_s4w_max695);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max705_iqr100k_beta12_rttguard_s4w_max705 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max705_iqr100k_beta12_rttguard_s4w_max705.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max705_iqr100k_beta0p12_rttguard_s4w_max705";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max705_iqr100k_beta12_rttguard_s4w_max705.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max705_iqr100k_beta12_rttguard_s4w_max705.policy_skew_max_ppm = 705.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max705_iqr100k_beta12_rttguard_s4w_max705.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max705_iqr100k_beta12_rttguard_s4w_max705.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max705_iqr100k_beta12_rttguard_s4w_max705.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max705_iqr100k_beta12_rttguard_s4w_max705);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr99k_beta12_rttguard_s4w_iqr99k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr99k_beta12_rttguard_s4w_iqr99k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr99k_beta0p12_rttguard_s4w_iqr99k";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr99k_beta12_rttguard_s4w_iqr99k.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr99k_beta12_rttguard_s4w_iqr99k.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr99k_beta12_rttguard_s4w_iqr99k.policy_skew_iqr_max_us = 99000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr99k_beta12_rttguard_s4w_iqr99k.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr99k_beta12_rttguard_s4w_iqr99k.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr99k_beta12_rttguard_s4w_iqr99k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr101k_beta12_rttguard_s4w_iqr101k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr101k_beta12_rttguard_s4w_iqr101k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr101k_beta0p12_rttguard_s4w_iqr101k";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr101k_beta12_rttguard_s4w_iqr101k.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr101k_beta12_rttguard_s4w_iqr101k.policy_skew_max_ppm = 700.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr101k_beta12_rttguard_s4w_iqr101k.policy_skew_iqr_max_us = 101000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr101k_beta12_rttguard_s4w_iqr101k.policy_skew_beta = 0.12;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr101k_beta12_rttguard_s4w_iqr101k.policy_skew_use_rtt_guard = true;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max700_iqr101k_beta12_rttguard_s4w_iqr101k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max1200_iqr100k_beta08 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max1200_iqr100k_beta08.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max1200_iqr100k_beta0p08";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max1200_iqr100k_beta08.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max1200_iqr100k_beta08.policy_skew_max_ppm = 1200.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max1200_iqr100k_beta08.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max1200_iqr100k_beta08.policy_skew_beta = 0.08;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max1200_iqr100k_beta08);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_net75 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_net75.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta0p08_net75";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_net75.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_net75.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_net75.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_net75.policy_skew_beta = 0.08;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_net75.policy_skew_net_max = 75.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_net75);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_net150 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_net150.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta0p08_net150";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_net150.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_net150.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_net150.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_net150.policy_skew_beta = 0.08;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_net150.policy_skew_net_max = 150.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_net150);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_win30 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_win30.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta0p08_win30s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_win30.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_win30.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_win30.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_win30.policy_skew_beta = 0.08;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_win30.policy_skew_window_us = 30000000;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_win30);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_win40 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_win40.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta0p08_win40s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_win40.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_win40.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_win40.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_win40.policy_skew_beta = 0.08;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_win40.policy_skew_window_us = 40000000;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta08_win40);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta10 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta10.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta0p10";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta10.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta10.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta10.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta10.policy_skew_beta = 0.10;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta10);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta20 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta20.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta0p20";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta20.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta20.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta20.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta20.policy_skew_beta = 0.20;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_beta20);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win10 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win10.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win10s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win10.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win10.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win10.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win10.policy_skew_window_us = 10000000;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win10);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win20 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win20.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win20s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win20.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win20.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win20.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win20.policy_skew_window_us = 20000000;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win20);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win60 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win60.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win60s";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win60.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win60.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win60.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win60.policy_skew_window_us = 60000000;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_win60);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_net100 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_net100.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_net100";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_net100.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_net100.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_net100.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_net100.policy_skew_net_max = 100.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_net100);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_net200 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_net200.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_net200";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_net200.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_net200.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_net200.policy_skew_iqr_max_us = 100000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_net200.policy_skew_net_max = 200.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_net200);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_max1000 =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_max1000.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_max1000";
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_max1000.policy_skew_min_samples = 2;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_max1000.policy_skew_max_ppm = 1000.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_max1000.policy_skew_iqr_max_us = 100000.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin2_max800_iqr100k_max1000);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin1_max800_iqr100k =
+            qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max800_iqr100k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_skewmin1_max800_iqr100k";
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max800_iqr100k.policy_skew_min_samples = 1;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max800_iqr100k.policy_skew_max_ppm = 800.0;
+        qshrink_only_switch5_rttguard_promo100_skewmin1_max800_iqr100k.policy_skew_iqr_max_us = 100000.0;
+        add(qshrink_only_switch5_rttguard_promo100_skewmin1_max800_iqr100k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_switch3 = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_switch3.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_switch3";
+        qshrink_only_switch5_rttguard_promo100_switch3.policy_switch_n = 3;
+        add(qshrink_only_switch5_rttguard_promo100_switch3);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_switch7 = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_switch7.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_switch7";
+        qshrink_only_switch5_rttguard_promo100_switch7.policy_switch_n = 7;
+        add(qshrink_only_switch5_rttguard_promo100_switch7);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_hold2s = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_hold2s.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_hold2s";
+        qshrink_only_switch5_rttguard_promo100_hold2s.policy_hold_us = 2000000;
+        add(qshrink_only_switch5_rttguard_promo100_hold2s);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_hold10s = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_hold10s.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_hold10s";
+        qshrink_only_switch5_rttguard_promo100_hold10s.policy_hold_us = 10000000;
+        add(qshrink_only_switch5_rttguard_promo100_hold10s);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_min10 = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_min10.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_min10";
+        qshrink_only_switch5_rttguard_promo100_min10.policy_min_samples = 10;
+        add(qshrink_only_switch5_rttguard_promo100_min10);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_min30 = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_min30.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_min30";
+        qshrink_only_switch5_rttguard_promo100_min30.policy_min_samples = 30;
+        add(qshrink_only_switch5_rttguard_promo100_min30);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_near15 = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_near15.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_near15";
+        qshrink_only_switch5_rttguard_promo100_near15.policy_near_ratio_low = 0.15;
+        add(qshrink_only_switch5_rttguard_promo100_near15);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_near25 = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_near25.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_near25";
+        qshrink_only_switch5_rttguard_promo100_near25.policy_near_ratio_low = 0.25;
+        add(qshrink_only_switch5_rttguard_promo100_near25);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_iqr10k = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_iqr10k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_iqr10k";
+        qshrink_only_switch5_rttguard_promo100_iqr10k.policy_iqr_high_us = 10000.0;
+        add(qshrink_only_switch5_rttguard_promo100_iqr10k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promo100_iqr30k = qshrink_only_switch5_rttguard_promo100;
+        qshrink_only_switch5_rttguard_promo100_iqr30k.variant_name =
+            "qshrink_only_switch5_rttguard_promo100_iqr30k";
+        qshrink_only_switch5_rttguard_promo100_iqr30k.policy_iqr_high_us = 30000.0;
+        add(qshrink_only_switch5_rttguard_promo100_iqr30k);
+
+        MethodConfig qshrink_only_switch5_rttguard_promok1 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_promok1.variant_name = "qshrink_only_switch5_rttguard_promok1";
+        qshrink_only_switch5_rttguard_promok1.promo_max_k = 1.0;
+        add(qshrink_only_switch5_rttguard_promok1);
+
+        MethodConfig qshrink_only_switch5_rttguard_iqrmin2k = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_iqrmin2k.variant_name = "qshrink_only_switch5_rttguard_iqrmin2k";
+        qshrink_only_switch5_rttguard_iqrmin2k.gsp_iqr_min_us = 2000.0;
+        add(qshrink_only_switch5_rttguard_iqrmin2k);
+
+        MethodConfig qshrink_only_switch5_rttguard_skew5 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_skew5.variant_name = "qshrink_only_switch5_rttguard_skew5";
+        qshrink_only_switch5_rttguard_skew5.quantile_use_policy_skew_gate = true;
+        qshrink_only_switch5_rttguard_skew5.quantile_policy_skew_min_ppm = 5.0;
+        add(qshrink_only_switch5_rttguard_skew5);
+
+        MethodConfig qshrink_only_switch5_rttguard_skew10 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_skew10.variant_name = "qshrink_only_switch5_rttguard_skew10";
+        qshrink_only_switch5_rttguard_skew10.quantile_use_policy_skew_gate = true;
+        qshrink_only_switch5_rttguard_skew10.quantile_policy_skew_min_ppm = 10.0;
+        add(qshrink_only_switch5_rttguard_skew10);
+
+        MethodConfig qshrink_only_switch5_rttguard_skew25 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_skew25.variant_name = "qshrink_only_switch5_rttguard_skew25";
+        qshrink_only_switch5_rttguard_skew25.quantile_use_policy_skew_gate = true;
+        qshrink_only_switch5_rttguard_skew25.quantile_policy_skew_min_ppm = 25.0;
+        add(qshrink_only_switch5_rttguard_skew25);
+
+        MethodConfig qshrink_only_switch5_rttguard_forcemulti5 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_forcemulti5.variant_name = "qshrink_only_switch5_rttguard_forcemulti5";
+        qshrink_only_switch5_rttguard_forcemulti5.policy_force_multi_on_shrink = true;
+        qshrink_only_switch5_rttguard_forcemulti5.policy_force_multi_hold_us = 5000000;
+        add(qshrink_only_switch5_rttguard_forcemulti5);
+
+        MethodConfig qshrink_only_switch5_rttguard_forcemulti10 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_forcemulti10.variant_name = "qshrink_only_switch5_rttguard_forcemulti10";
+        qshrink_only_switch5_rttguard_forcemulti10.policy_force_multi_on_shrink = true;
+        qshrink_only_switch5_rttguard_forcemulti10.policy_force_multi_hold_us = 10000000;
+        add(qshrink_only_switch5_rttguard_forcemulti10);
+
+        MethodConfig qshrink_only_switch5_rttguard_skew10_forcemulti5 = qshrink_only_switch5_rttguard_forcemulti5;
+        qshrink_only_switch5_rttguard_skew10_forcemulti5.variant_name = "qshrink_only_switch5_rttguard_skew10_forcemulti5";
+        qshrink_only_switch5_rttguard_skew10_forcemulti5.quantile_use_policy_skew_gate = true;
+        qshrink_only_switch5_rttguard_skew10_forcemulti5.quantile_policy_skew_min_ppm = 10.0;
+        add(qshrink_only_switch5_rttguard_skew10_forcemulti5);
+
+        MethodConfig qshrink_only_switch5_rttguard_skew25_forcemulti10 = qshrink_only_switch5_rttguard_forcemulti10;
+        qshrink_only_switch5_rttguard_skew25_forcemulti10.variant_name = "qshrink_only_switch5_rttguard_skew25_forcemulti10";
+        qshrink_only_switch5_rttguard_skew25_forcemulti10.quantile_use_policy_skew_gate = true;
+        qshrink_only_switch5_rttguard_skew25_forcemulti10.quantile_policy_skew_min_ppm = 25.0;
+        add(qshrink_only_switch5_rttguard_skew25_forcemulti10);
+
+        MethodConfig qshrink_only_switch5_rttguard_stalehold2 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_stalehold2.variant_name = "qshrink_only_switch5_rttguard_stalehold2";
+        qshrink_only_switch5_rttguard_stalehold2.quantile_near_stale_hold_us = 2000000;
+        add(qshrink_only_switch5_rttguard_stalehold2);
+
+        MethodConfig qshrink_only_switch5_rttguard_skew10_stalehold2 = qshrink_only_switch5_rttguard_stalehold2;
+        qshrink_only_switch5_rttguard_skew10_stalehold2.variant_name = "qshrink_only_switch5_rttguard_skew10_stalehold2";
+        qshrink_only_switch5_rttguard_skew10_stalehold2.quantile_use_policy_skew_gate = true;
+        qshrink_only_switch5_rttguard_skew10_stalehold2.quantile_policy_skew_min_ppm = 10.0;
+        add(qshrink_only_switch5_rttguard_skew10_stalehold2);
+
+        MethodConfig qshrink_only_switch5_rttguard_npkt50_skew10 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_npkt50_skew10.variant_name = "qshrink_only_switch5_rttguard_npkt50_skew10";
+        qshrink_only_switch5_rttguard_npkt50_skew10.gsp_npkt_min = 50;
+        qshrink_only_switch5_rttguard_npkt50_skew10.quantile_use_policy_skew_gate = true;
+        qshrink_only_switch5_rttguard_npkt50_skew10.quantile_policy_skew_min_ppm = 10.0;
+        add(qshrink_only_switch5_rttguard_npkt50_skew10);
+
+        MethodConfig qshrink_only_switch5_rttguard_qswap_q01q05 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_qswap_q01q05.variant_name = "qshrink_only_switch5_rttguard_qswap_q01q05";
+        qshrink_only_switch5_rttguard_qswap_q01q05.adaptive_use_quantile_swap = true;
+        qshrink_only_switch5_rttguard_qswap_q01q05.quantile_swap_low = 0.01;
+        qshrink_only_switch5_rttguard_qswap_q01q05.quantile_swap_high = 0.05;
+        qshrink_only_switch5_rttguard_qswap_q01q05.timesync_quantile = qshrink_only_switch5_rttguard_qswap_q01q05.quantile_swap_low;
+        add(qshrink_only_switch5_rttguard_qswap_q01q05);
+
+        MethodConfig qshrink_only_switch5_rttguard_qswap_q01q10 = qshrink_only_switch5_rttguard_qswap_q01q05;
+        qshrink_only_switch5_rttguard_qswap_q01q10.variant_name = "qshrink_only_switch5_rttguard_qswap_q01q10";
+        qshrink_only_switch5_rttguard_qswap_q01q10.quantile_swap_high = 0.10;
+        add(qshrink_only_switch5_rttguard_qswap_q01q10);
+
+        MethodConfig qshrink_only_switch5_rttguard_qswap_q00q05 = qshrink_only_switch5_rttguard_qswap_q01q05;
+        qshrink_only_switch5_rttguard_qswap_q00q05.variant_name = "qshrink_only_switch5_rttguard_qswap_q00q05";
+        qshrink_only_switch5_rttguard_qswap_q00q05.quantile_swap_low = 0.0;
+        qshrink_only_switch5_rttguard_qswap_q00q05.timesync_quantile = qshrink_only_switch5_rttguard_qswap_q00q05.quantile_swap_low;
+        add(qshrink_only_switch5_rttguard_qswap_q00q05);
+
+        MethodConfig qshrink_only_switch5_rttguard_qswap_q02q05 = qshrink_only_switch5_rttguard_qswap_q01q05;
+        qshrink_only_switch5_rttguard_qswap_q02q05.variant_name = "qshrink_only_switch5_rttguard_qswap_q02q05";
+        qshrink_only_switch5_rttguard_qswap_q02q05.quantile_swap_low = 0.02;
+        qshrink_only_switch5_rttguard_qswap_q02q05.timesync_quantile = qshrink_only_switch5_rttguard_qswap_q02q05.quantile_swap_low;
+        add(qshrink_only_switch5_rttguard_qswap_q02q05);
+
+        MethodConfig qshrink_only_switch5_rttguard_qswap_q01q03 = qshrink_only_switch5_rttguard_qswap_q01q05;
+        qshrink_only_switch5_rttguard_qswap_q01q03.variant_name = "qshrink_only_switch5_rttguard_qswap_q01q03";
+        qshrink_only_switch5_rttguard_qswap_q01q03.quantile_swap_high = 0.03;
+        add(qshrink_only_switch5_rttguard_qswap_q01q03);
+
+        MethodConfig qshrink_only_switch5_rttguard_qswap_tight = qshrink_only_switch5_rttguard_qswap_q01q05;
+        qshrink_only_switch5_rttguard_qswap_tight.variant_name = "qshrink_only_switch5_rttguard_qswap_tight";
+        qshrink_only_switch5_rttguard_qswap_tight.quantile_swap_jitter_enter_us = 150.0;
+        qshrink_only_switch5_rttguard_qswap_tight.quantile_swap_jitter_exit_us = 90.0;
+        qshrink_only_switch5_rttguard_qswap_tight.quantile_swap_iqr_enter_us = 300.0;
+        qshrink_only_switch5_rttguard_qswap_tight.quantile_swap_iqr_exit_us = 200.0;
+        add(qshrink_only_switch5_rttguard_qswap_tight);
+
+        MethodConfig qshrink_only_switch5_rttguard_qswap_loose = qshrink_only_switch5_rttguard_qswap_q01q05;
+        qshrink_only_switch5_rttguard_qswap_loose.variant_name = "qshrink_only_switch5_rttguard_qswap_loose";
+        qshrink_only_switch5_rttguard_qswap_loose.quantile_swap_jitter_enter_us = 300.0;
+        qshrink_only_switch5_rttguard_qswap_loose.quantile_swap_jitter_exit_us = 200.0;
+        qshrink_only_switch5_rttguard_qswap_loose.quantile_swap_iqr_enter_us = 600.0;
+        qshrink_only_switch5_rttguard_qswap_loose.quantile_swap_iqr_exit_us = 400.0;
+        add(qshrink_only_switch5_rttguard_qswap_loose);
+
+        MethodConfig qshrink_only_switch5_rttguard_qswap_iqronly = qshrink_only_switch5_rttguard_qswap_q01q05;
+        qshrink_only_switch5_rttguard_qswap_iqronly.variant_name = "qshrink_only_switch5_rttguard_qswap_iqronly";
+        qshrink_only_switch5_rttguard_qswap_iqronly.quantile_swap_jitter_enter_us = 1e9;
+        qshrink_only_switch5_rttguard_qswap_iqronly.quantile_swap_jitter_exit_us = 1e9;
+        add(qshrink_only_switch5_rttguard_qswap_iqronly);
+
+        MethodConfig qshrink_only_switch5_rttguard_qswap_jitteronly = qshrink_only_switch5_rttguard_qswap_q01q05;
+        qshrink_only_switch5_rttguard_qswap_jitteronly.variant_name = "qshrink_only_switch5_rttguard_qswap_jitteronly";
+        qshrink_only_switch5_rttguard_qswap_jitteronly.quantile_swap_iqr_enter_us = 1e9;
+        qshrink_only_switch5_rttguard_qswap_jitteronly.quantile_swap_iqr_exit_us = 1e9;
+        add(qshrink_only_switch5_rttguard_qswap_jitteronly);
+
+        MethodConfig qshrink_only_switch5_rttguard_qswap_hi08 = qshrink_only_switch5_rttguard_qswap_q01q05;
+        qshrink_only_switch5_rttguard_qswap_hi08.variant_name = "qshrink_only_switch5_rttguard_qswap_hi0p08";
+        qshrink_only_switch5_rttguard_qswap_hi08.quantile_swap_high = 0.08;
+        add(qshrink_only_switch5_rttguard_qswap_hi08);
+
+        MethodConfig qshrink_only_switch5_rttguard_cd2 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_cd2.variant_name = "qshrink_only_switch5_rttguard_cd2";
+        qshrink_only_switch5_rttguard_cd2.quantile_near_cooldown_us = 2000000;
+        add(qshrink_only_switch5_rttguard_cd2);
+
+        MethodConfig qshrink_only_switch5_rttguard_cd5 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_cd5.variant_name = "qshrink_only_switch5_rttguard_cd5";
+        qshrink_only_switch5_rttguard_cd5.quantile_near_cooldown_us = 5000000;
+        add(qshrink_only_switch5_rttguard_cd5);
+
+        MethodConfig qshrink_only_switch5_rttguard_cd10 = qshrink_only_switch5_rttguard;
+        qshrink_only_switch5_rttguard_cd10.variant_name = "qshrink_only_switch5_rttguard_cd10";
+        qshrink_only_switch5_rttguard_cd10.quantile_near_cooldown_us = 10000000;
+        add(qshrink_only_switch5_rttguard_cd10);
+
+        MethodConfig qshrink_only_switch5_rttguard_cd2_npkt50 = qshrink_only_switch5_rttguard_cd2;
+        qshrink_only_switch5_rttguard_cd2_npkt50.variant_name = "qshrink_only_switch5_rttguard_cd2_npkt50";
+        qshrink_only_switch5_rttguard_cd2_npkt50.gsp_npkt_min = 50;
+        add(qshrink_only_switch5_rttguard_cd2_npkt50);
+
+        MethodConfig qshrink_only_switch5_rttguard_cd5_npkt50 = qshrink_only_switch5_rttguard_cd5;
+        qshrink_only_switch5_rttguard_cd5_npkt50.variant_name = "qshrink_only_switch5_rttguard_cd5_npkt50";
+        qshrink_only_switch5_rttguard_cd5_npkt50.gsp_npkt_min = 50;
+        add(qshrink_only_switch5_rttguard_cd5_npkt50);
+
+        MethodConfig qshrink_only_switch5_rttguard_cd5_guard200 = qshrink_only_switch5_rttguard_cd5;
+        qshrink_only_switch5_rttguard_cd5_guard200.variant_name = "qshrink_only_switch5_rttguard_cd5_guard200";
+        qshrink_only_switch5_rttguard_cd5_guard200.gsp_guard_min_us = 200.0;
+        add(qshrink_only_switch5_rttguard_cd5_guard200);
+
+        MethodConfig qshrink_only_switch5_rttguard_cd5_stale5 = qshrink_only_switch5_rttguard_cd5;
+        qshrink_only_switch5_rttguard_cd5_stale5.variant_name = "qshrink_only_switch5_rttguard_cd5_stale5";
+        qshrink_only_switch5_rttguard_cd5_stale5.quantile_near_stale_n_consec = 5;
+        add(qshrink_only_switch5_rttguard_cd5_stale5);
+
+        MethodConfig qshrink_only_switch5_rttguard_cd5_skew10 = qshrink_only_switch5_rttguard_cd5;
+        qshrink_only_switch5_rttguard_cd5_skew10.variant_name = "qshrink_only_switch5_rttguard_cd5_skew10";
+        qshrink_only_switch5_rttguard_cd5_skew10.quantile_use_policy_skew_gate = true;
+        qshrink_only_switch5_rttguard_cd5_skew10.quantile_policy_skew_min_ppm = 10.0;
+        add(qshrink_only_switch5_rttguard_cd5_skew10);
+
+        MethodConfig qshrink_only_switch5_rttguard_cd5_forcemulti5 = qshrink_only_switch5_rttguard_cd5;
+        qshrink_only_switch5_rttguard_cd5_forcemulti5.variant_name = "qshrink_only_switch5_rttguard_cd5_forcemulti5";
+        qshrink_only_switch5_rttguard_cd5_forcemulti5.policy_force_multi_on_shrink = true;
+        qshrink_only_switch5_rttguard_cd5_forcemulti5.policy_force_multi_hold_us = 5000000;
+        add(qshrink_only_switch5_rttguard_cd5_forcemulti5);
+
+        MethodConfig qshrink_only_switch5_rttguard_cd10_forcemulti10 = qshrink_only_switch5_rttguard_cd10;
+        qshrink_only_switch5_rttguard_cd10_forcemulti10.variant_name = "qshrink_only_switch5_rttguard_cd10_forcemulti10";
+        qshrink_only_switch5_rttguard_cd10_forcemulti10.policy_force_multi_on_shrink = true;
+        qshrink_only_switch5_rttguard_cd10_forcemulti10.policy_force_multi_hold_us = 10000000;
+        add(qshrink_only_switch5_rttguard_cd10_forcemulti10);
+
+        MethodConfig qshrink_only_min5 = qshrink_only;
+        qshrink_only_min5.variant_name = "qshrink_only_min5";
+        qshrink_only_min5.policy_min_samples = 5;
+        add(qshrink_only_min5);
+
+        MethodConfig qshrink_only_min30 = qshrink_only;
+        qshrink_only_min30.variant_name = "qshrink_only_min30";
+        qshrink_only_min30.policy_min_samples = 30;
+        add(qshrink_only_min30);
+
+        MethodConfig qshrink_only_skew25 = qshrink_only;
+        qshrink_only_skew25.variant_name = "qshrink_only_skew25";
+        qshrink_only_skew25.policy_skew_min_ppm = 25.0;
+        add(qshrink_only_skew25);
+
+        MethodConfig qshrink_only_skew50 = qshrink_only;
+        qshrink_only_skew50.variant_name = "qshrink_only_skew50";
+        qshrink_only_skew50.policy_skew_min_ppm = 50.0;
+        add(qshrink_only_skew50);
+
+        MethodConfig near50 = m;
+        near50.variant_name = "near0p50";
+        near50.policy_near_ratio_low = 0.50;
+        add(near50);
+
+        MethodConfig rtt2000 = m;
+        rtt2000.variant_name = "rtt2000";
+        rtt2000.policy_rtt_step_us = 2000.0;
+        add(rtt2000);
+
+        MethodConfig iqr20000 = m;
+        iqr20000.variant_name = "iqr20000";
+        iqr20000.policy_iqr_high_us = 20000.0;
+        add(iqr20000);
+
+        MethodConfig min5 = m;
+        min5.variant_name = "min5";
+        min5.policy_min_samples = 5;
+        add(min5);
+
+        MethodConfig min30 = m;
+        min30.variant_name = "min30";
+        min30.policy_min_samples = 30;
+        add(min30);
+
+        MethodConfig cse5k = m;
+        cse5k.variant_name = "cse_iqr5k";
+        cse5k.cse_iqr_min_us = 5000.0;
+        add(cse5k);
+
+        MethodConfig cse15k = m;
+        cse15k.variant_name = "cse_iqr15k";
+        cse15k.cse_iqr_min_us = 15000.0;
+        add(cse15k);
+
+        MethodConfig cse30k = m;
+        cse30k.variant_name = "cse_iqr30k";
+        cse30k.cse_iqr_min_us = 30000.0;
+        add(cse30k);
+
+        MethodConfig cse80k = m;
+        cse80k.variant_name = "cse_iqr80k";
+        cse80k.cse_iqr_min_us = 80000.0;
+        add(cse80k);
+
+        MethodConfig cse_net10 = m;
+        cse_net10.variant_name = "cse_net10";
+        cse_net10.cse_net_slope_max = 10.0;
+        add(cse_net10);
+
+        MethodConfig cse_min2 = m;
+        cse_min2.variant_name = "cse_min2";
+        cse_min2.cse_min_samples = 2;
+        add(cse_min2);
+
+        MethodConfig cse_min8 = m;
+        cse_min8.variant_name = "cse_min8";
+        cse_min8.cse_min_samples = 8;
+        add(cse_min8);
+
+        MethodConfig skew5 = m;
+        skew5.variant_name = "skew5";
+        skew5.policy_skew_min_ppm = 5.0;
+        add(skew5);
+    }
+
+    // M4a11c - TimeSync min-delta linear regression
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncMinReg;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.minreg_window_us = 10000000;
+        m.minreg_min_samples = 5;
+        m.minreg_clamp_ppm = 200.0;
+        add(m);
+
+        MethodConfig w2 = m;
+        w2.variant_name = "w2s";
+        w2.minreg_window_us = 2000000;
+        add(w2);
+
+        MethodConfig w20 = m;
+        w20.variant_name = "w20s";
+        w20.minreg_window_us = 20000000;
+        add(w20);
+
+        MethodConfig theil = m;
+        theil.variant_name = "theilsen";
+        theil.minreg_use_theilsen = true;
+        add(theil);
+
+        MethodConfig theil_p10 = theil;
+        theil_p10.variant_name = "theilsen_p10";
+        theil_p10.minreg_use_short_p10 = true;
+        add(theil_p10);
+
+        MethodConfig theil_p10_cse = theil_p10;
+        theil_p10_cse.variant_name = "theilsen_p10_cse";
+        theil_p10_cse.minreg_use_cse_gate = true;
+        theil_p10_cse.cse_use_rtt_guard = true;
+        theil_p10_cse.cse_net_slope_max = 5.0;
+        add(theil_p10_cse);
+
+        MethodConfig huber = m;
+        huber.variant_name = "huber";
+        huber.minreg_use_huber = true;
+        huber.minreg_huber_k = 1.5;
+        add(huber);
+
+        MethodConfig cse_gate = m;
+        cse_gate.variant_name = "cse_gate";
+        cse_gate.minreg_use_cse_gate = true;
+        cse_gate.cse_use_rtt_guard = true;
+        cse_gate.cse_net_slope_max = 5.0;
+        add(cse_gate);
+    }
+
+    // M4a11d - TimeSync multi-window min aggregator
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncMultiWindow;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.multiwin_short_us = 2000000;
+        m.multiwin_mid_us = 10000000;
+        m.multiwin_long_us = 60000000;
+        add(m);
+
+        MethodConfig short_mid = m;
+        short_mid.variant_name = "short_mid";
+        short_mid.multiwin_short_us = 1000000;
+        short_mid.multiwin_mid_us = 5000000;
+        add(short_mid);
+
+        MethodConfig cse_gate = m;
+        cse_gate.variant_name = "cse_gate";
+        cse_gate.multiwin_use_cse_gate = true;
+        cse_gate.cse_use_rtt_guard = true;
+        cse_gate.cse_net_slope_max = 5.0;
+        add(cse_gate);
+    }
+
+    // M4a11e - TimeSync envelope decay (leaky min)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncEnvelopeDecay;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.decay_rate_us_per_s = 50.0;
+        add(m);
+
+        MethodConfig decay20 = m;
+        decay20.variant_name = "decay20";
+        decay20.decay_rate_us_per_s = 20.0;
+        add(decay20);
+
+        MethodConfig decay100 = m;
+        decay100.variant_name = "decay100";
+        decay100.decay_rate_us_per_s = 100.0;
+        add(decay100);
+
+        MethodConfig near_ratio = m;
+        near_ratio.variant_name = "near_ratio";
+        near_ratio.decay_use_near_ratio = true;
+        near_ratio.decay_near_ratio_floor = 0.1;
+        add(near_ratio);
+
+        MethodConfig cse = m;
+        cse.variant_name = "cse";
+        cse.decay_use_cse = true;
+        cse.decay_rate_us_per_s = 20.0;
+        cse.decay_rate_scale = 0.5;
+        cse.decay_rate_min_us_per_s = 10.0;
+        cse.decay_rate_max_us_per_s = 300.0;
+        add(cse);
+    }
+
+    // M4a12 - TimeSync KMin (k-th smallest long-bin min)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncKMin;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.kmin_k = 2;
+        add(m);
+
+        MethodConfig k3 = m;
+        k3.variant_name = "k3";
+        k3.kmin_k = 3;
+        add(k3);
+
+        MethodConfig k5 = m;
+        k5.variant_name = "k5";
+        k5.kmin_k = 5;
+        add(k5);
+
+        MethodConfig gated = m;
+        gated.variant_name = "gated";
+        gated.kmin_k = 3;
+        gated.kmin_use_stale_gate = true;
+        gated.kmin_use_xor_gate = true;
+        gated.kmin_use_rtt_guard = true;
+        gated.gsp_guard_min_us = 50.0;
+        gated.gsp_guard_k = 4.0;
+        gated.gsp_iqr_min_us = 200.0;
+        gated.gsp_iqr_k = 10.0;
+        gated.gsp_npkt_min = 20;
+        add(gated);
+
+        MethodConfig agew = m;
+        agew.variant_name = "agew";
+        agew.kmin_k = 3;
+        agew.kmin_use_age_weight = true;
+        agew.kmin_age_weight_us_per_s = 5.0;
+        add(agew);
+    }
+
+    // M4a13 - TimeSync KBest (evict smallest on staleness)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncKBest;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.kbest_k = 3;
+        m.kbest_n_consec = 2;
+        m.kbest_npkt_min = 20;
+        m.kbest_guard_min_us = 50.0;
+        m.kbest_guard_k = 4.0;
+        m.kbest_iqr_min_us = 200.0;
+        m.kbest_iqr_k = 10.0;
+        m.kbest_gnear_min_us = 25.0;
+        m.kbest_gnear_k = 2.0;
+        m.kbest_use_rtt_guard = true;
+        add(m);
+
+        MethodConfig k5 = m;
+        k5.variant_name = "k5";
+        k5.kbest_k = 5;
+        add(k5);
+
+        MethodConfig n3 = m;
+        n3.variant_name = "n3";
+        n3.kbest_n_consec = 3;
+        add(n3);
+    }
+
+    // M4a14 - TimeSync mixture-of-experts (anchor + tracker)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncMoE;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.moe_kp = 0.2;
+        m.moe_ki = 0.02;
+        m.moe_blend = 0.5;
+        m.moe_max_ppm = 200.0;
+        m.moe_npkt_min = 20;
+        m.moe_iqr_min_us = 200.0;
+        m.moe_iqr_k = 10.0;
+        m.moe_guard_min_us = 50.0;
+        m.moe_guard_k = 4.0;
+        m.moe_use_rtt_guard = true;
+        m.moe_use_xor_gate = false;
+        add(m);
+
+        MethodConfig kp04 = m;
+        kp04.variant_name = "kp0.4";
+        kp04.moe_kp = 0.4;
+        add(kp04);
+
+        MethodConfig ki005 = m;
+        ki005.variant_name = "ki0.05";
+        ki005.moe_ki = 0.05;
+        add(ki005);
+
+        MethodConfig w02 = m;
+        w02.variant_name = "w0.2";
+        w02.moe_blend = 0.2;
+        add(w02);
+
+        MethodConfig w08 = m;
+        w08.variant_name = "w0.8";
+        w08.moe_blend = 0.8;
+        add(w08);
+
+        MethodConfig hard = m;
+        hard.variant_name = "hard";
+        hard.moe_blend = 1.0;
+        add(hard);
+
+        MethodConfig conf = m;
+        conf.variant_name = "conf";
+        conf.moe_use_confidence_blend = true;
+        add(conf);
+
+        MethodConfig conf_xor = conf;
+        conf_xor.variant_name = "conf_xor";
+        conf_xor.moe_use_xor_gate = true;
+        add(conf_xor);
+
+        MethodConfig conf_decay = conf;
+        conf_decay.variant_name = "conf_decay";
+        conf_decay.moe_use_xor_gate = true;
+        conf_decay.moe_use_near_ratio = true;
+        conf_decay.moe_near_ratio_min = 0.1;
+        conf_decay.moe_unstable_reset_us = 5000000;
+        add(conf_decay);
+
+        MethodConfig autosel = m;
+        autosel.variant_name = "autosel";
+        autosel.moe_blend = 1.0;
+        autosel.moe_use_xor_gate = true;
+        autosel.moe_use_near_ratio = true;
+        autosel.moe_near_ratio_min = 0.1;
+        add(autosel);
+
+        MethodConfig xor_gate = m;
+        xor_gate.variant_name = "xor";
+        xor_gate.moe_use_xor_gate = true;
+        add(xor_gate);
+
+        MethodConfig noguard = m;
+        noguard.variant_name = "noguard";
+        noguard.moe_use_rtt_guard = false;
+        add(noguard);
+
+        MethodConfig noguard_xor = m;
+        noguard_xor.variant_name = "noguard_xor";
+        noguard_xor.moe_use_rtt_guard = false;
+        noguard_xor.moe_use_xor_gate = true;
+        add(noguard_xor);
+
+        MethodConfig resid200 = m;
+        resid200.variant_name = "resid200";
+        resid200.moe_resid_max_us = 200.0;
+        add(resid200);
+
+        MethodConfig guard1ms = m;
+        guard1ms.variant_name = "guard1ms";
+        guard1ms.rtt_guard_delta_us = 1000.0;
+        guard1ms.rtt_guard_iqr_us = 1000.0;
+        add(guard1ms);
+
+        MethodConfig strict = m;
+        strict.variant_name = "strict";
+        strict.moe_npkt_min = 50;
+        strict.moe_iqr_min_us = 100.0;
+        strict.moe_iqr_k = 5.0;
+        strict.moe_guard_min_us = 25.0;
+        strict.moe_guard_k = 2.0;
+        add(strict);
+
+        MethodConfig strict_xor = strict;
+        strict_xor.variant_name = "strict_xor";
+        strict_xor.moe_use_xor_gate = true;
+        add(strict_xor);
+
+        MethodConfig near = m;
+        near.variant_name = "near0p1";
+        near.moe_use_near_ratio = true;
+        near.moe_near_ratio_min = 0.1;
+        add(near);
+    }
+
+    // M4a14b - TimeSync RTT-conditioned bins
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncRttBins;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.rtt_bin_us = 10000;
+        m.rtt_bin_count = 8;
+        m.rtt_bin_alpha = 0.2;
+        m.rtt_bin_min_samples = 3;
+        add(m);
+
+        MethodConfig bin5 = m;
+        bin5.variant_name = "bin5ms";
+        bin5.rtt_bin_us = 5000;
+        add(bin5);
+
+        MethodConfig bin20 = m;
+        bin20.variant_name = "bin20ms";
+        bin20.rtt_bin_us = 20000;
+        add(bin20);
+
+        MethodConfig alpha01 = m;
+        alpha01.variant_name = "a0.1";
+        alpha01.rtt_bin_alpha = 0.1;
+        add(alpha01);
+
+        MethodConfig min5 = m;
+        min5.variant_name = "min5";
+        min5.rtt_bin_min_samples = 5;
+        add(min5);
+    }
+
+    // M4a15 - TimeSync DD-AC (drift-direction age compensation)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncDDAC;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.ddac_npkt_min = 20;
+        m.ddac_iqr_min_us = 200.0;
+        m.ddac_iqr_k = 10.0;
+        m.ddac_net_slope_max = 5.0;
+        m.ddac_beta = 0.05;
+        m.ddac_max_ppm = 200.0;
+        m.ddac_min_ppm = 1.0;
+        m.ddac_age_gap_us = 5000000;
+        m.ddac_clamp_margin_us = 100.0;
+        m.ddac_use_rtt_guard = true;
+        m.ddac_enable_step = false;
+        m.ddac_step_gb_us = 1000.0;
+        m.ddac_step_n_consec = 2;
+        m.ddac_step_rtt_guard_us = 200.0;
+        m.ddac_step_holdoff_us = 3000000;
+        add(m);
+
+        MethodConfig noguard = m;
+        noguard.variant_name = "noguard";
+        noguard.ddac_use_rtt_guard = false;
+        add(noguard);
+
+        MethodConfig age2 = m;
+        age2.variant_name = "age2s";
+        age2.ddac_age_gap_us = 2000000;
+        add(age2);
+
+        MethodConfig age10 = m;
+        age10.variant_name = "age10s";
+        age10.ddac_age_gap_us = 10000000;
+        add(age10);
+
+        MethodConfig clamp50 = m;
+        clamp50.variant_name = "clamp50";
+        clamp50.ddac_clamp_margin_us = 50.0;
+        add(clamp50);
+
+        MethodConfig dyn05 = m;
+        dyn05.variant_name = "clampiqr0p5";
+        dyn05.ddac_clamp_margin_us = 50.0;
+        dyn05.ddac_clamp_k = 0.5;
+        add(dyn05);
+
+        MethodConfig dyn10 = m;
+        dyn10.variant_name = "clampiqr1p0";
+        dyn10.ddac_clamp_margin_us = 100.0;
+        dyn10.ddac_clamp_k = 1.0;
+        add(dyn10);
+
+        MethodConfig signonly = m;
+        signonly.variant_name = "signonly";
+        signonly.ddac_use_age_gap = false;
+        add(signonly);
+
+        MethodConfig noelapsed = m;
+        noelapsed.variant_name = "noelapsed";
+        noelapsed.ddac_use_peer_age_elapsed = false;
+        add(noelapsed);
+
+        MethodConfig noelapsed_sign = m;
+        noelapsed_sign.variant_name = "noelapsed_sign";
+        noelapsed_sign.ddac_use_peer_age_elapsed = false;
+        noelapsed_sign.ddac_use_age_gap = false;
+        add(noelapsed_sign);
+
+        MethodConfig step = m;
+        step.variant_name = "step";
+        step.ddac_enable_step = true;
+        add(step);
+
+        MethodConfig step_relax = step;
+        step_relax.variant_name = "step_relax";
+        step_relax.ddac_step_require_stable = false;
+        add(step_relax);
+
+        MethodConfig step_hold0 = step;
+        step_hold0.variant_name = "step_hold0";
+        step_hold0.ddac_step_holdoff_us = 0;
+        add(step_hold0);
+
+        MethodConfig step_hold1 = step;
+        step_hold1.variant_name = "step_hold1s";
+        step_hold1.ddac_step_holdoff_us = 1000000;
+        add(step_hold1);
+
+        MethodConfig step_hold5 = step;
+        step_hold5.variant_name = "step_hold5s";
+        step_hold5.ddac_step_holdoff_us = 5000000;
+        add(step_hold5);
+
+        MethodConfig step_hold10 = step;
+        step_hold10.variant_name = "step_hold10s";
+        step_hold10.ddac_step_holdoff_us = 10000000;
+        add(step_hold10);
+
+        MethodConfig step_clamp50 = step;
+        step_clamp50.variant_name = "step_clamp50";
+        step_clamp50.ddac_clamp_margin_us = 50.0;
+        add(step_clamp50);
+
+        MethodConfig step_clamp200 = step;
+        step_clamp200.variant_name = "step_clamp200";
+        step_clamp200.ddac_clamp_margin_us = 200.0;
+        add(step_clamp200);
+
+        MethodConfig beta02 = m;
+        beta02.variant_name = "beta0p02";
+        beta02.ddac_beta = 0.02;
+        add(beta02);
+
+        MethodConfig beta10 = m;
+        beta10.variant_name = "beta0p10";
+        beta10.ddac_beta = 0.10;
+        add(beta10);
+
+        MethodConfig max500 = m;
+        max500.variant_name = "maxppm500";
+        max500.ddac_max_ppm = 500.0;
+        add(max500);
+
+        MethodConfig net2 = m;
+        net2.variant_name = "net2";
+        net2.ddac_net_slope_max = 2.0;
+        add(net2);
+
+        MethodConfig minppm5 = m;
+        minppm5.variant_name = "minppm5";
+        minppm5.ddac_min_ppm = 5.0;
+        add(minppm5);
+
+        MethodConfig age8 = m;
+        age8.variant_name = "age8s";
+        age8.ddac_age_gap_us = 8000000;
+        add(age8);
+
+        MethodConfig clamp2 = m;
+        clamp2.variant_name = "clampiqr2p0";
+        clamp2.ddac_clamp_margin_us = 100.0;
+        clamp2.ddac_clamp_k = 2.0;
+        add(clamp2);
+
+        MethodConfig strict = m;
+        strict.variant_name = "strict";
+        strict.ddac_npkt_min = 50;
+        strict.ddac_iqr_k = 5.0;
+        add(strict);
+
+        MethodConfig step_strict = step;
+        step_strict.variant_name = "step_strict";
+        step_strict.ddac_step_gb_us = 2000.0;
+        step_strict.ddac_step_n_consec = 3;
+        step_strict.ddac_step_rtt_guard_us = 500.0;
+        step_strict.ddac_step_holdoff_us = 5000000;
+        step_strict.ddac_step_require_stable = true;
+        add(step_strict);
+
+        MethodConfig step_soft = step;
+        step_soft.variant_name = "step_soft";
+        step_soft.ddac_step_gb_us = 500.0;
+        step_soft.ddac_step_n_consec = 1;
+        step_soft.ddac_step_rtt_guard_us = 100.0;
+        step_soft.ddac_step_holdoff_us = 1000000;
+        step_soft.ddac_step_require_stable = false;
+        add(step_soft);
+    }
+
+    // M4a15b - TimeSync DD-AC blend (confidence-weighted)
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncDDACBlend;
+        m.estimator = EstimatorKind::Min;
+        m.discipline = DisciplineKind::None;
+        m.probe_rate_hz = 0.0;
+        m.stats_long_window_us = 60000000;
+        m.stats_short_window_us = 2000000;
+        m.ddac_npkt_min = 20;
+        m.ddac_iqr_min_us = 200.0;
+        m.ddac_iqr_k = 10.0;
+        m.ddac_net_slope_max = 5.0;
+        m.ddac_beta = 0.05;
+        m.ddac_max_ppm = 200.0;
+        m.ddac_min_ppm = 1.0;
+        m.ddac_age_gap_us = 5000000;
+        m.ddac_clamp_margin_us = 100.0;
+        m.ddac_use_rtt_guard = true;
+        m.ddac_blend_skew_ppm = 50.0;
+        add(m);
+
+        MethodConfig blend100 = m;
+        blend100.variant_name = "blend100";
+        blend100.ddac_blend_skew_ppm = 100.0;
+        add(blend100);
+
+        MethodConfig blend20 = m;
+        blend20.variant_name = "blend20";
+        blend20.ddac_blend_skew_ppm = 20.0;
+        add(blend20);
+    }
+
+    // M4a6 - TimeSync + low-rate probes for skew
+    {
+        MethodConfig m = base;
+        m.kind = MethodKind::TimeSyncProbe;
+        m.estimator = EstimatorKind::Regression;
+        m.discipline = DisciplineKind::Hybrid;
+        m.probe_rate_hz = 1.0;
         add(m);
     }
 
@@ -2182,60 +19635,633 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
 //------------------------------------------------------------------------------
 // CSV output
 
+static string MethodLabel(const MethodConfig& method)
+{
+    const char* base = MethodName(method.kind);
+    if (method.variant_name.empty()) {
+        return string(base);
+    }
+    return string(base) + ":" + method.variant_name;
+}
+
 static void WriteCsvHeader(std::ofstream& out)
 {
-    out << "scenario,train,method,estimator,discipline,seed,"
-        << "offset_p50_ab_us,offset_p95_ab_us,offset_p99_ab_us,"
-        << "offset_p50_ba_us,offset_p95_ba_us,offset_p99_ba_us,"
-        << "poll_time_err_p50_ab_us,poll_time_err_p95_ab_us,poll_time_err_p99_ab_us,"
-        << "poll_time_err_p50_ba_us,poll_time_err_p95_ba_us,poll_time_err_p99_ba_us,"
+    out << "scenario,train,method,estimator,discipline,seed,drift_ppm_a,drift_ppm_b,skew_mag_ppm,poll_rate_hz,probe_rate_hz,mindelta_interval_us,overhead_budget_bps,"
+        << "offset_p50_ab_us,offset_p95_ab_us,offset_p99_ab_us,offset_mean_ab_us,offset_var_ab_us2,offset_max_ab_us,"
+        << "offset_p50_ba_us,offset_p95_ba_us,offset_p99_ba_us,offset_mean_ba_us,offset_var_ba_us2,offset_max_ba_us,"
+        << "poll_time_err_p50_ab_us,poll_time_err_p95_ab_us,poll_time_err_p99_ab_us,poll_time_err_mean_ab_us,"
+        << "poll_time_err_var_ab_us2,poll_time_err_max_ab_us,"
+        << "poll_time_err_p50_ba_us,poll_time_err_p95_ba_us,poll_time_err_p99_ba_us,poll_time_err_mean_ba_us,"
+        << "poll_time_err_var_ba_us2,poll_time_err_max_ba_us,"
+        << "poll_time_err_count_ab,poll_time_err_count_ba,"
+        << "poll_time_err_valid_ab,poll_time_err_valid_ba,"
+        << "poll_time_err_over5_ratio_ab,poll_time_err_over5_ratio_ba,"
+        << "poll_time_err_over10_ratio_ab,poll_time_err_over10_ratio_ba,"
+        << "poll_time_err_over20_ratio_ab,poll_time_err_over20_ratio_ba,"
+        << "poll_time_err_over50_ratio_ab,poll_time_err_over50_ratio_ba,"
         << "skew_p95_ab_ppm,skew_p95_ba_ppm,"
-        << "owd_p50_ab_us,owd_p95_ab_us,owd_p99_ab_us,"
-        << "owd_p50_ba_us,owd_p95_ba_us,owd_p99_ba_us,"
+        << "owd_p50_ab_us,owd_p95_ab_us,owd_p99_ab_us,owd_mean_ab_us,owd_var_ab_us2,owd_max_ab_us,"
+        << "owd_p50_ba_us,owd_p95_ba_us,owd_p99_ba_us,owd_mean_ba_us,owd_var_ba_us2,owd_max_ba_us,"
         << "converge_ab_s,converge_ba_s,"
+        << "step_recover_ab_s,step_recover_ba_s,"
+        << "step_recover_ab_us,step_recover_ba_us,"
+        << "step_recover3_ab_s,step_recover3_ba_s,"
+        << "step_recover3_ab_us,step_recover3_ba_us,"
+        << "step_recover5_ab_s,step_recover5_ba_s,"
+        << "step_recover5_ab_us,step_recover5_ba_us,"
+        << "step_recover3_5_ab_s,step_recover3_5_ba_s,"
+        << "step_recover3_5_ab_us,step_recover3_5_ba_us,"
+        << "step_recover10_ab_s,step_recover10_ba_s,"
+        << "step_recover10_ab_us,step_recover10_ba_us,"
+        << "step_recover3_10_ab_s,step_recover3_10_ba_s,"
+        << "step_recover3_10_ab_us,step_recover3_10_ba_us,"
+        << "step_recover20_ab_s,step_recover20_ba_s,"
+        << "step_recover20_ab_us,step_recover20_ba_us,"
+        << "step_recover3_20_ab_s,step_recover3_20_ba_s,"
+        << "step_recover3_20_ab_us,step_recover3_20_ba_us,"
+        << "step_recover50_ab_s,step_recover50_ba_s,"
+        << "step_recover50_ab_us,step_recover50_ba_us,"
+        << "step_recover3_50_ab_s,step_recover3_50_ba_s,"
+        << "step_recover3_50_ab_us,step_recover3_50_ba_us,"
+        << "step_recover100_ab_s,step_recover100_ba_s,"
+        << "step_recover100_ab_us,step_recover100_ba_us,"
+        << "step_recover3_100_ab_s,step_recover3_100_ba_s,"
+        << "step_recover3_100_ab_us,step_recover3_100_ba_us,"
+        << "step_recover500_ab_s,step_recover500_ba_s,"
+        << "step_recover500_ab_us,step_recover500_ba_us,"
+        << "step_recover3_500_ab_s,step_recover3_500_ba_s,"
+        << "step_recover3_500_ab_us,step_recover3_500_ba_us,"
+        << "step_peak_ab_us,step_peak_ba_us,"
+        << "step_auc_ab_us_s,step_auc_ba_us_s,"
+        << "step_settle_ab_s,step_settle_ba_s,"
         << "deadline_tp,deadline_fp,deadline_fn,deadline_tn,"
-        << "overhead_bps,cpu_ops,mem_bytes,"
-        << "teleop_rms_error,teleop_max_error\n";
+        << "short_p10_mean_ab_us,short_iqr_mean_ab_us,short_near_hits_mean_ab,"
+        << "short_p10_mean_ba_us,short_iqr_mean_ba_us,short_near_hits_mean_ba,"
+        << "rtt_short_mean_us,rtt_long_mean_us,rtt_delta_mean_us,rtt_iqr_mean_us,rtt_guard_ok_ratio,"
+        << "ts24_drops_ab,ts24_drops_ba,"
+        << "overhead_bps,budget_margin_bps,over_budget,cpu_ops,mem_bytes,"
+        << "teleop_rms_error,teleop_max_error,"
+        << "gsp_promotions_ab,gsp_promotions_ba,"
+        << "nfhs_promotions_ab,nfhs_promotions_ba,"
+        << "step_resets_ab,step_resets_ba,"
+        << "step_guard_ticks_ab,step_guard_ticks_ba,"
+        << "step_guard_stable_ab,step_guard_stable_ba,"
+        << "step_guard_enough_ab,step_guard_enough_ba,"
+        << "step_guard_nonear_ab,step_guard_nonear_ba,"
+        << "step_guard_near_ratio_ok_ab,step_guard_near_ratio_ok_ba,"
+        << "step_guard_rtt_ok_ab,step_guard_rtt_ok_ba,"
+        << "step_guard_xor_ok_ab,step_guard_xor_ok_ba,"
+        << "step_guard_sym_ok_ab,step_guard_sym_ok_ba,"
+        << "step_guard_stale_ab_ab,step_guard_stale_ab_ba,"
+        << "step_guard_stale_ba_ab,step_guard_stale_ba_ba,"
+        << "step_guard_innov_ok_ab,step_guard_innov_ok_ba,"
+        << "step_guard_all_ok_ab,step_guard_all_ok_ba,"
+        << "shadow_skew_updates_ab,shadow_skew_updates_ba,"
+        << "cse_updates_ab,cse_updates_ba,"
+        << "consensus_updates_ab,consensus_updates_ba,"
+        << "minreg_updates_ab,minreg_updates_ba,"
+        << "multiwin_updates_ab,multiwin_updates_ba,"
+        << "decay_updates_ab,decay_updates_ba,"
+        << "kmin_updates_ab,kmin_updates_ba,"
+        << "kbest_advances_ab,kbest_advances_ba,"
+        << "moe_updates_ab,moe_updates_ba,"
+        << "moe_blends_ab,moe_blends_ba,"
+        << "moe_conf_mean_ab,moe_conf_mean_ba,"
+        << "ddac_skew_updates_ab,ddac_skew_updates_ba,"
+        << "ddac_age_comp_ab,ddac_age_comp_ba,"
+        << "ddac_clamp_hits_ab,ddac_clamp_hits_ba,"
+        << "ddac_step_resets_ab,ddac_step_resets_ba,"
+        << "ddac_step_in_hits_ab,ddac_step_in_hits_ba,"
+        << "ddac_step_out_hits_ab,ddac_step_out_hits_ba,"
+        << "ddac_step_xor_hits_ab,ddac_step_xor_hits_ba,"
+        << "ddac_step_streak_max_ab,ddac_step_streak_max_ba,"
+        << "ddac_gap_in_mean_ab_us,ddac_gap_in_p95_ab_us,"
+        << "ddac_gap_out_mean_ab_us,ddac_gap_out_p95_ab_us,"
+        << "ddac_gap_in_mean_ba_us,ddac_gap_in_p95_ba_us,"
+        << "ddac_gap_out_mean_ba_us,ddac_gap_out_p95_ba_us,"
+        << "age_comp_updates_ab,age_comp_updates_ba,"
+        << "tilted_updates_ab,tilted_updates_ba\n";
 }
 
 static void WriteCsvRow(std::ofstream& out, const ScenarioConfig& scenario, const MethodConfig& method, uint64_t seed, const BenchmarkMetrics& m)
 {
+    const size_t poll_count_ab = m.ab.poll_time_err_us.Count();
+    const size_t poll_count_ba = m.ba.poll_time_err_us.Count();
+    const double budget_margin_bps = (scenario.overhead_budget_bps > 0.0)
+        ? (m.overhead_bps - scenario.overhead_budget_bps)
+        : 0.0;
+    const int over_budget = (scenario.overhead_budget_bps > 0.0 && budget_margin_bps > 0.0) ? 1 : 0;
+    auto step_recover_s = [&](const DirectionMetrics& dm) -> double {
+        if (!scenario.clock_step_enabled) {
+            return 0.0;
+        }
+        if (!dm.step_recovered) {
+            return -1.0;
+        }
+        if (dm.step_recover_time_us <= scenario.clock_step_time_us) {
+            return -1.0;
+        }
+        return (double)(dm.step_recover_time_us - scenario.clock_step_time_us) / 1000000.0;
+    };
+    auto step_recover_cons_s = [&](const DirectionMetrics& dm) -> double {
+        if (!scenario.clock_step_enabled) {
+            return 0.0;
+        }
+        if (!dm.step_recover_cons) {
+            return -1.0;
+        }
+        if (dm.step_recover_cons_time_us <= scenario.clock_step_time_us) {
+            return -1.0;
+        }
+        return (double)(dm.step_recover_cons_time_us - scenario.clock_step_time_us) / 1000000.0;
+    };
+    auto step_recover5_s = [&](const DirectionMetrics& dm) -> double {
+        if (!scenario.clock_step_enabled) {
+            return 0.0;
+        }
+        if (!dm.step_recovered_5ms) {
+            return -1.0;
+        }
+        if (dm.step_recover_time_5ms <= scenario.clock_step_time_us) {
+            return -1.0;
+        }
+        return (double)(dm.step_recover_time_5ms - scenario.clock_step_time_us) / 1000000.0;
+    };
+    auto step_recover3_5_s = [&](const DirectionMetrics& dm) -> double {
+        if (!scenario.clock_step_enabled) {
+            return 0.0;
+        }
+        if (!dm.step_recover_cons_5ms) {
+            return -1.0;
+        }
+        if (dm.step_recover_cons_time_5ms <= scenario.clock_step_time_us) {
+            return -1.0;
+        }
+        return (double)(dm.step_recover_cons_time_5ms - scenario.clock_step_time_us) / 1000000.0;
+    };
+    auto step_recover10_s = [&](const DirectionMetrics& dm) -> double {
+        if (!scenario.clock_step_enabled) {
+            return 0.0;
+        }
+        if (!dm.step_recovered_10ms) {
+            return -1.0;
+        }
+        if (dm.step_recover_time_10ms <= scenario.clock_step_time_us) {
+            return -1.0;
+        }
+        return (double)(dm.step_recover_time_10ms - scenario.clock_step_time_us) / 1000000.0;
+    };
+    auto step_recover3_10_s = [&](const DirectionMetrics& dm) -> double {
+        if (!scenario.clock_step_enabled) {
+            return 0.0;
+        }
+        if (!dm.step_recover_cons_10ms) {
+            return -1.0;
+        }
+        if (dm.step_recover_cons_time_10ms <= scenario.clock_step_time_us) {
+            return -1.0;
+        }
+        return (double)(dm.step_recover_cons_time_10ms - scenario.clock_step_time_us) / 1000000.0;
+    };
+    auto step_recover20_s = [&](const DirectionMetrics& dm) -> double {
+        if (!scenario.clock_step_enabled) {
+            return 0.0;
+        }
+        if (!dm.step_recovered_20ms) {
+            return -1.0;
+        }
+        if (dm.step_recover_time_20ms <= scenario.clock_step_time_us) {
+            return -1.0;
+        }
+        return (double)(dm.step_recover_time_20ms - scenario.clock_step_time_us) / 1000000.0;
+    };
+    auto step_recover3_20_s = [&](const DirectionMetrics& dm) -> double {
+        if (!scenario.clock_step_enabled) {
+            return 0.0;
+        }
+        if (!dm.step_recover_cons_20ms) {
+            return -1.0;
+        }
+        if (dm.step_recover_cons_time_20ms <= scenario.clock_step_time_us) {
+            return -1.0;
+        }
+        return (double)(dm.step_recover_cons_time_20ms - scenario.clock_step_time_us) / 1000000.0;
+    };
+    auto step_recover50_s = [&](const DirectionMetrics& dm) -> double {
+        if (!scenario.clock_step_enabled) {
+            return 0.0;
+        }
+        if (!dm.step_recovered_50ms) {
+            return -1.0;
+        }
+        if (dm.step_recover_time_50ms <= scenario.clock_step_time_us) {
+            return -1.0;
+        }
+        return (double)(dm.step_recover_time_50ms - scenario.clock_step_time_us) / 1000000.0;
+    };
+    auto step_recover3_50_s = [&](const DirectionMetrics& dm) -> double {
+        if (!scenario.clock_step_enabled) {
+            return 0.0;
+        }
+        if (!dm.step_recover_cons_50ms) {
+            return -1.0;
+        }
+        if (dm.step_recover_cons_time_50ms <= scenario.clock_step_time_us) {
+            return -1.0;
+        }
+        return (double)(dm.step_recover_cons_time_50ms - scenario.clock_step_time_us) / 1000000.0;
+    };
+    auto step_recover100_s = [&](const DirectionMetrics& dm) -> double {
+        if (!scenario.clock_step_enabled) {
+            return 0.0;
+        }
+        if (!dm.step_recovered_100ms) {
+            return -1.0;
+        }
+        if (dm.step_recover_time_100ms <= scenario.clock_step_time_us) {
+            return -1.0;
+        }
+        return (double)(dm.step_recover_time_100ms - scenario.clock_step_time_us) / 1000000.0;
+    };
+    auto step_recover3_100_s = [&](const DirectionMetrics& dm) -> double {
+        if (!scenario.clock_step_enabled) {
+            return 0.0;
+        }
+        if (!dm.step_recover_cons_100ms) {
+            return -1.0;
+        }
+        if (dm.step_recover_cons_time_100ms <= scenario.clock_step_time_us) {
+            return -1.0;
+        }
+        return (double)(dm.step_recover_cons_time_100ms - scenario.clock_step_time_us) / 1000000.0;
+    };
+    auto step_recover500_s = [&](const DirectionMetrics& dm) -> double {
+        if (!scenario.clock_step_enabled) {
+            return 0.0;
+        }
+        if (!dm.step_recovered_500ms) {
+            return -1.0;
+        }
+        if (dm.step_recover_time_500ms <= scenario.clock_step_time_us) {
+            return -1.0;
+        }
+        return (double)(dm.step_recover_time_500ms - scenario.clock_step_time_us) / 1000000.0;
+    };
+    auto step_recover3_500_s = [&](const DirectionMetrics& dm) -> double {
+        if (!scenario.clock_step_enabled) {
+            return 0.0;
+        }
+        if (!dm.step_recover_cons_500ms) {
+            return -1.0;
+        }
+        if (dm.step_recover_cons_time_500ms <= scenario.clock_step_time_us) {
+            return -1.0;
+        }
+        return (double)(dm.step_recover_cons_time_500ms - scenario.clock_step_time_us) / 1000000.0;
+    };
+
     out << scenario.name << "," << (scenario.train ? 1 : 0) << ","
-        << MethodName(method.kind) << ","
+        << MethodLabel(method) << ","
         << EstimatorName(method.estimator) << ","
         << DisciplineName(method.discipline) << ","
         << seed << ","
+        << scenario.drift_ppm_a << ","
+        << scenario.drift_ppm_b << ","
+        << std::fabs(scenario.drift_ppm_b - scenario.drift_ppm_a) << ","
+        << scenario.poll_rate_hz << ","
+        << method.probe_rate_hz << ","
+        << method.mindelta_interval_us << ","
+        << scenario.overhead_budget_bps << ","
         << m.ab.offset_err_us.Percentile(0.50) << ","
         << m.ab.offset_err_us.Percentile(0.95) << ","
         << m.ab.offset_err_us.Percentile(0.99) << ","
+        << m.ab.offset_err_us.Mean() << ","
+        << m.ab.offset_err_us.Variance() << ","
+        << m.ab.offset_err_us.Max() << ","
         << m.ba.offset_err_us.Percentile(0.50) << ","
         << m.ba.offset_err_us.Percentile(0.95) << ","
         << m.ba.offset_err_us.Percentile(0.99) << ","
+        << m.ba.offset_err_us.Mean() << ","
+        << m.ba.offset_err_us.Variance() << ","
+        << m.ba.offset_err_us.Max() << ","
         << m.ab.poll_time_err_us.Percentile(0.50) << ","
         << m.ab.poll_time_err_us.Percentile(0.95) << ","
         << m.ab.poll_time_err_us.Percentile(0.99) << ","
+        << m.ab.poll_time_err_us.Mean() << ","
+        << m.ab.poll_time_err_us.Variance() << ","
+        << m.ab.poll_time_err_us.Max() << ","
         << m.ba.poll_time_err_us.Percentile(0.50) << ","
         << m.ba.poll_time_err_us.Percentile(0.95) << ","
         << m.ba.poll_time_err_us.Percentile(0.99) << ","
+        << m.ba.poll_time_err_us.Mean() << ","
+        << m.ba.poll_time_err_us.Variance() << ","
+        << m.ba.poll_time_err_us.Max() << ","
+        << poll_count_ab << ","
+        << poll_count_ba << ","
+        << (poll_count_ab > 0 ? 1 : 0) << ","
+        << (poll_count_ba > 0 ? 1 : 0) << ","
+        << (poll_count_ab > 0 ? (double)m.ab.poll_over_5ms / (double)poll_count_ab : 0.0) << ","
+        << (poll_count_ba > 0 ? (double)m.ba.poll_over_5ms / (double)poll_count_ba : 0.0) << ","
+        << (poll_count_ab > 0 ? (double)m.ab.poll_over_10ms / (double)poll_count_ab : 0.0) << ","
+        << (poll_count_ba > 0 ? (double)m.ba.poll_over_10ms / (double)poll_count_ba : 0.0) << ","
+        << (poll_count_ab > 0 ? (double)m.ab.poll_over_20ms / (double)poll_count_ab : 0.0) << ","
+        << (poll_count_ba > 0 ? (double)m.ba.poll_over_20ms / (double)poll_count_ba : 0.0) << ","
+        << (poll_count_ab > 0 ? (double)m.ab.poll_over_50ms / (double)poll_count_ab : 0.0) << ","
+        << (poll_count_ba > 0 ? (double)m.ba.poll_over_50ms / (double)poll_count_ba : 0.0) << ","
         << m.ab.skew_err_ppm.Percentile(0.95) << ","
         << m.ba.skew_err_ppm.Percentile(0.95) << ","
         << m.ab.owd_err_us.Percentile(0.50) << ","
         << m.ab.owd_err_us.Percentile(0.95) << ","
         << m.ab.owd_err_us.Percentile(0.99) << ","
+        << m.ab.owd_err_us.Mean() << ","
+        << m.ab.owd_err_us.Variance() << ","
+        << m.ab.owd_err_us.Max() << ","
         << m.ba.owd_err_us.Percentile(0.50) << ","
         << m.ba.owd_err_us.Percentile(0.95) << ","
         << m.ba.owd_err_us.Percentile(0.99) << ","
+        << m.ba.owd_err_us.Mean() << ","
+        << m.ba.owd_err_us.Variance() << ","
+        << m.ba.owd_err_us.Max() << ","
         << (m.ab.converged ? (m.ab.converge_time_us / 1000000.0) : 0.0) << ","
         << (m.ba.converged ? (m.ba.converge_time_us / 1000000.0) : 0.0) << ","
+        << step_recover_s(m.ab) << ","
+        << step_recover_s(m.ba) << ","
+        << (m.ab.step_recovered
+                ? (double)((m.ab.step_recover_time_us > scenario.clock_step_time_us)
+                    ? (m.ab.step_recover_time_us - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << (m.ba.step_recovered
+                ? (double)((m.ba.step_recover_time_us > scenario.clock_step_time_us)
+                    ? (m.ba.step_recover_time_us - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << step_recover_cons_s(m.ab) << ","
+        << step_recover_cons_s(m.ba) << ","
+        << (m.ab.step_recover_cons
+                ? (double)((m.ab.step_recover_cons_time_us > scenario.clock_step_time_us)
+                    ? (m.ab.step_recover_cons_time_us - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << (m.ba.step_recover_cons
+                ? (double)((m.ba.step_recover_cons_time_us > scenario.clock_step_time_us)
+                    ? (m.ba.step_recover_cons_time_us - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << step_recover5_s(m.ab) << ","
+        << step_recover5_s(m.ba) << ","
+        << (m.ab.step_recovered_5ms
+                ? (double)((m.ab.step_recover_time_5ms > scenario.clock_step_time_us)
+                    ? (m.ab.step_recover_time_5ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << (m.ba.step_recovered_5ms
+                ? (double)((m.ba.step_recover_time_5ms > scenario.clock_step_time_us)
+                    ? (m.ba.step_recover_time_5ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << step_recover3_5_s(m.ab) << ","
+        << step_recover3_5_s(m.ba) << ","
+        << (m.ab.step_recover_cons_5ms
+                ? (double)((m.ab.step_recover_cons_time_5ms > scenario.clock_step_time_us)
+                    ? (m.ab.step_recover_cons_time_5ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << (m.ba.step_recover_cons_5ms
+                ? (double)((m.ba.step_recover_cons_time_5ms > scenario.clock_step_time_us)
+                    ? (m.ba.step_recover_cons_time_5ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << step_recover10_s(m.ab) << ","
+        << step_recover10_s(m.ba) << ","
+        << (m.ab.step_recovered_10ms
+                ? (double)((m.ab.step_recover_time_10ms > scenario.clock_step_time_us)
+                    ? (m.ab.step_recover_time_10ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << (m.ba.step_recovered_10ms
+                ? (double)((m.ba.step_recover_time_10ms > scenario.clock_step_time_us)
+                    ? (m.ba.step_recover_time_10ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << step_recover3_10_s(m.ab) << ","
+        << step_recover3_10_s(m.ba) << ","
+        << (m.ab.step_recover_cons_10ms
+                ? (double)((m.ab.step_recover_cons_time_10ms > scenario.clock_step_time_us)
+                    ? (m.ab.step_recover_cons_time_10ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << (m.ba.step_recover_cons_10ms
+                ? (double)((m.ba.step_recover_cons_time_10ms > scenario.clock_step_time_us)
+                    ? (m.ba.step_recover_cons_time_10ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << step_recover20_s(m.ab) << ","
+        << step_recover20_s(m.ba) << ","
+        << (m.ab.step_recovered_20ms
+                ? (double)((m.ab.step_recover_time_20ms > scenario.clock_step_time_us)
+                    ? (m.ab.step_recover_time_20ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << (m.ba.step_recovered_20ms
+                ? (double)((m.ba.step_recover_time_20ms > scenario.clock_step_time_us)
+                    ? (m.ba.step_recover_time_20ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << step_recover3_20_s(m.ab) << ","
+        << step_recover3_20_s(m.ba) << ","
+        << (m.ab.step_recover_cons_20ms
+                ? (double)((m.ab.step_recover_cons_time_20ms > scenario.clock_step_time_us)
+                    ? (m.ab.step_recover_cons_time_20ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << (m.ba.step_recover_cons_20ms
+                ? (double)((m.ba.step_recover_cons_time_20ms > scenario.clock_step_time_us)
+                    ? (m.ba.step_recover_cons_time_20ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << step_recover50_s(m.ab) << ","
+        << step_recover50_s(m.ba) << ","
+        << (m.ab.step_recovered_50ms
+                ? (double)((m.ab.step_recover_time_50ms > scenario.clock_step_time_us)
+                    ? (m.ab.step_recover_time_50ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << (m.ba.step_recovered_50ms
+                ? (double)((m.ba.step_recover_time_50ms > scenario.clock_step_time_us)
+                    ? (m.ba.step_recover_time_50ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << step_recover3_50_s(m.ab) << ","
+        << step_recover3_50_s(m.ba) << ","
+        << (m.ab.step_recover_cons_50ms
+                ? (double)((m.ab.step_recover_cons_time_50ms > scenario.clock_step_time_us)
+                    ? (m.ab.step_recover_cons_time_50ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << (m.ba.step_recover_cons_50ms
+                ? (double)((m.ba.step_recover_cons_time_50ms > scenario.clock_step_time_us)
+                    ? (m.ba.step_recover_cons_time_50ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << step_recover100_s(m.ab) << ","
+        << step_recover100_s(m.ba) << ","
+        << (m.ab.step_recovered_100ms
+                ? (double)((m.ab.step_recover_time_100ms > scenario.clock_step_time_us)
+                    ? (m.ab.step_recover_time_100ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << (m.ba.step_recovered_100ms
+                ? (double)((m.ba.step_recover_time_100ms > scenario.clock_step_time_us)
+                    ? (m.ba.step_recover_time_100ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << step_recover3_100_s(m.ab) << ","
+        << step_recover3_100_s(m.ba) << ","
+        << (m.ab.step_recover_cons_100ms
+                ? (double)((m.ab.step_recover_cons_time_100ms > scenario.clock_step_time_us)
+                    ? (m.ab.step_recover_cons_time_100ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << (m.ba.step_recover_cons_100ms
+                ? (double)((m.ba.step_recover_cons_time_100ms > scenario.clock_step_time_us)
+                    ? (m.ba.step_recover_cons_time_100ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << step_recover500_s(m.ab) << ","
+        << step_recover500_s(m.ba) << ","
+        << (m.ab.step_recovered_500ms
+                ? (double)((m.ab.step_recover_time_500ms > scenario.clock_step_time_us)
+                    ? (m.ab.step_recover_time_500ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << (m.ba.step_recovered_500ms
+                ? (double)((m.ba.step_recover_time_500ms > scenario.clock_step_time_us)
+                    ? (m.ba.step_recover_time_500ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << step_recover3_500_s(m.ab) << ","
+        << step_recover3_500_s(m.ba) << ","
+        << (m.ab.step_recover_cons_500ms
+                ? (double)((m.ab.step_recover_cons_time_500ms > scenario.clock_step_time_us)
+                    ? (m.ab.step_recover_cons_time_500ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << (m.ba.step_recover_cons_500ms
+                ? (double)((m.ba.step_recover_cons_time_500ms > scenario.clock_step_time_us)
+                    ? (m.ba.step_recover_cons_time_500ms - scenario.clock_step_time_us)
+                    : -1.0)
+                : -1.0) << ","
+        << m.ab.step_peak_err_us << ","
+        << m.ba.step_peak_err_us << ","
+        << m.ab.step_auc_err_us_s << ","
+        << m.ba.step_auc_err_us_s << ","
+        << step_recover_cons_s(m.ab) << ","
+        << step_recover_cons_s(m.ba) << ","
         << m.ab.deadline_tp + m.ba.deadline_tp << ","
         << m.ab.deadline_fp + m.ba.deadline_fp << ","
         << m.ab.deadline_fn + m.ba.deadline_fn << ","
         << m.ab.deadline_tn + m.ba.deadline_tn << ","
+        << m.ab.short_p10_us.Mean() << ","
+        << m.ab.short_iqr_us.Mean() << ","
+        << m.ab.short_near_hits.Mean() << ","
+        << m.ba.short_p10_us.Mean() << ","
+        << m.ba.short_iqr_us.Mean() << ","
+        << m.ba.short_near_hits.Mean() << ","
+        << m.rtt_short_us.Mean() << ","
+        << m.rtt_long_us.Mean() << ","
+        << m.rtt_delta_us.Mean() << ","
+        << m.rtt_short_iqr_us.Mean() << ","
+        << (m.rtt_guard_total > 0 ? ((double)m.rtt_guard_ok / (double)m.rtt_guard_total) : 0.0) << ","
+        << m.ab.ts24_drops << ","
+        << m.ba.ts24_drops << ","
         << m.overhead_bps << ","
+        << budget_margin_bps << ","
+        << over_budget << ","
         << m.cpu_ops << ","
         << m.mem_bytes << ","
         << m.teleop_rms_error << ","
-        << m.teleop_max_error << "\n";
+        << m.teleop_max_error << ","
+        << m.method_a.gsp_promotions << ","
+        << m.method_b.gsp_promotions << ","
+        << m.method_a.nfhs_promotions << ","
+        << m.method_b.nfhs_promotions << ","
+        << m.method_a.step_resets << ","
+        << m.method_b.step_resets << ","
+        << m.method_a.step_guard_ticks << ","
+        << m.method_b.step_guard_ticks << ","
+        << m.method_a.step_guard_stable << ","
+        << m.method_b.step_guard_stable << ","
+        << m.method_a.step_guard_enough << ","
+        << m.method_b.step_guard_enough << ","
+        << m.method_a.step_guard_nonear << ","
+        << m.method_b.step_guard_nonear << ","
+        << m.method_a.step_guard_near_ratio_ok << ","
+        << m.method_b.step_guard_near_ratio_ok << ","
+        << m.method_a.step_guard_rtt_ok << ","
+        << m.method_b.step_guard_rtt_ok << ","
+        << m.method_a.step_guard_xor_ok << ","
+        << m.method_b.step_guard_xor_ok << ","
+        << m.method_a.step_guard_sym_ok << ","
+        << m.method_b.step_guard_sym_ok << ","
+        << m.method_a.step_guard_stale_ab << ","
+        << m.method_b.step_guard_stale_ab << ","
+        << m.method_a.step_guard_stale_ba << ","
+        << m.method_b.step_guard_stale_ba << ","
+        << m.method_a.step_guard_innov_ok << ","
+        << m.method_b.step_guard_innov_ok << ","
+        << m.method_a.step_guard_all_ok << ","
+        << m.method_b.step_guard_all_ok << ","
+        << m.method_a.shadow_skew_updates << ","
+        << m.method_b.shadow_skew_updates << ","
+        << m.method_a.cse_updates << ","
+        << m.method_b.cse_updates << ","
+        << m.method_a.consensus_updates << ","
+        << m.method_b.consensus_updates << ","
+        << m.method_a.minreg_updates << ","
+        << m.method_b.minreg_updates << ","
+        << m.method_a.multiwin_updates << ","
+        << m.method_b.multiwin_updates << ","
+        << m.method_a.decay_updates << ","
+        << m.method_b.decay_updates << ","
+        << m.method_a.kmin_updates << ","
+        << m.method_b.kmin_updates << ","
+        << m.method_a.kbest_advances << ","
+        << m.method_b.kbest_advances << ","
+        << m.method_a.moe_updates << ","
+        << m.method_b.moe_updates << ","
+        << m.method_a.moe_blends << ","
+        << m.method_b.moe_blends << ","
+        << m.method_a.moe_conf_mean << ","
+        << m.method_b.moe_conf_mean << ","
+        << m.method_a.ddac_skew_updates << ","
+        << m.method_b.ddac_skew_updates << ","
+        << m.method_a.ddac_age_comp << ","
+        << m.method_b.ddac_age_comp << ","
+        << m.method_a.ddac_clamp_hits << ","
+        << m.method_b.ddac_clamp_hits << ","
+        << m.method_a.ddac_step_resets << ","
+        << m.method_b.ddac_step_resets << ","
+        << m.method_a.ddac_step_in_hits << ","
+        << m.method_b.ddac_step_in_hits << ","
+        << m.method_a.ddac_step_out_hits << ","
+        << m.method_b.ddac_step_out_hits << ","
+        << m.method_a.ddac_step_xor_hits << ","
+        << m.method_b.ddac_step_xor_hits << ","
+        << m.method_a.ddac_step_streak_max << ","
+        << m.method_b.ddac_step_streak_max << ","
+        << m.method_a.ddac_gap_in_mean_us << ","
+        << m.method_a.ddac_gap_in_p95_us << ","
+        << m.method_a.ddac_gap_out_mean_us << ","
+        << m.method_a.ddac_gap_out_p95_us << ","
+        << m.method_b.ddac_gap_in_mean_us << ","
+        << m.method_b.ddac_gap_in_p95_us << ","
+        << m.method_b.ddac_gap_out_mean_us << ","
+        << m.method_b.ddac_gap_out_p95_us << ","
+        << m.method_a.age_comp_updates << ","
+        << m.method_b.age_comp_updates << ","
+        << m.method_a.tilted_updates << ","
+        << m.method_b.tilted_updates << "\n";
 }
 
 //------------------------------------------------------------------------------
@@ -2244,16 +20270,31 @@ static void WriteCsvRow(std::ofstream& out, const ScenarioConfig& scenario, cons
 struct CliOptions
 {
     string out_csv = "peer_bench.csv";
-    unsigned seeds = 5;
+    unsigned seeds = 100;
     bool grid = false;
     bool train_only = false;
     bool holdout_only = false;
+    bool include_disabled = false;
+    bool skew_only = false;
     unsigned threads = 0;
     string scenario_filter;
     string method_filter;
+    string scenario_exact;
+    string method_exact;
     double duration_override_s = 0.0;
     double poll_rate_hz = 0.0;
     bool poll_rate_hz_set = false;
+    double probe_rate_hz = 0.0;
+    bool probe_rate_hz_set = false;
+    bool drift_overlay = true;
+    double drift_overlay_min_ppm = 25.0;
+    double drift_overlay_max_ppm = 400.0;
+    enum class DriftOverlayPrior { Uniform, LogUniform, Mixture } drift_overlay_prior
+        = DriftOverlayPrior::Mixture;
+    bool unit_tests = false;
+    bool trace = false;
+    string trace_dir;
+    uint64_t trace_interval_us = 1000000;
 };
 
 static CliOptions ParseArgs(int argc, char** argv)
@@ -2275,6 +20316,12 @@ static CliOptions ParseArgs(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--holdout")) {
             opt.holdout_only = true;
         }
+        else if (!std::strcmp(argv[i], "--include-disabled")) {
+            opt.include_disabled = true;
+        }
+        else if (!std::strcmp(argv[i], "--skew")) {
+            opt.skew_only = true;
+        }
         else if (!std::strcmp(argv[i], "--threads") && i + 1 < argc) {
             opt.threads = (unsigned)std::atoi(argv[++i]);
         }
@@ -2284,6 +20331,12 @@ static CliOptions ParseArgs(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--method") && i + 1 < argc) {
             opt.method_filter = argv[++i];
         }
+        else if (!std::strcmp(argv[i], "--scenario-exact") && i + 1 < argc) {
+            opt.scenario_exact = argv[++i];
+        }
+        else if (!std::strcmp(argv[i], "--method-exact") && i + 1 < argc) {
+            opt.method_exact = argv[++i];
+        }
         else if (!std::strcmp(argv[i], "--duration") && i + 1 < argc) {
             opt.duration_override_s = std::atof(argv[++i]);
         }
@@ -2291,15 +20344,124 @@ static CliOptions ParseArgs(int argc, char** argv)
             opt.poll_rate_hz = std::atof(argv[++i]);
             opt.poll_rate_hz_set = true;
         }
+        else if (!std::strcmp(argv[i], "--probe-rate-hz") && i + 1 < argc) {
+            opt.probe_rate_hz = std::atof(argv[++i]);
+            opt.probe_rate_hz_set = true;
+        }
+        else if (!std::strcmp(argv[i], "--drift-overlay-ppm") && i + 2 < argc) {
+            opt.drift_overlay = true;
+            opt.drift_overlay_min_ppm = std::atof(argv[++i]);
+            opt.drift_overlay_max_ppm = std::atof(argv[++i]);
+        }
+        else if (!std::strcmp(argv[i], "--drift-overlay-prior") && i + 1 < argc) {
+            const char* prior = argv[++i];
+            if (!std::strcmp(prior, "uniform")) {
+                opt.drift_overlay_prior = CliOptions::DriftOverlayPrior::Uniform;
+            }
+            else if (!std::strcmp(prior, "log")) {
+                opt.drift_overlay_prior = CliOptions::DriftOverlayPrior::LogUniform;
+            }
+            else if (!std::strcmp(prior, "mixture")) {
+                opt.drift_overlay_prior = CliOptions::DriftOverlayPrior::Mixture;
+            }
+        }
+        else if (!std::strcmp(argv[i], "--no-drift-overlay")) {
+            opt.drift_overlay = false;
+        }
+        else if (!std::strcmp(argv[i], "--trace")) {
+            opt.trace = true;
+            if (opt.trace_dir.empty()) {
+                opt.trace_dir = "traces";
+            }
+        }
+        else if (!std::strcmp(argv[i], "--trace-dir") && i + 1 < argc) {
+            opt.trace = true;
+            opt.trace_dir = argv[++i];
+        }
+        else if (!std::strcmp(argv[i], "--trace-interval-us") && i + 1 < argc) {
+            opt.trace_interval_us = (uint64_t)std::strtoull(argv[++i], nullptr, 10);
+        }
+        else if (!std::strcmp(argv[i], "--unit-tests")) {
+            opt.unit_tests = true;
+        }
     }
     if (opt.poll_rate_hz_set && opt.poll_rate_hz < 0.0) {
         opt.poll_rate_hz = 0.0;
+    }
+    if (opt.probe_rate_hz_set && opt.probe_rate_hz < 0.0) {
+        opt.probe_rate_hz = 0.0;
     }
     return opt;
 }
 
 //------------------------------------------------------------------------------
 // Runner
+
+static double RandLogUniform(PCGRandom& rng, double low, double high)
+{
+    if (low > high) {
+        std::swap(low, high);
+    }
+    if (high <= 0.0) {
+        return 0.0;
+    }
+    const double clamp_low = (low <= 0.0) ? 1e-6 : low;
+    if (clamp_low == high) {
+        return high;
+    }
+    const double log_low = std::log(clamp_low);
+    const double log_high = std::log(high);
+    const double u = RandRangeDouble(rng, log_low, log_high);
+    return std::exp(u);
+}
+
+static double SampleDriftOverlay(
+    PCGRandom& rng,
+    CliOptions::DriftOverlayPrior prior,
+    double low,
+    double high)
+{
+    if (low > high) {
+        std::swap(low, high);
+    }
+    if (high <= 0.0) {
+        return 0.0;
+    }
+    if (low < 0.0) {
+        low = 0.0;
+    }
+    if (prior == CliOptions::DriftOverlayPrior::Uniform) {
+        return RandRangeDouble(rng, low, high);
+    }
+    if (prior == CliOptions::DriftOverlayPrior::LogUniform) {
+        return RandLogUniform(rng, low, high);
+    }
+    const double clamp_low = (low <= 0.0) ? 1e-6 : low;
+    const double mid = std::sqrt(clamp_low * high);
+    const double pick = rng.NextDouble01();
+    if (pick < 0.75) {
+        return RandLogUniform(rng, clamp_low, mid);
+    }
+    return RandLogUniform(rng, mid, high);
+}
+
+static void ApplyRandomDriftOverlay(
+    ScenarioConfig& scenario,
+    uint64_t seed,
+    double min_ppm,
+    double max_ppm,
+    CliOptions::DriftOverlayPrior prior)
+{
+    PCGRandom rng;
+    rng.Seed(seed ^ Hash64(scenario.name), 0xD1F7A5EDULL);
+    const double ppm = SampleDriftOverlay(rng, prior, min_ppm, max_ppm);
+    if (ppm <= 0.0) {
+        return;
+    }
+    const double sign = (rng.NextDouble01() < 0.5) ? -1.0 : 1.0;
+    scenario.drift_ppm_a += sign * ppm;
+    scenario.drift_ppm_b -= sign * ppm;
+}
 
 static std::vector<RunItem> BuildRunItems(const CliOptions& opt)
 {
@@ -2308,8 +20470,27 @@ static std::vector<RunItem> BuildRunItems(const CliOptions& opt)
 
     std::vector<RunItem> items;
 
+    if (opt.probe_rate_hz_set) {
+        for (size_t i = 0; i < methods.size(); ++i) {
+            methods[i].probe_rate_hz = opt.probe_rate_hz;
+        }
+    }
+
     for (size_t i = 0; i < scenarios.size(); ++i) {
-        if (!opt.scenario_filter.empty() && scenarios[i].name.find(opt.scenario_filter) == string::npos) {
+        if (!opt.include_disabled && !scenarios[i].core) {
+            continue;
+        }
+        if (opt.skew_only && !IsSkewScenario(scenarios[i])) {
+            continue;
+        }
+        if (opt.skew_only && IsStressScenario(scenarios[i])) {
+            continue;
+        }
+        if (!opt.scenario_exact.empty() && scenarios[i].name != opt.scenario_exact) {
+            continue;
+        }
+        if (opt.scenario_exact.empty() && !opt.scenario_filter.empty()
+            && scenarios[i].name.find(opt.scenario_filter) == string::npos) {
             continue;
         }
         if (opt.train_only && !scenarios[i].train) {
@@ -2325,8 +20506,12 @@ static std::vector<RunItem> BuildRunItems(const CliOptions& opt)
             scenarios[i].poll_rate_hz = opt.poll_rate_hz;
         }
         for (size_t m = 0; m < methods.size(); ++m) {
-            const string method_name = MethodName(methods[m].kind);
-            if (!opt.method_filter.empty() && method_name.find(opt.method_filter) == string::npos) {
+            const string method_name = MethodLabel(methods[m]);
+            if (!opt.method_exact.empty() && method_name != opt.method_exact) {
+                continue;
+            }
+            if (opt.method_exact.empty() && !opt.method_filter.empty()
+                && method_name.find(opt.method_filter) == string::npos) {
                 continue;
             }
             for (unsigned s = 0; s < opt.seeds; ++s) {
@@ -2334,6 +20519,14 @@ static std::vector<RunItem> BuildRunItems(const CliOptions& opt)
                 item.scenario = scenarios[i];
                 item.method = methods[m];
                 item.seed = (uint64_t)s;
+                if (opt.drift_overlay) {
+                    ApplyRandomDriftOverlay(
+                        item.scenario,
+                        item.seed,
+                        opt.drift_overlay_min_ppm,
+                        opt.drift_overlay_max_ppm,
+                        opt.drift_overlay_prior);
+                }
                 items.push_back(item);
             }
         }
@@ -2350,9 +20543,756 @@ static std::vector<RunItem> BuildRunItems(const CliOptions& opt)
     return items;
 }
 
+static bool FindMethod(const std::vector<MethodConfig>& methods, MethodKind kind, const char* variant, MethodConfig& out)
+{
+    for (const auto& m : methods) {
+        if (m.kind != kind) {
+            continue;
+        }
+        if (variant) {
+            if (m.variant_name == variant) {
+                out = m;
+                return true;
+            }
+        } else if (m.variant_name.empty()) {
+            out = m;
+            return true;
+        }
+    }
+    // fallback: first matching kind
+    for (const auto& m : methods) {
+        if (m.kind == kind) {
+            out = m;
+            return true;
+        }
+    }
+    return false;
+}
+
+static ScenarioConfig MakeScenario(const char* name, uint64_t duration_us)
+{
+    ScenarioConfig cfg = BaseScenario(name);
+    cfg.duration_us = duration_us;
+    cfg.send_rate_hz = 60.0;
+    cfg.poll_rate_hz = 10.0;
+    return cfg;
+}
+
+static bool RequireCounter(const char* label, uint64_t value)
+{
+    if (value == 0) {
+        std::cerr << "Unit test failed: " << label << " == 0\n";
+        return false;
+    }
+    return true;
+}
+
+static int RunUnitTests()
+{
+    const uint64_t kSecond = 1000000ULL;
+    const uint64_t kShort = 12 * kSecond;
+    const uint64_t kMedium = 20 * kSecond;
+
+    std::vector<MethodConfig> methods = BuildMethodVariants(false);
+
+    auto run = [&](const ScenarioConfig& scenario, const MethodConfig& method) -> BenchmarkMetrics {
+        return RunScenario(scenario, method, 0xC0FFEEULL);
+    };
+
+    bool ok = true;
+
+    // Scenario availability (clock jumps + new video cases)
+    {
+        std::vector<ScenarioConfig> scenarios = BuildScenarios();
+        auto has = [&](const char* name) -> bool {
+            for (const auto& sc : scenarios) {
+                if (sc.name == name) {
+                    return true;
+                }
+            }
+            std::cerr << "Unit test failed: missing scenario " << name << "\n";
+            return false;
+        };
+        ok &= has("E63_clock_step_1s_a_fwd");
+        ok &= has("E64_clock_step_1s_a_back");
+        ok &= has("E65_clock_step_1s_b_fwd");
+        ok &= has("E66_clock_step_1s_b_back");
+        ok &= has("E67_clock_step_120s_a_fwd");
+        ok &= has("E68_clock_step_120s_a_back");
+        ok &= has("E69_clock_step_120s_b_fwd");
+        ok &= has("E70_clock_step_120s_b_back");
+        ok &= has("E71_video_latency_ramp");
+        ok &= has("E72_video_congestion_ramp");
+        ok &= has("E73_video_jitter_burst");
+        ok &= has("E74_video_path_bloat");
+        ok &= has("E75_video_asym_path_bloat");
+        ok &= has("E76_video_queue_sawtooth");
+        ok &= has("E77_video_asym_loss_burst");
+        ok &= has("E78_video_path_flap_jitter");
+        ok &= has("E79_clock_step_mc_huge");
+        ok &= has("E80_ts24_poison");
+        ok &= has("E80_video_congestion_pulses");
+        ok &= has("E81_clock_skew_random_walk_mc");
+        ok &= has("E82_video_rtt_random_walk_cellular");
+        ok &= has("E83_video_asym_bw_drop");
+        ok &= has("E84_video_multipath_reorder_burst");
+        ok &= has("E140_reorder_dup_storm");
+        ok &= has("E85_drift_rw_signflip");
+        ok &= has("E7_drift_25ppm");
+        ok &= has("E7_drift_100ppm");
+        ok &= has("E7_drift_200ppm");
+        ok &= has("E7_drift_300ppm");
+        ok &= has("E7_drift_400ppm");
+        ok &= has("E86_clock_step_300s_a_fwd");
+        ok &= has("E87_clock_step_300s_b_back");
+        ok &= has("E88_video_wifi_bursty");
+        ok &= has("E89_video_satlink_jitter");
+        ok &= has("E90_sparse_traffic");
+        ok &= has("E91_clock_freeze_resume");
+        ok &= has("E92_clock_slew");
+        ok &= has("E93_asym_timestamp_noise");
+        ok &= has("E94_drift_sym_pathchange");
+        ok &= has("E94_video_link_realistic");
+        ok &= has("E95_clock_jump_small_b_fwd");
+        ok &= has("E96_clock_jump_small_b_back");
+        ok &= has("E97_clock_jump_large_a_fwd");
+        ok &= has("E98_clock_jump_large_a_back");
+        ok &= has("E136_clock_jump_matrix_pp");
+        ok &= has("E137_clock_jump_matrix_pn");
+        ok &= has("E138_clock_jump_matrix_np");
+        ok &= has("E139_clock_jump_matrix_nn");
+        ok &= has("E99_video_diurnal_rtt_pulses");
+        ok &= has("E100_video_heavytail_reorder");
+        ok &= has("E101_ts_quant_asym_noise");
+        ok &= has("E102_clock_skew_random_walk");
+        ok &= has("E103_asym_path_switch");
+        ok &= has("E104_bursty_uplink_steady_downlink");
+        ok &= has("E105_intermittent_probe_rate");
+        ok &= has("E106_bidirectional_queue_coupling");
+        ok &= has("E107_temp_skew_sine");
+        ok &= has("E108_mobile_handover");
+        ok &= has("E109_asym_baseline_periodic_drops");
+        ok &= has("E110_jitter_square_wave");
+        ok &= has("E111_periodic_outage");
+        ok &= has("E127_asym_periodic_outage");
+        ok &= has("E112_oneway_priority_inversion");
+        ok &= has("E113_correlated_loss_jitter");
+        ok &= has("E114_skew_sign_flip");
+        ok &= has("E115_bursty_jitter_diurnal_skew");
+        ok &= has("E116_satellite_burst_loss_long_rtt");
+        ok &= has("E134_satellite_doppler_skew");
+        ok &= has("E117_upstream_congestion_waves");
+        ok &= has("E131_congestion_wave_corr");
+        ok &= has("E118_cross_traffic_asym_jitter");
+        ok &= has("E132_uplink_saturation_ack_compress");
+        ok &= has("E119_drift_rw_long");
+        ok &= has("E133_temp_drift_sine_step");
+        ok &= has("E120_route_rebind");
+        ok &= has("E135_nat_rebind_outage_flip");
+        ok &= has("E121_cpu_jitter_burst");
+        ok &= has("E129_asym_scheduler_noise_burst");
+        ok &= has("E122_skew_reset_zero");
+        ok &= has("E123_wifi_roam_asym_burst");
+        ok &= has("E124_cellular_rlc_bimodal");
+        ok &= has("E125_bufferbloat_ramp_drop");
+        ok &= has("E126_video_heavy_tail_mix");
+        ok &= has("E128_ts24_wrap_stress");
+        ok &= has("E130_heavytail_step_reorder");
+    }
+
+    // Video latency bounds (20–120 ms base delay)
+    {
+        std::vector<ScenarioConfig> scenarios = BuildScenarios();
+        const uint64_t min_delay = 20000;
+        const uint64_t max_delay = 120000;
+        for (const auto& sc : scenarios) {
+            if (sc.name.find("video") == string::npos) {
+                continue;
+            }
+            if (sc.delay_ab.base_delay_us < min_delay || sc.delay_ab.base_delay_us > max_delay) {
+                std::cerr << "Unit test failed: video delay_ab out of bounds in " << sc.name << "\n";
+                ok = false;
+            }
+            if (sc.delay_ba.base_delay_us < min_delay || sc.delay_ba.base_delay_us > max_delay) {
+                std::cerr << "Unit test failed: video delay_ba out of bounds in " << sc.name << "\n";
+                ok = false;
+            }
+        }
+    }
+
+    // Fairness defaults: 1s min-delta exchange / 1 Hz probes
+    {
+        std::vector<MethodConfig> methods_check = BuildMethodVariants(false);
+        for (const auto& m : methods_check) {
+            if (UsesMinDeltaExchange(m.kind) && m.mindelta_interval_us != 1000000ULL) {
+                std::cerr << "Unit test failed: mindelta_interval_us != 1s for " << MethodName(m.kind) << "\n";
+                ok = false;
+            }
+            if (UsesProbes(m.kind) && std::fabs(m.probe_rate_hz - 1.0) > 1e-6) {
+                std::cerr << "Unit test failed: probe_rate_hz != 1Hz for " << MethodName(m.kind) << "\n";
+                ok = false;
+            }
+        }
+    }
+
+    // Low-rate probe skew calibration variant
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncSkewCorrected, "probe_skew_0p2hz", m);
+        if (!m.enable_probes || !m.probe_skew_only) {
+            std::cerr << "Unit test failed: probe skew flags not enabled\n";
+            ok = false;
+        }
+        if (std::fabs(m.probe_rate_hz - 0.2) > 1e-6) {
+            std::cerr << "Unit test failed: probe skew rate != 0.2 Hz\n";
+            ok = false;
+        }
+        if (m.window_us < 10000000ULL) {
+            std::cerr << "Unit test failed: probe skew window too short\n";
+            ok = false;
+        }
+    }
+
+    // GSP promotion under drift
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncShadow, nullptr, m);
+        m.gsp_use_rtt_guard = false;
+        m.promo_max_ppm = 0.0;
+        ScenarioConfig sc = MakeScenario("UT-PB-GSP", kMedium);
+        sc.drift_ppm_a = 100;
+        sc.drift_ppm_b = -100;
+        sc.drift_step_enabled = true;
+        sc.drift_step_time_us = 8 * kSecond;
+        sc.drift_step_delta_ppm_a = 200;
+        sc.drift_step_delta_ppm_b = -200;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("gsp_promotions", bm.method_a.gsp_promotions + bm.method_b.gsp_promotions);
+    }
+
+    // Adaptive bins window change under drift
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncAdaptiveBins, "fast2", m);
+        m.promo_max_ppm = 0.0;
+        ScenarioConfig sc = MakeScenario("UT-PB-ADAPTIVE-BINS", kMedium);
+        sc.drift_ppm_a = 120;
+        sc.drift_ppm_b = -120;
+        sc.drift_step_enabled = true;
+        sc.drift_step_time_us = 8 * kSecond;
+        sc.drift_step_delta_ppm_a = 200;
+        sc.drift_step_delta_ppm_b = -200;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("adaptive_bins_changes",
+            bm.method_a.adaptive_bins_changes + bm.method_b.adaptive_bins_changes);
+    }
+
+    // NFHS promotion under drift
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncNFHS, nullptr, m);
+        m.nfhs_age_us = 2000000;
+        m.nfhs_miss_us = 1000000;
+        m.nfhs_n_consec = 1;
+        m.nfhs_npkt_min = 1;
+        m.nfhs_iqr_min_us = 1000000.0;
+        m.nfhs_use_rtt_guard = false;
+        m.promo_max_ppm = 0.0;
+        ScenarioConfig sc = MakeScenario("UT-PB-NFHS", kMedium);
+        sc.drift_ppm_a = 120;
+        sc.drift_ppm_b = -120;
+        sc.drift_step_enabled = true;
+        sc.drift_step_time_us = 8 * kSecond;
+        sc.drift_step_delta_ppm_a = 200;
+        sc.drift_step_delta_ppm_b = -200;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("nfhs_promotions", bm.method_a.nfhs_promotions + bm.method_b.nfhs_promotions);
+    }
+
+    // Step guard reset on clock step
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncStepGuard, nullptr, m);
+        m.step_threshold_us = 100.0;
+        m.step_n_consec = 1;
+        m.step_npkt_min = 1;
+        m.step_iqr_min_us = 1000000.0;
+        m.step_use_rtt_guard = false;
+        ScenarioConfig sc = MakeScenario("UT-PB-STEP", kMedium);
+        sc.clock_step_enabled = true;
+        sc.clock_step_time_us = 6 * kSecond;
+        sc.clock_step_a_us = 2000000;
+        sc.clock_step_b_us = -2000000;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("step_resets_stepguard", bm.method_a.step_resets + bm.method_b.step_resets);
+    }
+
+    // Step guard bin-reset variant
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncStepGuard, "binreset", m);
+        m.step_threshold_us = 100.0;
+        m.step_n_consec = 1;
+        m.step_npkt_min = 1;
+        m.step_iqr_min_us = 1000000.0;
+        m.step_use_rtt_guard = false;
+        m.step_use_near_ratio = true;
+        m.step_near_ratio_max = 1.0;
+        ScenarioConfig sc = MakeScenario("UT-PB-STEP-BINRESET", kMedium);
+        sc.clock_step_enabled = true;
+        sc.clock_step_time_us = 6 * kSecond;
+        sc.clock_step_a_us = 2000000;
+        sc.clock_step_b_us = 0;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("step_resets_binreset", bm.method_a.step_resets + bm.method_b.step_resets);
+    }
+
+    // Step guard recovery on clock jump (A forward)
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncStepGuard, nullptr, m);
+        m.step_threshold_us = 100.0;
+        m.step_n_consec = 1;
+        m.step_npkt_min = 1;
+        m.step_iqr_min_us = 1000000.0;
+        m.step_use_rtt_guard = false;
+        m.step_use_near_ratio = true;
+        m.step_near_ratio_max = 1.0;
+        ScenarioConfig sc = MakeScenario("UT-PB-CLOCK-JUMP-A", kMedium);
+        sc.delay_ab.jitter_us = 0;
+        sc.delay_ba.jitter_us = 0;
+        sc.clock_step_enabled = true;
+        sc.clock_step_time_us = 6 * kSecond;
+        sc.clock_step_a_us = 2000000;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("clock_jump_a_step_resets", bm.method_a.step_resets + bm.method_b.step_resets);
+        ok &= RequireCounter("clock_jump_a_recovered",
+            (uint64_t)bm.ab.step_recovered + (uint64_t)bm.ba.step_recovered);
+    }
+
+    // Step guard recovery on clock jump (B backward, large)
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncStepGuard, nullptr, m);
+        m.step_threshold_us = 100.0;
+        m.step_n_consec = 1;
+        m.step_npkt_min = 1;
+        m.step_iqr_min_us = 1000000.0;
+        m.step_use_rtt_guard = false;
+        m.step_use_near_ratio = true;
+        m.step_near_ratio_max = 1.0;
+        ScenarioConfig sc = MakeScenario("UT-PB-CLOCK-JUMP-B", kMedium);
+        sc.delay_ab.jitter_us = 0;
+        sc.delay_ba.jitter_us = 0;
+        sc.clock_step_enabled = true;
+        sc.clock_step_time_us = 6 * kSecond;
+        sc.clock_step_b_us = -120000000;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("clock_jump_b_step_resets", bm.method_a.step_resets + bm.method_b.step_resets);
+    }
+
+    // Step guard probe-only path (no short stats)
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncStepGuard, nullptr, m);
+        m.enable_probes = true;
+        m.probe_rate_hz = 1.0;
+        m.step_use_probe_offset = true;
+        m.step_probe_only = true;
+        m.step_probe_relax = true;
+        m.step_probe_relax_nonear = true;
+        m.step_threshold_us = 100.0;
+        m.step_n_consec = 1;
+        m.step_npkt_min = 0;
+        m.step_iqr_min_us = 1000000.0;
+        m.step_use_rtt_guard = false;
+        m.stats_short_window_us = 0;
+        ScenarioConfig sc = MakeScenario("UT-PB-STEP-PROBE", kMedium);
+        sc.clock_step_enabled = true;
+        sc.clock_step_time_us = 6 * kSecond;
+        sc.clock_step_a_us = 2000000;
+        sc.clock_step_b_us = -2000000;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("step_resets_probe", bm.method_a.step_resets + bm.method_b.step_resets);
+    }
+
+    // Step guard probe-hard path
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncStepGuard, nullptr, m);
+        m.enable_probes = true;
+        m.probe_rate_hz = 1.0;
+        m.step_use_probe_offset = true;
+        m.step_probe_only = true;
+        m.step_probe_hard = true;
+        m.step_probe_relax = true;
+        m.step_probe_relax_nonear = true;
+        m.step_threshold_us = 100.0;
+        m.step_n_consec = 1;
+        m.step_npkt_min = 0;
+        m.step_iqr_min_us = 1000000.0;
+        m.step_use_rtt_guard = false;
+        m.stats_short_window_us = 0;
+        ScenarioConfig sc = MakeScenario("UT-PB-STEP-PROBE-HARD", kMedium);
+        sc.clock_step_enabled = true;
+        sc.clock_step_time_us = 6 * kSecond;
+        sc.clock_step_a_us = 2000000;
+        sc.clock_step_b_us = -2000000;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("step_resets_probe_hard", bm.method_a.step_resets + bm.method_b.step_resets);
+    }
+
+    // TS24 plausibility filter drops corrupted timestamps
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSync, nullptr, m);
+        m.ts24_plausibility = true;
+        m.ts24_neg_eps_us = 0.0;
+        m.ts24_delta_max_us = 2000000.0;
+        m.ts24_min_phys_us = 0.0;
+        ScenarioConfig sc = MakeScenario("E80_ts24_poison", kMedium);
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("ts24_drops", bm.ab.ts24_drops + bm.ba.ts24_drops);
+    }
+
+    // Consensus slope update
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncConsensus, nullptr, m);
+        m.consensus_min_samples = 3;
+        m.consensus_candidate_frac = 1.0;
+        m.consensus_candidate_floor_us = 0.0;
+        m.consensus_use_rtt_guard = false;
+        ScenarioConfig sc = MakeScenario("UT-PB-CONSENSUS", kMedium);
+        sc.drift_ppm_a = 200;
+        sc.drift_ppm_b = -200;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("consensus_updates", bm.method_a.consensus_updates + bm.method_b.consensus_updates);
+    }
+
+    // CSE + tilted updates
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncTilted, nullptr, m);
+        m.cse_min_samples = 3;
+        m.cse_iqr_min_us = 1000000.0;
+        m.cse_net_slope_max = 1e9;
+        m.cse_use_rtt_guard = false;
+        ScenarioConfig sc = MakeScenario("UT-PB-TILTED", kMedium);
+        sc.drift_ppm_a = 1000;
+        sc.drift_ppm_b = -1000;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("cse_updates", bm.method_a.cse_updates + bm.method_b.cse_updates);
+        ok &= RequireCounter("tilted_updates", bm.method_a.tilted_updates + bm.method_b.tilted_updates);
+    }
+
+    // Tilted step-guard resets
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncTilted, "step", m);
+        m.step_threshold_us = 100.0;
+        m.step_n_consec = 1;
+        m.step_npkt_min = 1;
+        m.step_iqr_min_us = 1000000.0;
+        m.step_use_rtt_guard = false;
+        ScenarioConfig sc = MakeScenario("UT-PB-TILTED-STEP", kMedium);
+        sc.clock_step_enabled = true;
+        sc.clock_step_time_us = 6 * kSecond;
+        sc.clock_step_a_us = 2000000;
+        sc.clock_step_b_us = -2000000;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("step_resets_tilted", bm.method_a.step_resets + bm.method_b.step_resets);
+    }
+
+    // Tilted shadow promotion
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncTilted, "shadow_rtt", m);
+        m.gsp_guard_min_us = 0.0;
+        m.gsp_guard_k = 0.0;
+        m.gsp_iqr_min_us = 1000000.0;
+        m.gsp_iqr_k = 0.0;
+        m.gsp_gnear_min_us = 0.0;
+        m.gsp_gnear_k = 0.0;
+        m.gsp_npkt_min = 1;
+        m.gsp_n_consec = 1;
+        m.gsp_age_ok_us = 0;
+        m.gsp_use_rtt_guard = false;
+        m.promo_max_ppm = 0.0;
+        ScenarioConfig sc = MakeScenario("UT-PB-TILTED-SHADOW", kMedium);
+        sc.drift_ppm_a = 120;
+        sc.drift_ppm_b = -120;
+        sc.drift_step_enabled = true;
+        sc.drift_step_time_us = 8 * kSecond;
+        sc.drift_step_delta_ppm_a = 200;
+        sc.drift_step_delta_ppm_b = -200;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("gsp_promotions", bm.method_a.gsp_promotions + bm.method_b.gsp_promotions);
+    }
+
+    // Age-comp updates
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncAgeComp, nullptr, m);
+        m.cse_min_samples = 3;
+        m.cse_iqr_min_us = 1000000.0;
+        m.cse_net_slope_max = 1e9;
+        m.cse_use_rtt_guard = false;
+        ScenarioConfig sc = MakeScenario("UT-PB-AGECOMP", kMedium);
+        sc.send_rate_hz = 10.0;
+        sc.delay_ab.jitter_us = 0;
+        sc.delay_ba.jitter_us = 0;
+        sc.delay_ab.ramp_us_per_s = 1000;
+        sc.delay_ba.ramp_us_per_s = -1000;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("age_comp_updates", bm.method_a.age_comp_updates + bm.method_b.age_comp_updates);
+    }
+
+    // Age-comp step-guard resets
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncAgeComp, "step", m);
+        m.step_threshold_us = 100.0;
+        m.step_n_consec = 1;
+        m.step_npkt_min = 1;
+        m.step_iqr_min_us = 1000000.0;
+        m.step_use_rtt_guard = false;
+        ScenarioConfig sc = MakeScenario("UT-PB-AGECOMP-STEP", kMedium);
+        sc.clock_step_enabled = true;
+        sc.clock_step_time_us = 6 * kSecond;
+        sc.clock_step_a_us = 2000000;
+        sc.clock_step_b_us = -2000000;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("step_resets_agecomp", bm.method_a.step_resets + bm.method_b.step_resets);
+    }
+
+    // Age-comp clamp path
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncAgeComp, nullptr, m);
+        m.age_comp_clamp_margin_us = 50.0;
+        m.age_comp_clamp_k = 0.5;
+        ScenarioConfig sc = MakeScenario("UT-PB-AGECOMP-CLAMP", kMedium);
+        sc.drift_ppm_a = 200;
+        sc.drift_ppm_b = -200;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("age_comp_updates", bm.method_a.age_comp_updates + bm.method_b.age_comp_updates);
+    }
+
+    // MinReg updates
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncMinReg, nullptr, m);
+        ScenarioConfig sc = MakeScenario("UT-PB-MINREG", kShort);
+        sc.drift_ppm_a = 80;
+        sc.drift_ppm_b = -80;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("minreg_updates", bm.method_a.minreg_updates + bm.method_b.minreg_updates);
+    }
+
+    // Multi-window updates
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncMultiWindow, nullptr, m);
+        ScenarioConfig sc = MakeScenario("UT-PB-MULTIWIN", kShort);
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("multiwin_updates", bm.method_a.multiwin_updates + bm.method_b.multiwin_updates);
+    }
+
+    // Envelope decay updates
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncEnvelopeDecay, nullptr, m);
+        ScenarioConfig sc = MakeScenario("UT-PB-DECAY", kShort);
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("decay_updates", bm.method_a.decay_updates + bm.method_b.decay_updates);
+    }
+
+    // Policy switcher updates
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncPolicy, nullptr, m);
+        ScenarioConfig sc = MakeScenario("UT-PB-POLICY", kShort);
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("policy_multiwin", bm.method_a.multiwin_updates + bm.method_b.multiwin_updates);
+        ok &= RequireCounter("policy_decay", bm.method_a.decay_updates + bm.method_b.decay_updates);
+    }
+
+    // Envelope decay near-hit variant
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncEnvelopeDecay, "near_ratio", m);
+        if (!m.decay_use_near_ratio) {
+            std::cerr << "Unit test failed: decay near_ratio flag not enabled\n";
+            ok = false;
+        }
+    }
+
+    // Dual-slope skew updates
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncDualSlope, nullptr, m);
+        m.cse_min_samples = 2;
+        m.cse_iqr_min_us = 1000000.0;
+        m.cse_net_slope_max = 1000000.0;
+        m.cse_use_rtt_guard = false;
+        ScenarioConfig sc = MakeScenario("UT-PB-DUALSLOPE", kMedium);
+        sc.drift_ppm_a = 120;
+        sc.drift_ppm_b = -120;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("dual_slope_updates", bm.method_a.cse_updates + bm.method_b.cse_updates);
+    }
+
+    // KMin updates
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncKMin, nullptr, m);
+        ScenarioConfig sc = MakeScenario("UT-PB-KMIN", kShort);
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("kmin_updates", bm.method_a.kmin_updates + bm.method_b.kmin_updates);
+    }
+
+    // KBest advances under path change
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncKBest, nullptr, m);
+        m.kbest_n_consec = 1;
+        m.kbest_npkt_min = 1;
+        m.kbest_guard_min_us = 0.0;
+        m.kbest_guard_k = 0.0;
+        m.kbest_iqr_min_us = 1000000.0;
+        m.kbest_gnear_min_us = 0.0;
+        m.kbest_gnear_k = 0.0;
+        m.kbest_use_rtt_guard = false;
+        ScenarioConfig sc = MakeScenario("UT-PB-KBEST", kMedium);
+        sc.delay_ab.step_at_us = 6 * kSecond;
+        sc.delay_ba.step_at_us = 6 * kSecond;
+        sc.delay_ab.step_delta_us = 40000;
+        sc.delay_ba.step_delta_us = 40000;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("kbest_advances", bm.method_a.kbest_advances + bm.method_b.kbest_advances);
+    }
+
+    // MoE tracker updates and blends
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncMoE, nullptr, m);
+        m.moe_use_rtt_guard = false;
+        m.moe_npkt_min = 1;
+        m.moe_iqr_min_us = 1000000.0;
+        ScenarioConfig sc = MakeScenario("UT-PB-MOE", kMedium);
+        sc.drift_ppm_a = 100;
+        sc.drift_ppm_b = -100;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("moe_updates", bm.method_a.moe_updates + bm.method_b.moe_updates);
+        ok &= RequireCounter("moe_blends", bm.method_a.moe_blends + bm.method_b.moe_blends);
+    }
+
+    // MoE near-floor gating variant
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncMoE, "near0p1", m);
+        m.moe_use_rtt_guard = false;
+        m.moe_npkt_min = 1;
+        m.moe_iqr_min_us = 1000000.0;
+        m.stats_gnear_us = 1000.0;
+        m.moe_near_ratio_min = 0.01;
+        ScenarioConfig sc = MakeScenario("UT-PB-MOE-NEAR", kMedium);
+        sc.drift_ppm_a = 80;
+        sc.drift_ppm_b = -80;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("moe_updates", bm.method_a.moe_updates + bm.method_b.moe_updates);
+    }
+
+    // DDAC skew/age-comp updates
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncDDAC, nullptr, m);
+        m.ddac_npkt_min = 1;
+        m.ddac_iqr_min_us = 1000000.0;
+        m.ddac_net_slope_max = 1e9;
+        m.ddac_use_rtt_guard = false;
+        m.ddac_age_gap_us = 0;
+        m.ddac_use_age_gap = false;
+        m.ddac_use_peer_age_elapsed = false;
+        m.ddac_min_ppm = 0.0;
+        ScenarioConfig sc = MakeScenario("UT-PB-DDAC", kMedium);
+        sc.drift_ppm_a = 150;
+        sc.drift_ppm_b = -150;
+        sc.drift_step_enabled = true;
+        sc.drift_step_time_us = 8 * kSecond;
+        sc.drift_step_delta_ppm_a = 100;
+        sc.drift_step_delta_ppm_b = -100;
+        BenchmarkMetrics bm = run(sc, m);
+        ok &= RequireCounter("ddac_skew_updates", bm.method_a.ddac_skew_updates + bm.method_b.ddac_skew_updates);
+        ok &= RequireCounter("ddac_age_comp", bm.method_a.ddac_age_comp + bm.method_b.ddac_age_comp);
+    }
+
+    // DDAC clamp + step reset (direct)
+    {
+        MethodConfig m;
+        ok &= FindMethod(methods, MethodKind::TimeSyncDDAC, nullptr, m);
+        m.ddac_use_rtt_guard = false;
+        m.ddac_use_age_gap = false;
+        m.ddac_age_gap_us = 0;
+        m.ddac_min_ppm = 0.0;
+        m.ddac_npkt_min = 1;
+        m.ddac_iqr_min_us = 1000000.0;
+        m.ddac_net_slope_max = 1e9;
+        m.ddac_clamp_margin_us = 1.0;
+        m.ddac_clamp_k = 0.0;
+        m.ddac_enable_step = true;
+        m.ddac_step_n_consec = 1;
+        m.ddac_step_require_stable = false;
+        m.ddac_step_gb_us = 50.0;
+
+        NodeState node;
+        node.long_min_valid = true;
+        node.long_min_us = 1000.0;
+        node.long_min_time_us = 0;
+        node.short_snapshot.valid = true;
+        node.short_snapshot.p10 = 1300.0;
+        node.short_snapshot.p0 = 1290.0;
+        node.short_snapshot.iqr = 1.0;
+        node.short_snapshot.count = 100;
+        node.ddac_peer_valid = true;
+        node.ddac_peer_min_long_us = 900.0;
+        node.ddac_peer_age_us = 1000000;
+        node.ddac_peer_p10_us = 910.0;
+        node.ddac_peer_p0_us = 905.0;
+        node.ddac_peer_iqr_us = 1.0;
+        node.ddac_peer_count = 100;
+        node.ddac_skew_valid = true;
+        node.ddac_skew_ppm = 200.0;
+
+        const uint64_t now_us = 10 * kSecond;
+        UpdateDDAC(node, now_us, m, true);
+        ok &= RequireCounter("ddac_clamp_hits", node.ddac_clamp_hits);
+        ok &= RequireCounter("ddac_step_resets", node.ddac_step_resets);
+    }
+
+    if (!ok) {
+        std::cerr << "peer_bench unit tests failed\n";
+        return 1;
+    }
+    std::cout << "peer_bench unit tests passed\n";
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     CliOptions opt = ParseArgs(argc, argv);
+
+    if (opt.unit_tests) {
+        return RunUnitTests();
+    }
+
+    if (opt.trace) {
+        g_trace.enabled = true;
+        g_trace.dir = opt.trace_dir.empty() ? "traces" : opt.trace_dir;
+        g_trace.interval_us = opt.trace_interval_us;
+        EnsureDir(g_trace.dir);
+    }
 
     std::vector<RunItem> items = BuildRunItems(opt);
     if (items.empty()) {
