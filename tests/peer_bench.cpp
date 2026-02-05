@@ -1908,7 +1908,8 @@ struct Message
     Counter24 ts24 = 0;
     Counter23 app_ts23 = 0;
     Counter24 min_delta = 0;
-    uint32_t env_delta_us = 0;
+    double env_delta_us = 0.0;
+    bool env_valid = false;
     double skew_est_ppm = 0.0;
     bool skew_valid = false;
 
@@ -8283,8 +8284,10 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
                         }
                     }
                 } else if (method.kind == MethodKind::Piggyback) {
-                    recv_node.peer_env_value = (double)ev.msg.env_delta_us;
-                    recv_node.peer_env_valid = true;
+                    if (ev.msg.env_valid) {
+                        recv_node.peer_env_value = ev.msg.env_delta_us;
+                        recv_node.peer_env_valid = true;
+                    }
                 }
             }
         }
@@ -9055,7 +9058,8 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
                     }
                 }
             } else {
-                msg.env_delta_us = (uint32_t)std::max(0.0, node_a.local_env.Value());
+                msg.env_valid = node_a.local_env.Ready();
+                msg.env_delta_us = node_a.local_env.Value();
             }
             msg.true_remote_local_at_send = ComputeLocalTimeUsec(now_us, node_b.clock, rng, false);
 
@@ -9112,7 +9116,8 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
                     }
                 }
             } else {
-                msg.env_delta_us = (uint32_t)std::max(0.0, node_b.local_env.Value());
+                msg.env_valid = node_b.local_env.Ready();
+                msg.env_delta_us = node_b.local_env.Value();
             }
             msg.true_remote_local_at_send = ComputeLocalTimeUsec(now_us, node_a.clock, rng, false);
 
@@ -9876,8 +9881,10 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
                         }
                     }
                 } else if (method.kind == MethodKind::Piggyback) {
-                    recv_node.peer_env_value = (double)ev.msg.env_delta_us;
-                    recv_node.peer_env_valid = true;
+                    if (ev.msg.env_valid) {
+                        recv_node.peer_env_value = ev.msg.env_delta_us;
+                        recv_node.peer_env_valid = true;
+                    }
                 }
             }
         }
@@ -10559,7 +10566,8 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
                     msg.skew_est_ppm = msg.skew_valid ? skew_ppm : 0.0;
                 }
             } else {
-                msg.env_delta_us = (uint32_t)std::max(0.0, node_a.local_env.Value());
+                msg.env_valid = node_a.local_env.Ready();
+                msg.env_delta_us = node_a.local_env.Value();
             }
             msg.true_remote_local_at_send = ComputeLocalTimeUsec(now_us, node_b.clock, rng, false);
 
@@ -10591,7 +10599,8 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
                     msg.skew_est_ppm = msg.skew_valid ? skew_ppm : 0.0;
                 }
             } else {
-                msg.env_delta_us = (uint32_t)std::max(0.0, node_b.local_env.Value());
+                msg.env_valid = node_b.local_env.Ready();
+                msg.env_delta_us = node_b.local_env.Value();
             }
             msg.true_remote_local_at_send = ComputeLocalTimeUsec(now_us, node_a.clock, rng, false);
 
@@ -20309,7 +20318,7 @@ struct CliOptions
     };
 
     string out_csv = "peer_bench.csv";
-    unsigned seeds = 100;
+    unsigned seeds = 200;
     bool grid = false;
     bool train_only = false;
     bool holdout_only = false;
