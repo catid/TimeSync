@@ -1493,14 +1493,18 @@ struct MethodConfig
     bool policy_quantile_block_high_iqr = false;
     bool policy_quantile_ignore_rtt_jump = false; // allow quantile even during rtt_jump (for ramp scenarios)
     double policy_irj_min_rtt_delta_us = 0.0; // minimum |rtt_delta| for irj guard override (0=any)
+    double policy_irj_rtt_delta_growth_us = 0.0; // minimum |rtt_delta| growth over current rtt_jump streak (filters flat steps)
     double policy_irj_mean_rtt_delta_us = 0.0; // minimum EWMA(|rtt_delta|) for irj guard override
     double policy_irj_mean_rtt_delta_alpha = 0.2; // EWMA alpha for policy_irj_mean_rtt_delta_us gate
     double policy_irj_guard_fail_ratio_min = 0.0; // minimum EWMA guard-fail ratio (0..1) for IRJ
     double policy_irj_guard_fail_ratio_alpha = 0.2; // EWMA alpha for guard-fail ratio
     double policy_irj_guard_quantile_blend = 1.0; // guard-fallback IRJ: blend tilted->quantile (1=full quantile)
     double policy_irj_guard_raise_cap_us = 0.0; // if >0, cap IRJ raise above tilted by this amount
+    double policy_irj_guard_raise_stale_k = 0.0; // if >0, cap IRJ raise by k * (bilateral_stale - threshold)
     int policy_irj_min_streak = 0; // minimum rtt_jump streak for irj guard override (0=any)
     double policy_irj_bilateral_stale_us = 0.0; // if >0, irj requires both nodes' p10 - tilted_min > this threshold
+    uint64_t policy_irj_bilateral_min_age_us = 0; // if >0, require both tilted minima to be at least this old
+    double policy_irj_bilateral_iqr_max_us = 0.0; // if >0, require both short-window IQRs to be <= this
     int policy_irj_stale_streak_n = 0; // if >0, bilateral staleness must hold for N consecutive 1Hz ticks
     double policy_irj_bilateral_growth_us = 0.0; // if >0, bilateral stale amount must grow by this much over the streak
     int policy_irj_bilateral_rise_n = 0; // if >0, require this many consecutive rising stale ticks
@@ -5509,9 +5513,10 @@ static int PolicySelectDesiredMode(
     const double near_ratio = (node.short_snapshot.valid && node.short_snapshot.count > 0)
         ? (double)node.short_snapshot.near_hits / (double)node.short_snapshot.count
         : 1.0;
+    const double abs_rtt_delta = std::fabs(rtt_delta);
     const bool rtt_jump = rtt_ready &&
         method.policy_rtt_step_us > 0.0 &&
-        std::fabs(rtt_delta) >= method.policy_rtt_step_us;
+        abs_rtt_delta >= method.policy_rtt_step_us;
     const bool guard_required = method.policy_require_rtt_guard;
     const bool guard_ready = guard_required ? guard_ok : true;
     const bool high_iqr = node.short_snapshot.valid &&
@@ -5526,24 +5531,23 @@ static int PolicySelectDesiredMode(
         (method.policy_skew_min_ppm <= 0.0 || std::fabs(skew_ppm) >= method.policy_skew_min_ppm);
 
     if (rtt_ready) {
-        const double abs_delta = std::fabs(rtt_delta);
         double alpha = method.policy_irj_mean_rtt_delta_alpha;
         if (alpha <= 0.0 || alpha > 1.0) {
             alpha = 0.2;
         }
         if (!node.irj_rtt_delta_ema_valid) {
             node.irj_rtt_delta_ema_valid = true;
-            node.irj_rtt_delta_ema_us = abs_delta;
+            node.irj_rtt_delta_ema_us = abs_rtt_delta;
         } else {
             node.irj_rtt_delta_ema_us =
-                alpha * abs_delta + (1.0 - alpha) * node.irj_rtt_delta_ema_us;
+                alpha * abs_rtt_delta + (1.0 - alpha) * node.irj_rtt_delta_ema_us;
         }
     }
 
     // Track sustained rtt_jump streak (ramp detector)
     if (rtt_jump) {
         if (node.rtt_jump_streak == 0) {
-            node.rtt_jump_streak_start_delta = std::fabs(rtt_delta);
+            node.rtt_jump_streak_start_delta = abs_rtt_delta;
         }
         node.rtt_jump_streak++;
     } else {
@@ -5590,8 +5594,13 @@ static int PolicySelectDesiredMode(
         (node.irj_rtt_delta_ema_valid && node.irj_rtt_delta_ema_us >= method.policy_irj_mean_rtt_delta_us);
     const bool irj_guard_fail_ratio_ok = (method.policy_irj_guard_fail_ratio_min <= 0.0) ||
         (node.irj_guard_fail_ewma_valid && node.irj_guard_fail_ewma >= method.policy_irj_guard_fail_ratio_min);
+    const bool irj_delta_growth_ok = (method.policy_irj_rtt_delta_growth_us <= 0.0) ||
+        (rtt_jump &&
+            node.rtt_jump_streak > 0 &&
+            abs_rtt_delta >= node.rtt_jump_streak_start_delta + method.policy_irj_rtt_delta_growth_us);
     const bool irj_active = method.policy_quantile_ignore_rtt_jump &&
-        (method.policy_irj_min_rtt_delta_us <= 0.0 || std::fabs(rtt_delta) >= method.policy_irj_min_rtt_delta_us) &&
+        (method.policy_irj_min_rtt_delta_us <= 0.0 || abs_rtt_delta >= method.policy_irj_min_rtt_delta_us) &&
+        irj_delta_growth_ok &&
         irj_mean_delta_ok &&
         irj_guard_fail_ratio_ok &&
         (method.policy_irj_min_streak <= 0 || node.rtt_jump_streak >= method.policy_irj_min_streak) &&
@@ -5835,7 +5844,8 @@ static void UpdatePolicyNode(
     const PolicyCandidate& cand_quant,
     const PolicyCandidate& cand_tilted,
     const PolicyCandidate& cand_decay,
-    bool bilateral_stale = false)
+    bool bilateral_stale = false,
+    double bilateral_stale_pair_us = 0.0)
 {
     const bool saw_active = method.saw_use && node.saw_hold_until_us > now_us;
     const int desired = PolicySelectDesiredMode(node, method, guard_ok, rtt_ready, rtt_delta, saw_active, bilateral_stale);
@@ -5886,8 +5896,21 @@ static void UpdatePolicyNode(
         if (raised < base) {
             raised = base;
         }
-        if (method.policy_irj_guard_raise_cap_us > 0.0) {
-            raised = std::min(raised, base + method.policy_irj_guard_raise_cap_us);
+        double raise_cap_us = method.policy_irj_guard_raise_cap_us;
+        if (method.policy_irj_guard_raise_stale_k > 0.0 &&
+            method.policy_irj_bilateral_stale_us > 0.0 &&
+            bilateral_stale_pair_us > method.policy_irj_bilateral_stale_us) {
+            const double stale_cap_us =
+                method.policy_irj_guard_raise_stale_k *
+                (bilateral_stale_pair_us - method.policy_irj_bilateral_stale_us);
+            if (raise_cap_us > 0.0) {
+                raise_cap_us = std::min(raise_cap_us, stale_cap_us);
+            } else {
+                raise_cap_us = stale_cap_us;
+            }
+        }
+        if (raise_cap_us > 0.0) {
+            raised = std::min(raised, base + raise_cap_us);
         }
         picked_override = cand_quant;
         picked_override.min_us = raised;
@@ -5958,14 +5981,25 @@ static void UpdateTimeSyncPolicy(
     // Bilateral staleness check: both nodes have p10 far above their tilted minimum
     // This indicates a monotonic ramp (like E72) where tilted mode tracks poorly
     bool bilateral_stale = false;
+    double bilateral_stale_pair_us = 0.0;
     if (method.policy_irj_bilateral_stale_us > 0.0 &&
         node_a.short_snapshot.valid && node_a.tilted_min_valid &&
         node_b.short_snapshot.valid && node_b.tilted_min_valid) {
         const double stale_a = node_a.short_snapshot.p10 - node_a.tilted_min_us;
         const double stale_b = node_b.short_snapshot.p10 - node_b.tilted_min_us;
         const double stale_pair = std::min(stale_a, stale_b);
-        const bool stale_now = (stale_a >= method.policy_irj_bilateral_stale_us &&
-                                stale_b >= method.policy_irj_bilateral_stale_us);
+        const uint64_t age_a = (now_us > node_a.tilted_min_time_us) ? (now_us - node_a.tilted_min_time_us) : 0;
+        const uint64_t age_b = (now_us > node_b.tilted_min_time_us) ? (now_us - node_b.tilted_min_time_us) : 0;
+        const bool age_ok = (method.policy_irj_bilateral_min_age_us == 0) ||
+            (age_a >= method.policy_irj_bilateral_min_age_us &&
+                age_b >= method.policy_irj_bilateral_min_age_us);
+        const bool iqr_ok = (method.policy_irj_bilateral_iqr_max_us <= 0.0) ||
+            (node_a.short_snapshot.iqr <= method.policy_irj_bilateral_iqr_max_us &&
+                node_b.short_snapshot.iqr <= method.policy_irj_bilateral_iqr_max_us);
+        const bool stale_now = age_ok &&
+            iqr_ok &&
+            (stale_a >= method.policy_irj_bilateral_stale_us &&
+                stale_b >= method.policy_irj_bilateral_stale_us);
         if (stale_now) {
             if (node_a.irj_bilateral_stale_streak == 0) {
                 node_a.irj_bilateral_stale_start_us = stale_pair;
@@ -6013,12 +6047,15 @@ static void UpdateTimeSyncPolicy(
             }
         }
         bilateral_stale = stale_now && streak_ok && growth_ok && rise_ok && slope_ok;
+        if (bilateral_stale) {
+            bilateral_stale_pair_us = stale_pair;
+        }
     }
 
     UpdatePolicyNode(node_a, now_us, method, guard_ok, rtt_ready, rtt_delta,
-        multi_a, quant_a, tilted_a, decay_a, bilateral_stale);
+        multi_a, quant_a, tilted_a, decay_a, bilateral_stale, bilateral_stale_pair_us);
     UpdatePolicyNode(node_b, now_us, method, guard_ok, rtt_ready, rtt_delta,
-        multi_b, quant_b, tilted_b, decay_b, bilateral_stale);
+        multi_b, quant_b, tilted_b, decay_b, bilateral_stale, bilateral_stale_pair_us);
 }
 
 static void UpdateMoE(
@@ -19538,7 +19575,144 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_growth_us = 5000.0;
             add(v); }
 
-        // 31: Same as irj_bs15k_n10, but IRJ applies only in guard fallback path
+        // 31: Bounded IRJ + bilateral minimum age gate (15s)
+        R14("irj_bs15k_n10_b50_c18k_age15s")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_min_age_us = 15000000ULL;
+            add(v); }
+
+        // 32: Bounded IRJ + bilateral minimum age gate (20s)
+        R14("irj_bs15k_n10_b50_c18k_age20s")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        // 33: Bounded IRJ + bilateral minimum age gate (25s)
+        R14("irj_bs15k_n10_b50_c18k_age25s")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_min_age_us = 25000000ULL;
+            add(v); }
+
+        // 34: Age-gated bounded IRJ with lower cap (20s age, +12ms cap)
+        R14("irj_bs15k_n10_b50_c12k_age20s")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        // 35: Age-gated bounded IRJ + stale growth (+3ms over streak)
+        R14("irj_bs15k_n10_b50_c12k_age20s_g3k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_growth_us = 3000.0;
+            add(v); }
+
+        // 36: Age20 bounded IRJ + mild rising stale requirement
+        R14("irj_bs15k_n10_b50_c18k_age20s_r4_u200")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_rise_n = 4;
+            v.policy_irj_bilateral_rise_us = 200.0;
+            add(v); }
+
+        // 37: Age20 + lower cap + mild rising stale requirement
+        R14("irj_bs15k_n10_b50_c12k_age20s_r4_u200")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_rise_n = 4;
+            v.policy_irj_bilateral_rise_us = 200.0;
+            add(v); }
+
+        // 38: Age20 bounded IRJ + iqr/delta gates (strict ramp-only)
+        R14("irj_bs15k_n10_b50_c18k_age20s_i6k_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 39: Lower-cap version of strict ramp-only gates
+        R14("irj_bs15k_n10_b50_c12k_age20s_i6k_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 40: Slightly looser IQR gate
+        R14("irj_bs15k_n10_b50_c12k_age20s_i8k_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 8000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 41: Strict ramp-only using EWMA |rtt_delta| gate instead of instant gate
+        R14("irj_bs15k_n10_b50_c18k_age20s_i6k_dm45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_mean_rtt_delta_us = 45000.0;
+            v.policy_irj_mean_rtt_delta_alpha = 0.2;
+            add(v); }
+
+        // 42: Lower-cap EWMA |rtt_delta| strict ramp-only
+        R14("irj_bs15k_n10_b50_c12k_age20s_i6k_dm45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_mean_rtt_delta_us = 45000.0;
+            v.policy_irj_mean_rtt_delta_alpha = 0.2;
+            add(v); }
+
+        // 43: Same as irj_bs15k_n10, but IRJ applies only in guard fallback path
         // (protects handover-like cases where guard recovers but rtt_jump remains high)
         R14("irj_bs15k_n10_go")
             v.policy_quantile_ignore_rtt_jump = true;
@@ -19845,7 +20019,375 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_ramp_correction_alpha = 0.75;
             add(v); }
 
-        // 62: Control (standard robust config, 1s window)
+        // 62: Strict ramp-only + delta-growth gate (4ms over streak)
+        R14("irj_bs15k_n10_b50_c18k_age20s_i6k_d45k_dg4k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_rtt_delta_growth_us = 4000.0;
+            add(v); }
+
+        // 63: Strict ramp-only + delta-growth gate (6ms over streak)
+        R14("irj_bs15k_n10_b50_c18k_age20s_i6k_d45k_dg6k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_rtt_delta_growth_us = 6000.0;
+            add(v); }
+
+        // 64: Lower-cap strict ramp-only + delta-growth gate (4ms)
+        R14("irj_bs15k_n10_b50_c12k_age20s_i6k_d45k_dg4k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_rtt_delta_growth_us = 4000.0;
+            add(v); }
+
+        // 65: Lower-cap strict ramp-only + delta-growth gate (6ms)
+        R14("irj_bs15k_n10_b50_c12k_age20s_i6k_d45k_dg6k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_rtt_delta_growth_us = 6000.0;
+            add(v); }
+
+        // 66: Strict ramp-only + bilateral rise gate
+        R14("irj_bs15k_n10_b50_c18k_age20s_i6k_d45k_r4_u200")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_rise_n = 4;
+            v.policy_irj_bilateral_rise_us = 200.0;
+            add(v); }
+
+        // 67: Strict ramp-only + bilateral stale slope gate
+        R14("irj_bs15k_n10_b50_c18k_age20s_i6k_d45k_sl5_u200")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_slope_window = 5;
+            v.policy_irj_bilateral_slope_us = 200.0;
+            add(v); }
+
+        // 68: Lower-cap strict ramp-only + bilateral rise gate
+        R14("irj_bs15k_n10_b50_c12k_age20s_i6k_d45k_r4_u200")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_rise_n = 4;
+            v.policy_irj_bilateral_rise_us = 200.0;
+            add(v); }
+
+        // 69: Lower-cap strict ramp-only + bilateral stale slope gate
+        R14("irj_bs15k_n10_b50_c12k_age20s_i6k_d45k_sl5_u200")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_slope_window = 5;
+            v.policy_irj_bilateral_slope_us = 200.0;
+            add(v); }
+
+        // 70: Strict ramp-only + short guard-fail streak
+        R14("irj_bs15k_n10_b50_c18k_age20s_i6k_d45k_gf6")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_guard_fail_streak_n = 6;
+            add(v); }
+
+        // 71: Lower-cap strict ramp-only + short guard-fail streak
+        R14("irj_bs15k_n10_b50_c12k_age20s_i6k_d45k_gf6")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_guard_fail_streak_n = 6;
+            add(v); }
+
+        // 72: Strict ramp-only + mild bilateral rise gate
+        R14("irj_bs15k_n10_b50_c18k_age20s_i6k_d45k_r2_u100")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_rise_n = 2;
+            v.policy_irj_bilateral_rise_us = 100.0;
+            add(v); }
+
+        // 73: Lower-cap strict ramp-only + mild bilateral rise gate
+        R14("irj_bs15k_n10_b50_c12k_age20s_i6k_d45k_r2_u100")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_rise_n = 2;
+            v.policy_irj_bilateral_rise_us = 100.0;
+            add(v); }
+
+        // 74: Strict ramp-only + mild stale-slope gate
+        R14("irj_bs15k_n10_b50_c18k_age20s_i6k_d45k_sl5_u50")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_slope_window = 5;
+            v.policy_irj_bilateral_slope_us = 50.0;
+            add(v); }
+
+        // 75: Lower-cap strict ramp-only + mild stale-slope gate
+        R14("irj_bs15k_n10_b50_c12k_age20s_i6k_d45k_sl5_u50")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_slope_window = 5;
+            v.policy_irj_bilateral_slope_us = 50.0;
+            add(v); }
+
+        // 76: Strict ramp-only + adaptive stale-scaled raise cap (k=0.5)
+        R14("irj_bs15k_n10_b50_c18k_age20s_i6k_d45k_sk0p5")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_guard_raise_stale_k = 0.5;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 77: Lower-cap strict ramp-only + adaptive stale-scaled raise cap (k=0.5)
+        R14("irj_bs15k_n10_b50_c12k_age20s_i6k_d45k_sk0p5")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_guard_raise_stale_k = 0.5;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 78: Strict ramp-only + adaptive stale-scaled raise cap (k=0.8)
+        R14("irj_bs15k_n10_b50_c18k_age20s_i6k_d45k_sk0p8")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_guard_raise_stale_k = 0.8;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 79: Lower-cap strict ramp-only + adaptive stale-scaled raise cap (k=0.8)
+        R14("irj_bs15k_n10_b50_c12k_age20s_i6k_d45k_sk0p8")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_guard_raise_stale_k = 0.8;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 80: Strict ramp-only + adaptive stale-scaled raise cap (k=1.5)
+        R14("irj_bs15k_n10_b50_c18k_age20s_i6k_d45k_sk1p5")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_guard_raise_stale_k = 1.5;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 81: Lower-cap strict ramp-only + adaptive stale-scaled raise cap (k=1.5)
+        R14("irj_bs15k_n10_b50_c12k_age20s_i6k_d45k_sk1p5")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_guard_raise_stale_k = 1.5;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 82: Strict ramp-only + adaptive stale-scaled raise cap (k=2.0)
+        R14("irj_bs15k_n10_b50_c18k_age20s_i6k_d45k_sk2p0")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_guard_raise_stale_k = 2.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 83: Lower-cap strict ramp-only + adaptive stale-scaled raise cap (k=2.0)
+        R14("irj_bs15k_n10_b50_c12k_age20s_i6k_d45k_sk2p0")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_guard_raise_stale_k = 2.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 84: Strict ramp-only with longer bilateral stale streak (n=12)
+        R14("irj_bs15k_n12_b50_c18k_age20s_i6k_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 85: Lower-cap strict ramp-only with longer bilateral stale streak (n=12)
+        R14("irj_bs15k_n12_b50_c12k_age20s_i6k_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 86: Strict ramp-only (n=12) + adaptive stale-scaled raise cap (k=1.5)
+        R14("irj_bs15k_n12_b50_c18k_age20s_i6k_d45k_sk1p5")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_guard_raise_stale_k = 1.5;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 87: Lower-cap strict ramp-only (n=12) + adaptive stale-scaled raise cap (k=1.5)
+        R14("irj_bs15k_n12_b50_c12k_age20s_i6k_d45k_sk1p5")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_guard_raise_stale_k = 1.5;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 88: Strict ramp-only with very long bilateral stale streak (n=15)
+        R14("irj_bs15k_n15_b50_c18k_age20s_i6k_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 15;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 89: Lower-cap strict ramp-only with very long bilateral stale streak (n=15)
+        R14("irj_bs15k_n15_b50_c12k_age20s_i6k_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 15;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 90: Control (standard robust config, 1s window)
         R14("ctrl")
             add(v); }
 
