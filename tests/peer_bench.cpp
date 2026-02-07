@@ -1497,6 +1497,8 @@ struct MethodConfig
     double policy_irj_mean_rtt_delta_alpha = 0.2; // EWMA alpha for policy_irj_mean_rtt_delta_us gate
     double policy_irj_guard_fail_ratio_min = 0.0; // minimum EWMA guard-fail ratio (0..1) for IRJ
     double policy_irj_guard_fail_ratio_alpha = 0.2; // EWMA alpha for guard-fail ratio
+    double policy_irj_guard_quantile_blend = 1.0; // guard-fallback IRJ: blend tilted->quantile (1=full quantile)
+    double policy_irj_guard_raise_cap_us = 0.0; // if >0, cap IRJ raise above tilted by this amount
     int policy_irj_min_streak = 0; // minimum rtt_jump streak for irj guard override (0=any)
     double policy_irj_bilateral_stale_us = 0.0; // if >0, irj requires both nodes' p10 - tilted_min > this threshold
     int policy_irj_stale_streak_n = 0; // if >0, bilateral staleness must hold for N consecutive 1Hz ticks
@@ -5841,6 +5843,9 @@ static void UpdatePolicyNode(
 
     // Removed debug trace
 
+    PolicyCandidate picked_override;
+    bool has_picked_override = false;
+
     const PolicyCandidate* pick = nullptr;
     if (mode == kPolicyModeMulti && cand_multi.valid) {
         pick = &cand_multi;
@@ -5864,8 +5869,37 @@ static void UpdatePolicyNode(
         }
     }
 
+    // Guard-fallback IRJ: bound quantile override by blending/capping relative to tilted.
+    // This keeps E72 ramp adaptation while reducing E108-like overreaction.
+    if (!guard_ok &&
+        bilateral_stale &&
+        mode == kPolicyModeQuantile &&
+        cand_quant.valid &&
+        cand_tilted.valid &&
+        method.policy_quantile_ignore_rtt_jump) {
+        double alpha = method.policy_irj_guard_quantile_blend;
+        if (alpha < 0.0) alpha = 0.0;
+        if (alpha > 1.0) alpha = 1.0;
+        const double base = cand_tilted.min_us;
+        const double target = cand_quant.min_us;
+        double raised = base + alpha * (target - base);
+        if (raised < base) {
+            raised = base;
+        }
+        if (method.policy_irj_guard_raise_cap_us > 0.0) {
+            raised = std::min(raised, base + method.policy_irj_guard_raise_cap_us);
+        }
+        picked_override = cand_quant;
+        picked_override.min_us = raised;
+        has_picked_override = true;
+    }
+
     if (pick) {
-        ApplyPolicyCandidate(node, *pick, now_us);
+        if (has_picked_override) {
+            ApplyPolicyCandidate(node, picked_override, now_us);
+        } else {
+            ApplyPolicyCandidate(node, *pick, now_us);
+        }
     }
 }
 
@@ -19362,7 +19396,149 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_stale_streak_n = 10;
             add(v); }
 
-        // 17: Same as irj_bs15k_n10, but IRJ applies only in guard fallback path
+        // 17: IRJ with bounded guard-fallback quantile (50% blend, +12ms cap)
+        R14("irj_bs15k_n10_b50_c12k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            add(v); }
+
+        // 18: IRJ bounded (50% blend, +18ms cap)
+        R14("irj_bs15k_n10_b50_c18k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            add(v); }
+
+        // 19: IRJ bounded (65% blend, +18ms cap)
+        R14("irj_bs15k_n10_b65_c18k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.65;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            add(v); }
+
+        // 20: IRJ bounded (75% blend, +20ms cap)
+        R14("irj_bs15k_n10_b75_c20k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.75;
+            v.policy_irj_guard_raise_cap_us = 20000.0;
+            add(v); }
+
+        // 21: Bounded IRJ + mild rise gate (step suppression)
+        R14("irj_bs15k_n10_b50_c18k_r5_u300")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_rise_n = 5;
+            v.policy_irj_bilateral_rise_us = 300.0;
+            add(v); }
+
+        // 22: Bounded IRJ + permissive rise gate
+        R14("irj_bs15k_n10_b50_c18k_r4_u200")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_rise_n = 4;
+            v.policy_irj_bilateral_rise_us = 200.0;
+            add(v); }
+
+        // 23: Conservative bounded IRJ + mild rise gate
+        R14("irj_bs15k_n10_b50_c12k_r5_u300")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12000.0;
+            v.policy_irj_bilateral_rise_n = 5;
+            v.policy_irj_bilateral_rise_us = 300.0;
+            add(v); }
+
+        // 24: Bounded IRJ + guard-fail EWMA gate
+        R14("irj_bs15k_n10_b50_c18k_gfr60")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_guard_fail_ratio_min = 0.60;
+            v.policy_irj_guard_fail_ratio_alpha = 0.2;
+            add(v); }
+
+        // 25: Bounded IRJ + strict |rtt_delta| gate
+        R14("irj_bs15k_n10_b50_c18k_d50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_min_rtt_delta_us = 50000.0;
+            add(v); }
+
+        // 26: Bounded IRJ + combined strict gates
+        R14("irj_bs15k_n10_b50_c18k_gfr60_d50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_guard_fail_ratio_min = 0.60;
+            v.policy_irj_guard_fail_ratio_alpha = 0.2;
+            v.policy_irj_min_rtt_delta_us = 50000.0;
+            add(v); }
+
+        // 27: Bounded IRJ + long guard-fail streak gate
+        R14("irj_bs15k_n10_b50_c18k_gf15")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_guard_fail_streak_n = 15;
+            add(v); }
+
+        // 28: Bounded IRJ + very long guard-fail streak gate
+        R14("irj_bs15k_n10_b50_c18k_gf20")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_guard_fail_streak_n = 20;
+            add(v); }
+
+        // 29: Bounded IRJ + stale growth gate (+3ms over streak)
+        R14("irj_bs15k_n10_b50_c18k_g3k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_growth_us = 3000.0;
+            add(v); }
+
+        // 30: Bounded IRJ + stale growth gate (+5ms over streak)
+        R14("irj_bs15k_n10_b50_c18k_g5k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_growth_us = 5000.0;
+            add(v); }
+
+        // 31: Same as irj_bs15k_n10, but IRJ applies only in guard fallback path
         // (protects handover-like cases where guard recovers but rtt_jump remains high)
         R14("irj_bs15k_n10_go")
             v.policy_quantile_ignore_rtt_jump = true;
@@ -19371,7 +19547,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_guard_only = true;
             add(v); }
 
-        // 18: Guard-only IRJ with slightly lower stale threshold
+        // 28: Guard-only IRJ with slightly lower stale threshold
         R14("irj_bs12k_n10_go")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 12000.0;
@@ -19379,7 +19555,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_guard_only = true;
             add(v); }
 
-        // 19: Guard-only IRJ with shorter streak
+        // 29: Guard-only IRJ with shorter streak
         R14("irj_bs15k_n8_go")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19387,7 +19563,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_guard_only = true;
             add(v); }
 
-        // 20: irj_bs15k_n10 + min |rtt_delta| 45k (reject smaller handover spikes)
+        // 30: irj_bs15k_n10 + min |rtt_delta| 45k (reject smaller handover spikes)
         R14("irj_bs15k_n10_d45k")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19395,7 +19571,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_min_rtt_delta_us = 45000.0;
             add(v); }
 
-        // 21: irj_bs15k_n10 + min |rtt_delta| 50k (strict ramp-only trigger)
+        // 31: irj_bs15k_n10 + min |rtt_delta| 50k (strict ramp-only trigger)
         R14("irj_bs15k_n10_d50k")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19403,7 +19579,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_min_rtt_delta_us = 50000.0;
             add(v); }
 
-        // 22: irj_bs15k_n10 + 50k min delta + 10-tick rtt_jump streak
+        // 32: irj_bs15k_n10 + 50k min delta + 10-tick rtt_jump streak
         R14("irj_bs15k_n10_d50k_s10")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19412,7 +19588,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_min_streak = 10;
             add(v); }
 
-        // 23: IRJ gated by EWMA(|rtt_delta|) >= 40k
+        // 33: IRJ gated by EWMA(|rtt_delta|) >= 40k
         R14("irj_bs15k_n10_dm40k")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19421,7 +19597,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_mean_rtt_delta_alpha = 0.2;
             add(v); }
 
-        // 24: IRJ gated by EWMA(|rtt_delta|) >= 42k
+        // 34: IRJ gated by EWMA(|rtt_delta|) >= 42k
         R14("irj_bs15k_n10_dm42k")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19430,7 +19606,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_mean_rtt_delta_alpha = 0.2;
             add(v); }
 
-        // 25: IRJ gated by EWMA(|rtt_delta|) >= 45k
+        // 35: IRJ gated by EWMA(|rtt_delta|) >= 45k
         R14("irj_bs15k_n10_dm45k")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19439,7 +19615,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_mean_rtt_delta_alpha = 0.2;
             add(v); }
 
-        // 26: IRJ gated by EWMA guard-fail ratio >= 0.50
+        // 36: IRJ gated by EWMA guard-fail ratio >= 0.50
         R14("irj_bs15k_n10_gfr50")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19448,7 +19624,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_guard_fail_ratio_alpha = 0.2;
             add(v); }
 
-        // 27: IRJ gated by EWMA guard-fail ratio >= 0.60
+        // 37: IRJ gated by EWMA guard-fail ratio >= 0.60
         R14("irj_bs15k_n10_gfr60")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19457,7 +19633,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_guard_fail_ratio_alpha = 0.2;
             add(v); }
 
-        // 28: irj_bs15k_n10 + stale-growth gate (ramp-like behavior required)
+        // 38: irj_bs15k_n10 + stale-growth gate (ramp-like behavior required)
         R14("irj_bs15k_n10_grow5k")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19465,7 +19641,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_growth_us = 5000.0;
             add(v); }
 
-        // 29: Same as above with stronger growth requirement
+        // 39: Same as above with stronger growth requirement
         R14("irj_bs15k_n10_grow8k")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19473,7 +19649,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_growth_us = 8000.0;
             add(v); }
 
-        // 30: Combine strict rtt gate + growth gate
+        // 40: Combine strict rtt gate + growth gate
         R14("irj_bs15k_n10_d50k_grow5k")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19482,7 +19658,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_growth_us = 5000.0;
             add(v); }
 
-        // 31: Rising stale gate: require +500us/tick for 6 consecutive ticks
+        // 41: Rising stale gate: require +500us/tick for 6 consecutive ticks
         R14("irj_bs15k_n10_rise6_u500")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19491,7 +19667,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_rise_us = 500.0;
             add(v); }
 
-        // 32: Rising stale gate with longer rise streak
+        // 42: Rising stale gate with longer rise streak
         R14("irj_bs15k_n10_rise8_u500")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19500,7 +19676,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_rise_us = 500.0;
             add(v); }
 
-        // 33: Rising stale gate with lower per-tick threshold
+        // 43: Rising stale gate with lower per-tick threshold
         R14("irj_bs15k_n10_rise6_u300")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19509,7 +19685,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_rise_us = 300.0;
             add(v); }
 
-        // 34: Lower stale threshold + rise gate (earlier trigger than 15k)
+        // 44: Lower stale threshold + rise gate (earlier trigger than 15k)
         R14("irj_bs12k_n10_rise6_u500")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 12000.0;
@@ -19518,7 +19694,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_rise_us = 500.0;
             add(v); }
 
-        // 35: More aggressive lower threshold + rise gate
+        // 45: More aggressive lower threshold + rise gate
         R14("irj_bs10k_n10_rise6_u500")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 10000.0;
@@ -19527,7 +19703,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_rise_us = 500.0;
             add(v); }
 
-        // 36: Lower threshold + shorter stale streak + rise gate
+        // 46: Lower threshold + shorter stale streak + rise gate
         R14("irj_bs12k_n8_rise6_u500")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 12000.0;
@@ -19536,7 +19712,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_rise_us = 500.0;
             add(v); }
 
-        // 37: Relaxed rise gate (15k, rise 4 ticks at +300)
+        // 47: Relaxed rise gate (15k, rise 4 ticks at +300)
         R14("irj_bs15k_n10_rise4_u300")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19545,7 +19721,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_rise_us = 300.0;
             add(v); }
 
-        // 38: Relaxed rise gate with lower stale threshold
+        // 48: Relaxed rise gate with lower stale threshold
         R14("irj_bs12k_n10_rise4_u300")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 12000.0;
@@ -19554,7 +19730,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_rise_us = 300.0;
             add(v); }
 
-        // 39: Further relaxed rise increment
+        // 49: Further relaxed rise increment
         R14("irj_bs12k_n10_rise4_u200")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 12000.0;
@@ -19563,7 +19739,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_rise_us = 200.0;
             add(v); }
 
-        // 40: Mid-strength rise gate
+        // 50: Mid-strength rise gate
         R14("irj_bs12k_n10_rise5_u300")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 12000.0;
@@ -19572,7 +19748,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_rise_us = 300.0;
             add(v); }
 
-        // 41: Slope gate over 5 ticks (>= 200 us/tick) + bilateral stale gate
+        // 51: Slope gate over 5 ticks (>= 200 us/tick) + bilateral stale gate
         R14("irj_bs15k_n10_sl5_u200")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19581,7 +19757,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_slope_us = 200.0;
             add(v); }
 
-        // 42: Slope gate over 5 ticks (>= 300 us/tick)
+        // 52: Slope gate over 5 ticks (>= 300 us/tick)
         R14("irj_bs15k_n10_sl5_u300")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19590,7 +19766,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_slope_us = 300.0;
             add(v); }
 
-        // 43: Longer slope gate over 8 ticks (>= 200 us/tick)
+        // 53: Longer slope gate over 8 ticks (>= 200 us/tick)
         R14("irj_bs15k_n10_sl8_u200")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19599,7 +19775,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_slope_us = 200.0;
             add(v); }
 
-        // 44: Slope gate + stricter rtt delta floor
+        // 54: Slope gate + stricter rtt delta floor
         R14("irj_bs15k_n10_sl5_u200_d50k")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19609,7 +19785,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_min_rtt_delta_us = 50000.0;
             add(v); }
 
-        // 45: Guard-fail streak gate (4 ticks) + bilateral stale gate
+        // 55: Guard-fail streak gate (4 ticks) + bilateral stale gate
         R14("irj_bs15k_n10_gf4")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19617,7 +19793,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_guard_fail_streak_n = 4;
             add(v); }
 
-        // 46: Guard-fail streak gate (6 ticks) + bilateral stale gate
+        // 56: Guard-fail streak gate (6 ticks) + bilateral stale gate
         R14("irj_bs15k_n10_gf6")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19625,7 +19801,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_guard_fail_streak_n = 6;
             add(v); }
 
-        // 47: Guard-fail streak gate (8 ticks) + bilateral stale gate
+        // 57: Guard-fail streak gate (8 ticks) + bilateral stale gate
         R14("irj_bs15k_n10_gf8")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19633,7 +19809,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_guard_fail_streak_n = 8;
             add(v); }
 
-        // 48: Stricter combo: 6 guard-fail ticks + 50k rtt delta floor
+        // 58: Stricter combo: 6 guard-fail ticks + 50k rtt delta floor
         R14("irj_bs15k_n10_gf6_d50k")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -19642,7 +19818,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_min_rtt_delta_us = 50000.0;
             add(v); }
 
-        // 49: Bilateral ramp correction (conservative)
+        // 59: Bilateral ramp correction (conservative)
         R14("rcb_a05_t200_w10")
             v.policy_ramp_correction = true;
             v.policy_ramp_bilateral = true;
@@ -19651,7 +19827,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_ramp_correction_alpha = 0.5;
             add(v); }
 
-        // 50: Bilateral ramp correction (faster onset)
+        // 60: Bilateral ramp correction (faster onset)
         R14("rcb_a05_t150_w8")
             v.policy_ramp_correction = true;
             v.policy_ramp_bilateral = true;
@@ -19660,7 +19836,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_ramp_correction_alpha = 0.5;
             add(v); }
 
-        // 51: Bilateral ramp correction (stronger gain)
+        // 61: Bilateral ramp correction (stronger gain)
         R14("rcb_a075_t150_w8")
             v.policy_ramp_correction = true;
             v.policy_ramp_bilateral = true;
@@ -19669,7 +19845,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_ramp_correction_alpha = 0.75;
             add(v); }
 
-        // 52: Control (standard robust config, 1s window)
+        // 62: Control (standard robust config, 1s window)
         R14("ctrl")
             add(v); }
 
