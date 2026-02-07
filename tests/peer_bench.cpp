@@ -450,6 +450,23 @@ struct DelayModel
     bool markov_high = false;
     uint64_t markov_last_update_us = 0;
 
+    // OS scheduling jitter: models the delay between NIC receipt and
+    // application recvfrom().  Applied to the receive timestamp, not
+    // the network delay.  Typical values: 100-10000 us under load.
+    uint32_t sched_jitter_us = 0;
+    double sched_jitter_sigma = 1.0; // log-normal sigma
+
+    uint32_t SampleSchedJitter(PCGRandom& rng) const
+    {
+        if (sched_jitter_us == 0) {
+            return 0;
+        }
+        // Log-normal distribution: always positive, heavy-tailed
+        const double mu = std::log((double)sched_jitter_us + 1.0);
+        const double j = std::exp(mu + sched_jitter_sigma * RandNormal(rng)) - 1.0;
+        return (j > 0.0) ? (uint32_t)j : 0;
+    }
+
     uint32_t SampleDelay(uint64_t now_us, PCGRandom& rng)
     {
         uint32_t base_delay = base_delay_us;
@@ -1291,7 +1308,7 @@ struct ScenarioConfig
     double probe_rate_hz = 1.0;
     double poll_rate_hz = 10.0;
     uint64_t mindelta_interval_us = 1000000;
-    uint64_t metrics_warmup_us = 1000 * 1000ULL;
+    uint64_t metrics_warmup_us = 2 * 1000 * 1000ULL; // at least one full window
 
     DelayModel delay_ab;
     DelayModel delay_ba;
@@ -1474,7 +1491,54 @@ struct MethodConfig
     double quantile_policy_skew_min_ppm = 0.0;
     bool policy_quantile_requires_skew = false;
     bool policy_quantile_block_high_iqr = false;
+    bool policy_quantile_ignore_rtt_jump = false; // allow quantile even during rtt_jump (for ramp scenarios)
+    double policy_irj_min_rtt_delta_us = 0.0; // minimum |rtt_delta| for irj guard override (0=any)
+    double policy_irj_mean_rtt_delta_us = 0.0; // minimum EWMA(|rtt_delta|) for irj guard override
+    double policy_irj_mean_rtt_delta_alpha = 0.2; // EWMA alpha for policy_irj_mean_rtt_delta_us gate
+    double policy_irj_guard_fail_ratio_min = 0.0; // minimum EWMA guard-fail ratio (0..1) for IRJ
+    double policy_irj_guard_fail_ratio_alpha = 0.2; // EWMA alpha for guard-fail ratio
+    int policy_irj_min_streak = 0; // minimum rtt_jump streak for irj guard override (0=any)
+    double policy_irj_bilateral_stale_us = 0.0; // if >0, irj requires both nodes' p10 - tilted_min > this threshold
+    int policy_irj_stale_streak_n = 0; // if >0, bilateral staleness must hold for N consecutive 1Hz ticks
+    double policy_irj_bilateral_growth_us = 0.0; // if >0, bilateral stale amount must grow by this much over the streak
+    int policy_irj_bilateral_rise_n = 0; // if >0, require this many consecutive rising stale ticks
+    double policy_irj_bilateral_rise_us = 0.0; // minimum per-tick stale rise to count toward rise_n
+    int policy_irj_bilateral_slope_window = 0; // if >0, require stale slope over this many ticks
+    double policy_irj_bilateral_slope_us = 0.0; // minimum stale slope in us/tick over slope_window
+    int policy_irj_guard_fail_streak_n = 0; // if >0, require N consecutive guard-fail ticks before IRJ override
+    bool policy_irj_guard_only = false; // if true, IRJ only applies in guard fallback path (not normal rtt_jump path)
+    int policy_rtt_jump_quantile_n = 0; // if >0, force quantile after N consecutive rtt_jump ticks (ramp detector)
+    double policy_rtt_jump_growth_us = 0.0; // required rtt_delta growth over streak to distinguish ramp from step
+    double policy_rtt_jump_min_delta_us = 0.0; // minimum |rtt_delta| to force quantile (filters small jumps)
     bool policy_prioritize_decay = false;
+    bool policy_per_packet_min = false; // update effective_min from TS24 on every packet (downward only)
+    bool policy_per_packet_fresh = false; // update effective_min from TS24 on every packet (both directions)
+    bool policy_per_packet_up = false;  // update effective_min from TS24 on every packet (upward only - for ramp tracking)
+    bool policy_per_packet_fresh_quantile = false; // per_packet_fresh only when in quantile mode (safe ramp tracking)
+    bool policy_per_packet_peer = false; // also update peer_min per-packet
+    bool policy_use_library_offset = false; // use library's GetRemoteTimeUsec() for estimation instead of algo_offset_us
+    bool policy_tilted_reset_on_qshrink = false; // reset tilted_bins when qshrink fires
+    bool policy_tilted_use_gsp = false;          // GSP step detection + tilted_bins reset for Policy
+    bool policy_gsp_block_during_qshrink = false; // Block GSP when qshrink hold is active on either node
+    double policy_gsp_min_gap_us = 0.0; // Minimum p10-effective_min gap to fire GSP (filters small steps)
+    bool policy_gsp_skip_stable = false; // Skip IQR stability check (use gap+age as sole guards)
+    // Adaptive tilted window: shrink when gap > threshold, grow back when gap is small
+    bool policy_tilted_adaptive_window = false;
+    uint64_t policy_tilted_min_window_us = 5000000;   // minimum tilted window (5s)
+    uint64_t policy_tilted_max_window_us = 60000000;  // maximum tilted window (60s)
+    double policy_tilted_shrink_gap_k = 4.0;          // shrink when gap > k * jitter
+    double policy_tilted_shrink_gap_min_us = 1000.0;  // minimum gap to trigger shrink
+    double policy_tilted_grow_gap_k = 2.0;            // grow when gap < k * jitter
+    uint64_t policy_tilted_shrink_step_us = 5000000;  // shrink by this much per tick
+    uint64_t policy_tilted_grow_step_us = 1000000;    // grow by this much per tick
+    uint64_t policy_tilted_shrink_delay_us = 0;      // require gap to persist this long before shrinking
+    bool policy_aw_block_during_qshrink = true;      // block adaptive shrink when qshrink hold is active
+    int policy_aw_require_ramp_streak = 0;            // require ramp_rising_streak >= N to allow shrink (0=disabled)
+    // Ramp-aware shrink suppression
+    bool quantile_shrink_block_ramp = false;
+    int quantile_shrink_ramp_streak = 3;       // consecutive rising p10 windows to detect ramp
+    double quantile_shrink_ramp_rate_us_s = 50.0; // min p10 rise rate to count as rising
+    double quantile_shrink_iqr_block_us = 0.0; // block shrink when IQR exceeds this
     bool policy_quantile_prefer_low_near = false;
     bool policy_near_ignore_stable = false;
     bool policy_tilted_requires_skew = false;
@@ -1482,6 +1546,30 @@ struct MethodConfig
     uint64_t policy_hold_us = 0;
     int policy_switch_n = 0;
     bool policy_require_rtt_guard = false;
+    // M1: Jitter-gated minimum floor (prevent extreme low outliers during heavy-tail)
+    bool policy_jitter_floor = false;
+    double policy_jitter_floor_enter_us = 200.0;
+    double policy_jitter_floor_exit_us = 100.0;
+    double policy_jitter_floor_iqr_enter_us = 400.0;
+    double policy_jitter_floor_iqr_exit_us = 200.0;
+    // M2: Tilted-mode near-stale reset (detect stale tilted estimate via near_hits=0)
+    bool policy_tilted_near_stale_reset = false;
+    int policy_tilted_near_stale_n = 3;
+    // M3: RTT-adaptive tilted window shrink (flush stale data on bufferbloat)
+    bool policy_rtt_tilted_shrink = false;
+    double policy_rtt_tilted_shrink_delta_us = 300.0;
+    uint64_t policy_rtt_tilted_shrink_window_us = 5000000;
+    uint64_t policy_rtt_tilted_shrink_hold_us = 3000000;
+    // M4: Sign coherence guard for mode switches
+    bool policy_sign_coherence = false;
+    int policy_sign_coherence_n = 3;
+    double policy_sign_coherence_min_delta_us = 25.0;
+    // M5: Ramp correction - detect p10 slope and correct effective_min bias
+    bool policy_ramp_correction = false;
+    bool policy_ramp_bilateral = false;          // require BOTH directions to have positive slope
+    int policy_ramp_slope_window = 10;           // ticks to look back for slope (10=10s at 1Hz)
+    double policy_ramp_slope_threshold = 200.0;  // us/s minimum slope to trigger correction
+    double policy_ramp_correction_alpha = 0.5;   // fraction of full correction to apply (0-1)
     int sample_stride = 1; // stamp every N packets
     double probe_rate_hz = 0.0;
     uint64_t mindelta_interval_us = 0;
@@ -1755,6 +1843,7 @@ struct DirectionMetrics
     SampleStats poll_time_err_us;
     SampleStats skew_err_ppm;
     SampleStats owd_err_us;
+    SampleStats owd_signed_err_us; // Signed OWD error for bias detection
     SampleStats short_p10_us;
     SampleStats short_iqr_us;
     SampleStats short_near_hits;
@@ -1948,6 +2037,7 @@ struct ShortStatsSnapshot
 {
     bool valid = false;
     double p0 = 0.0;
+    double p5 = 0.0;
     double p10 = 0.0;
     double p25 = 0.0;
     double p75 = 0.0;
@@ -2141,6 +2231,7 @@ struct ShortWindowStats
         out.count = values.size();
         out.near_hits = near_hits;
         out.p0 = values.front();
+        out.p5 = values[idx(0.05)];
         out.p10 = values[idx(0.10)];
         out.p25 = values[idx(0.25)];
         out.p75 = values[idx(0.75)];
@@ -2283,6 +2374,43 @@ struct NodeState
     int policy_switch_streak = 0;
     uint64_t policy_hold_until_us = 0;
     uint64_t policy_switches = 0;
+    uint64_t policy_mode_ticks[8] = {}; // count of 1Hz ticks spent in each mode
+    // M1: Jitter-gated minimum floor state
+    bool policy_jitter_floor_active = false;
+    // M2: Tilted-mode near-stale reset state
+    int tilted_near_stale_streak = 0;
+    int rtt_jump_streak = 0; // consecutive ticks with rtt_jump=true
+    double rtt_jump_streak_start_delta = 0.0; // |rtt_delta| at streak start
+    bool irj_rtt_delta_ema_valid = false;
+    double irj_rtt_delta_ema_us = 0.0;
+    bool irj_guard_fail_ewma_valid = false;
+    double irj_guard_fail_ewma = 0.0;
+    int irj_guard_fail_streak = 0; // consecutive ticks with guard failure (for IRJ gating)
+    int irj_bilateral_stale_streak = 0; // consecutive ticks where bilateral staleness holds (pair-level, use node_a's)
+    double irj_bilateral_stale_start_us = 0.0; // bilateral stale amount at streak start (for ramp-like growth gate)
+    int irj_bilateral_rise_streak = 0; // consecutive ticks where bilateral stale keeps rising
+    double irj_bilateral_prev_stale_us = 0.0; // previous bilateral stale amount
+    double irj_bilateral_stale_ring[16] = {}; // rolling stale samples for slope gating
+    int irj_bilateral_stale_ring_idx = 0;
+    int irj_bilateral_stale_ring_count = 0;
+    // M3: RTT-adaptive tilted window shrink state
+    uint64_t rtt_tilted_shrink_until_us = 0;
+    uint64_t rtt_tilted_shrink_orig_window_us = 0;
+    // M4: Sign coherence guard state
+    int policy_sign_count = 0;
+    int policy_sign_dir = 0;
+    double policy_prev_offset_us = 0.0;
+    bool policy_prev_offset_valid = false;
+    // M5: Ramp correction state
+    double p10_ring[16] = {};
+    int p10_ring_idx = 0;
+    int p10_ring_count = 0;
+
+    // Ramp detection: track short-window p10 slope
+    double ramp_prev_p10 = 0.0;
+    uint64_t ramp_prev_time_us = 0;
+    bool ramp_prev_valid = false;
+    int ramp_rising_streak = 0;
 
     LongWindowBins long_bins;
     LongWindowBins tilted_bins;
@@ -2329,6 +2457,7 @@ struct NodeState
     bool algo_offset_valid = false;
 
     int gsp_stale_streak = 0;
+    uint64_t aw_gap_persist_start_us = 0; // when adaptive window gap first exceeded threshold (0=not active)
     uint64_t nfhs_last_near_hit_us = 0;
     int nfhs_stale_streak = 0;
     int step_streak = 0;
@@ -3439,6 +3568,24 @@ static void MaybeUpdateShortStats(
                 node.jitter_ewma_us = (1.0 - alpha) * node.jitter_ewma_us + alpha * jitter;
             }
         }
+        // Ramp detection: track p10 slope for shrink suppression
+        if (node.ramp_prev_valid) {
+            const double dt_s = (double)(now_us - node.ramp_prev_time_us) * 1e-6;
+            if (dt_s > 0.05) {
+                const double rate = (snapshot.p10 - node.ramp_prev_p10) / dt_s;
+                if (rate >= 50.0) { // default threshold; overridden by method config in suppression check
+                    node.ramp_rising_streak++;
+                } else {
+                    node.ramp_rising_streak = 0;
+                }
+                node.ramp_prev_p10 = snapshot.p10;
+                node.ramp_prev_time_us = now_us;
+            }
+        } else {
+            node.ramp_prev_p10 = snapshot.p10;
+            node.ramp_prev_time_us = now_us;
+            node.ramp_prev_valid = true;
+        }
         dm.short_p10_us.Add(snapshot.p10);
         dm.short_iqr_us.Add(snapshot.iqr);
         dm.short_near_hits.Add((double)snapshot.near_hits);
@@ -3717,9 +3864,23 @@ static void ApplyQuantileFlipAction(NodeState& node, const MethodConfig& method,
         ResetQuantileState(node, method);
     }
     if (method.quantile_flip_shrink && method.quantile_flip_window_us > 0) {
-        node.drift_window_us = method.quantile_flip_window_us;
-        node.timesync.SetDriftWindowUsec(node.drift_window_us);
-        node.drift_window_restore_us = now_us + method.quantile_flip_hold_us;
+        bool suppress_shrink = false;
+        // Suppress shrink when IQR is high (congestion/heavy-tail)
+        if (method.quantile_shrink_iqr_block_us > 0.0 &&
+            node.short_snapshot.valid &&
+            node.short_snapshot.iqr >= method.quantile_shrink_iqr_block_us) {
+            suppress_shrink = true;
+        }
+        // Suppress shrink when ramp is detected (rising p10 floor)
+        if (method.quantile_shrink_block_ramp &&
+            node.ramp_rising_streak >= method.quantile_shrink_ramp_streak) {
+            suppress_shrink = true;
+        }
+        if (!suppress_shrink) {
+            node.drift_window_us = method.quantile_flip_window_us;
+            node.timesync.SetDriftWindowUsec(node.drift_window_us);
+            node.drift_window_restore_us = now_us + method.quantile_flip_hold_us;
+        }
     }
     if (method.quantile_flip_hold) {
         StartQuantileHold(node, method, now_us, false);
@@ -5333,12 +5494,13 @@ static double PolicySkewPpm(const NodeState& node, const MethodConfig& method, b
 }
 
 static int PolicySelectDesiredMode(
-    const NodeState& node,
+    NodeState& node,
     const MethodConfig& method,
     bool guard_ok,
     bool rtt_ready,
     double rtt_delta,
-    bool saw_active)
+    bool saw_active,
+    bool bilateral_stale = false)
 {
     const size_t min_samples = (method.policy_min_samples > 0) ? method.policy_min_samples : 20;
     const bool stable = node.short_snapshot.valid && node.short_snapshot.count >= min_samples;
@@ -5361,7 +5523,85 @@ static int PolicySelectDesiredMode(
     const bool skew_ok = skew_valid &&
         (method.policy_skew_min_ppm <= 0.0 || std::fabs(skew_ppm) >= method.policy_skew_min_ppm);
 
+    if (rtt_ready) {
+        const double abs_delta = std::fabs(rtt_delta);
+        double alpha = method.policy_irj_mean_rtt_delta_alpha;
+        if (alpha <= 0.0 || alpha > 1.0) {
+            alpha = 0.2;
+        }
+        if (!node.irj_rtt_delta_ema_valid) {
+            node.irj_rtt_delta_ema_valid = true;
+            node.irj_rtt_delta_ema_us = abs_delta;
+        } else {
+            node.irj_rtt_delta_ema_us =
+                alpha * abs_delta + (1.0 - alpha) * node.irj_rtt_delta_ema_us;
+        }
+    }
+
+    // Track sustained rtt_jump streak (ramp detector)
+    if (rtt_jump) {
+        if (node.rtt_jump_streak == 0) {
+            node.rtt_jump_streak_start_delta = std::fabs(rtt_delta);
+        }
+        node.rtt_jump_streak++;
+    } else {
+        node.rtt_jump_streak = 0;
+    }
+
+    if (!guard_ok) {
+        node.irj_guard_fail_streak++;
+    } else {
+        node.irj_guard_fail_streak = 0;
+    }
+    {
+        const double fail_sample = guard_ok ? 0.0 : 1.0;
+        double alpha = method.policy_irj_guard_fail_ratio_alpha;
+        if (alpha <= 0.0 || alpha > 1.0) {
+            alpha = 0.2;
+        }
+        if (!node.irj_guard_fail_ewma_valid) {
+            node.irj_guard_fail_ewma_valid = true;
+            node.irj_guard_fail_ewma = fail_sample;
+        } else {
+            node.irj_guard_fail_ewma =
+                alpha * fail_sample + (1.0 - alpha) * node.irj_guard_fail_ewma;
+        }
+    }
+
+    // Sustained rtt_jump → force quantile (ramp scenario like E72)
+    // Must be before guard_ready check since ramp causes guard failure
+    // High N + min_delta threshold ensures only true sustained ramps trigger
+    if (method.policy_rtt_jump_quantile_n > 0 &&
+        node.rtt_jump_streak >= method.policy_rtt_jump_quantile_n &&
+        method.policy_use_quantile) {
+        const bool growth_ok = method.policy_rtt_jump_growth_us <= 0.0 ||
+            (std::fabs(rtt_delta) >= node.rtt_jump_streak_start_delta + method.policy_rtt_jump_growth_us);
+        const bool delta_ok = method.policy_rtt_jump_min_delta_us <= 0.0 ||
+            (std::fabs(rtt_delta) >= method.policy_rtt_jump_min_delta_us);
+        if (growth_ok && delta_ok) {
+            return kPolicyModeQuantile;
+        }
+    }
+
+    // IRJ (ignore rtt_jump) is active when thresholds are met.
+    const bool irj_mean_delta_ok = (method.policy_irj_mean_rtt_delta_us <= 0.0) ||
+        (node.irj_rtt_delta_ema_valid && node.irj_rtt_delta_ema_us >= method.policy_irj_mean_rtt_delta_us);
+    const bool irj_guard_fail_ratio_ok = (method.policy_irj_guard_fail_ratio_min <= 0.0) ||
+        (node.irj_guard_fail_ewma_valid && node.irj_guard_fail_ewma >= method.policy_irj_guard_fail_ratio_min);
+    const bool irj_active = method.policy_quantile_ignore_rtt_jump &&
+        (method.policy_irj_min_rtt_delta_us <= 0.0 || std::fabs(rtt_delta) >= method.policy_irj_min_rtt_delta_us) &&
+        irj_mean_delta_ok &&
+        irj_guard_fail_ratio_ok &&
+        (method.policy_irj_min_streak <= 0 || node.rtt_jump_streak >= method.policy_irj_min_streak) &&
+        (method.policy_irj_guard_fail_streak_n <= 0 ||
+            node.irj_guard_fail_streak >= method.policy_irj_guard_fail_streak_n) &&
+        (method.policy_irj_bilateral_stale_us <= 0.0 || bilateral_stale);
+
     if (!guard_ready) {
+        // When IRJ is active during guard failure, force quantile instead of tilted fallback
+        if (irj_active && rtt_jump && method.policy_use_quantile) {
+            return kPolicyModeQuantile;
+        }
         return PolicyFallbackMode(method);
     }
     if (saw_active && method.policy_use_multiwin) {
@@ -5374,7 +5614,10 @@ static int PolicySelectDesiredMode(
         return kPolicyModeDecay;
     }
 
-    bool quantile_allowed = low_near && method.policy_use_quantile && !rtt_jump;
+    // Optional safeguard: let IRJ override only guard fallback, not normal path.
+    const bool irj_allows_normal_path = irj_active && !method.policy_irj_guard_only;
+    const bool rtt_block = rtt_jump && !irj_allows_normal_path;
+    bool quantile_allowed = low_near && method.policy_use_quantile && !rtt_block;
     if (quantile_allowed && method.policy_quantile_requires_skew) {
         quantile_allowed = skew_ok;
     }
@@ -5438,7 +5681,9 @@ static int PolicyResolveMode(NodeState& node, int desired, uint64_t now_us, cons
         node.policy_switch_streak++;
     }
     const int switch_n = std::max(1, method.policy_switch_n);
-    if (node.policy_switch_streak >= switch_n) {
+    const bool coherence_ok = !method.policy_sign_coherence ||
+        node.policy_sign_count >= method.policy_sign_coherence_n;
+    if (node.policy_switch_streak >= switch_n && coherence_ok) {
         node.policy_mode = desired;
         node.policy_pending_mode = desired;
         node.policy_switch_streak = 0;
@@ -5519,6 +5764,64 @@ static void ApplyPolicyCandidate(NodeState& node, const PolicyCandidate& cand, u
     node.peer_min_valid = true;
 }
 
+// M1: Update jitter-gated minimum floor hysteresis
+static void UpdatePolicyJitterFloor(NodeState& node, const MethodConfig& method)
+{
+    if (!method.policy_jitter_floor || !node.short_snapshot.valid) return;
+    const double jitter = std::max(0.0, node.short_snapshot.p10 - node.short_snapshot.p0);
+    const double iqr = node.short_snapshot.iqr;
+    const bool enter = (jitter >= method.policy_jitter_floor_enter_us) ||
+        (iqr >= method.policy_jitter_floor_iqr_enter_us);
+    const bool exit_cond = (jitter <= method.policy_jitter_floor_exit_us) &&
+        (iqr <= method.policy_jitter_floor_iqr_exit_us);
+    if (!node.policy_jitter_floor_active && enter) {
+        node.policy_jitter_floor_active = true;
+    } else if (node.policy_jitter_floor_active && exit_cond) {
+        node.policy_jitter_floor_active = false;
+    }
+}
+
+// M2: Detect tilted-mode stale estimate via near_hits=0
+static bool DetectTiltedNearStale(NodeState& node, const MethodConfig& method, uint64_t /*now_us*/)
+{
+    if (!node.short_snapshot.valid) return false;
+    const double jitter = GuardJitter(node, method);
+    const double iqr_max = std::max(method.gsp_iqr_min_us, method.gsp_iqr_k * jitter);
+    const bool stable = node.short_snapshot.iqr <= iqr_max;
+    const bool enough = node.short_snapshot.count >= method.gsp_npkt_min;
+    const bool no_near = node.short_snapshot.near_hits == 0;
+    if (stable && enough && no_near) {
+        node.tilted_near_stale_streak++;
+    } else {
+        node.tilted_near_stale_streak = 0;
+    }
+    return node.tilted_near_stale_streak >= std::max(1, method.policy_tilted_near_stale_n);
+}
+
+// M4: Update sign coherence tracking for mode switching
+static void UpdatePolicySignCoherence(NodeState& node, const MethodConfig& method)
+{
+    if (!method.policy_sign_coherence || !node.algo_offset_valid) return;
+    if (node.policy_prev_offset_valid) {
+        const double delta = node.algo_offset_us - node.policy_prev_offset_us;
+        const double delta_mag = std::fabs(delta);
+        if (delta_mag >= method.policy_sign_coherence_min_delta_us) {
+            const int sign = (delta > 0.0) ? 1 : -1;
+            if (sign == node.policy_sign_dir) {
+                node.policy_sign_count++;
+            } else {
+                node.policy_sign_dir = sign;
+                node.policy_sign_count = 1;
+            }
+        } else {
+            node.policy_sign_dir = 0;
+            node.policy_sign_count = 0;
+        }
+    }
+    node.policy_prev_offset_us = node.algo_offset_us;
+    node.policy_prev_offset_valid = true;
+}
+
 static void UpdatePolicyNode(
     NodeState& node,
     uint64_t now_us,
@@ -5529,11 +5832,14 @@ static void UpdatePolicyNode(
     const PolicyCandidate& cand_multi,
     const PolicyCandidate& cand_quant,
     const PolicyCandidate& cand_tilted,
-    const PolicyCandidate& cand_decay)
+    const PolicyCandidate& cand_decay,
+    bool bilateral_stale = false)
 {
     const bool saw_active = method.saw_use && node.saw_hold_until_us > now_us;
-    const int desired = PolicySelectDesiredMode(node, method, guard_ok, rtt_ready, rtt_delta, saw_active);
+    const int desired = PolicySelectDesiredMode(node, method, guard_ok, rtt_ready, rtt_delta, saw_active, bilateral_stale);
     const int mode = PolicyResolveMode(node, desired, now_us, method);
+
+    // Removed debug trace
 
     const PolicyCandidate* pick = nullptr;
     if (mode == kPolicyModeMulti && cand_multi.valid) {
@@ -5615,10 +5921,70 @@ static void UpdateTimeSyncPolicy(
     const PolicyCandidate decay_a = method.policy_use_decay ? PolicyDecayCandidate(node_a) : PolicyCandidate();
     const PolicyCandidate decay_b = method.policy_use_decay ? PolicyDecayCandidate(node_b) : PolicyCandidate();
 
+    // Bilateral staleness check: both nodes have p10 far above their tilted minimum
+    // This indicates a monotonic ramp (like E72) where tilted mode tracks poorly
+    bool bilateral_stale = false;
+    if (method.policy_irj_bilateral_stale_us > 0.0 &&
+        node_a.short_snapshot.valid && node_a.tilted_min_valid &&
+        node_b.short_snapshot.valid && node_b.tilted_min_valid) {
+        const double stale_a = node_a.short_snapshot.p10 - node_a.tilted_min_us;
+        const double stale_b = node_b.short_snapshot.p10 - node_b.tilted_min_us;
+        const double stale_pair = std::min(stale_a, stale_b);
+        const bool stale_now = (stale_a >= method.policy_irj_bilateral_stale_us &&
+                                stale_b >= method.policy_irj_bilateral_stale_us);
+        if (stale_now) {
+            if (node_a.irj_bilateral_stale_streak == 0) {
+                node_a.irj_bilateral_stale_start_us = stale_pair;
+                node_a.irj_bilateral_rise_streak = 0;
+            } else {
+                const double rise_min = method.policy_irj_bilateral_rise_us;
+                if (rise_min <= 0.0 || stale_pair >= node_a.irj_bilateral_prev_stale_us + rise_min) {
+                    node_a.irj_bilateral_rise_streak++;
+                } else {
+                    node_a.irj_bilateral_rise_streak = 0;
+                }
+            }
+            node_a.irj_bilateral_stale_streak++;
+            node_a.irj_bilateral_prev_stale_us = stale_pair;
+            node_a.irj_bilateral_stale_ring[node_a.irj_bilateral_stale_ring_idx % 16] = stale_pair;
+            node_a.irj_bilateral_stale_ring_idx = (node_a.irj_bilateral_stale_ring_idx + 1) % 16;
+            if (node_a.irj_bilateral_stale_ring_count < 16) {
+                node_a.irj_bilateral_stale_ring_count++;
+            }
+        } else {
+            node_a.irj_bilateral_stale_streak = 0;
+            node_a.irj_bilateral_stale_start_us = 0.0;
+            node_a.irj_bilateral_rise_streak = 0;
+            node_a.irj_bilateral_prev_stale_us = 0.0;
+            node_a.irj_bilateral_stale_ring_idx = 0;
+            node_a.irj_bilateral_stale_ring_count = 0;
+        }
+        const bool streak_ok = (method.policy_irj_stale_streak_n <= 0 ||
+            node_a.irj_bilateral_stale_streak >= method.policy_irj_stale_streak_n);
+        const bool growth_ok = (method.policy_irj_bilateral_growth_us <= 0.0 ||
+            (stale_pair - node_a.irj_bilateral_stale_start_us) >= method.policy_irj_bilateral_growth_us);
+        const bool rise_ok = (method.policy_irj_bilateral_rise_n <= 0 ||
+            node_a.irj_bilateral_rise_streak >= method.policy_irj_bilateral_rise_n);
+        bool slope_ok = true;
+        if (method.policy_irj_bilateral_slope_window > 0) {
+            slope_ok = false;
+            if (node_a.irj_bilateral_stale_ring_count >= 2) {
+                const int max_win = node_a.irj_bilateral_stale_ring_count - 1;
+                const int win = std::min(method.policy_irj_bilateral_slope_window, max_win);
+                const int latest_idx = ((node_a.irj_bilateral_stale_ring_idx - 1) % 16 + 16) % 16;
+                const int old_idx = ((latest_idx - win) % 16 + 16) % 16;
+                const double stale_slope = (node_a.irj_bilateral_stale_ring[latest_idx] -
+                    node_a.irj_bilateral_stale_ring[old_idx]) / (double)win;
+                slope_ok = stale_slope >= method.policy_irj_bilateral_slope_us;
+            }
+        }
+        bilateral_stale = stale_now && streak_ok && growth_ok && rise_ok && slope_ok;
+    }
+
     UpdatePolicyNode(node_a, now_us, method, guard_ok, rtt_ready, rtt_delta,
-        multi_a, quant_a, tilted_a, decay_a);
+        multi_a, quant_a, tilted_a, decay_a, bilateral_stale);
     UpdatePolicyNode(node_b, now_us, method, guard_ok, rtt_ready, rtt_delta,
-        multi_b, quant_b, tilted_b, decay_b);
+        multi_b, quant_b, tilted_b, decay_b, bilateral_stale);
 }
 
 static void UpdateMoE(
@@ -7132,6 +7498,9 @@ static bool EstimateRemoteTimeUsec(const MethodConfig& method, NodeState& node, 
             }
             return node.timesync.GetRemoteTimeUsec(local_now_us, remote_est_us);
         }
+        if (method.kind == MethodKind::TimeSyncPolicy && method.policy_use_library_offset) {
+            return node.timesync.GetRemoteTimeUsec(local_now_us, remote_est_us);
+        }
         if (node.algo_offset_valid) {
             const double est = (double)local_now_us + node.algo_offset_us;
             if (est <= 0.0) {
@@ -7387,6 +7756,7 @@ static void AddPollTimeError(DirectionMetrics& dm, double err_us, uint64_t now_u
 static void AddOwdError(DirectionMetrics& dm, double err_us)
 {
     dm.owd_err_us.Add(AbsDouble(err_us));
+    dm.owd_signed_err_us.Add(err_us);
 }
 
 static void UpdateDeadlineMetrics(DirectionMetrics& dm, double owd_true_us, double owd_est_us, double deadline_us)
@@ -7572,6 +7942,12 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
         node_b.timesync_short.SetDriftWindowUsec(short_window_us);
     }
 
+    // Set timesync drift window for Policy methods (default is 10s, but method.window_us may differ)
+    if (method.kind == MethodKind::TimeSyncPolicy && method.window_us > 0) {
+        node_a.timesync.SetDriftWindowUsec(method.window_us);
+        node_b.timesync.SetDriftWindowUsec(method.window_us);
+    }
+
     if (UsesTimeSyncCore(method.kind)) {
         const uint64_t long_window_us = (method.stats_long_window_us > 0)
             ? method.stats_long_window_us
@@ -7677,7 +8053,8 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
             DirectionMetrics& dm = to_b ? metrics.ab : metrics.ba;
             DelayModel& dmodel = to_b ? delay_ab : delay_ba;
 
-            const uint64_t local_recv = ComputeLocalTimeUsec(now_us, recv_node.clock, rng, true);
+            const uint64_t local_recv = ComputeLocalTimeUsec(now_us, recv_node.clock, rng, true)
+                + dmodel.SampleSchedJitter(rng);
             const uint64_t true_local_now = ComputeLocalTimeUsec(now_us, recv_node.clock, rng, false);
             const uint64_t true_remote_now = ComputeLocalTimeUsec(now_us, send_node.clock, rng, false);
             const uint64_t true_remote_local_at_send = ev.msg.true_remote_local_at_send;
@@ -7764,11 +8141,36 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
                                 const double skew_ppm = PolicySkewPpm(recv_node, method, skew_valid);
                                 UpdateTiltedMin(recv_node, local_recv, delta_us, skew_ppm);
                             }
+                            // Restore policy-selected effective_min, then optionally
+                            // override with fresh TS24 quantile for per-packet tracking.
                             recv_node.effective_min_us = prev_min;
                             recv_node.effective_min_time_us = prev_time;
                             recv_node.effective_min_valid = prev_valid;
                             recv_node.peer_min_us = prev_peer;
                             recv_node.peer_min_valid = prev_peer_valid;
+                            if ((method.policy_per_packet_min || method.policy_per_packet_fresh || method.policy_per_packet_up || method.policy_per_packet_fresh_quantile) && prev_valid) {
+                                PolicyCandidate fresh = PolicyQuantileCandidate(recv_node);
+                                if (fresh.valid) {
+                                    bool accept = false;
+                                    if (method.policy_per_packet_fresh) accept = true;           // both directions
+                                    else if (method.policy_per_packet_fresh_quantile && recv_node.policy_mode == kPolicyModeQuantile) accept = true; // fresh only in quantile mode
+                                    else if (method.policy_per_packet_up && fresh.min_us > prev_min) accept = true;  // upward only (ramp tracking)
+                                    else if (method.policy_per_packet_min && fresh.min_us < prev_min) accept = true; // downward only
+                                    // M1: Jitter floor clamp - prevent extreme lows during heavy-tail
+                                    if (accept && method.policy_jitter_floor && recv_node.policy_jitter_floor_active &&
+                                        recv_node.short_snapshot.valid && fresh.min_us < recv_node.short_snapshot.p5) {
+                                        fresh.min_us = recv_node.short_snapshot.p5;
+                                    }
+                                    if (accept) {
+                                        recv_node.effective_min_us = fresh.min_us;
+                                        recv_node.effective_min_time_us = now_us;
+                                    }
+                                    if (method.policy_per_packet_peer && fresh.peer_min_us > 0) {
+                                        recv_node.peer_min_us = fresh.peer_min_us;
+                                        recv_node.peer_min_valid = true;
+                                    }
+                                }
+                            }
                         } else if (method.kind == MethodKind::TimeSyncDDAC) {
                             // DD-AC updates effective mins on the 1 Hz tick.
                         } else if (EnsureEffectiveMin(recv_node) && delta_us < recv_node.effective_min_us) {
@@ -7777,7 +8179,8 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
                             recv_node.effective_min_valid = true;
                         }
                         UpdateAlgoOffset(recv_node, now_us);
-                        if (recv_node.algo_offset_valid) {
+                        if (recv_node.algo_offset_valid ||
+                            (method.policy_use_library_offset && recv_node.timesync.IsSynchronized())) {
                             MaybeSetSyncTime(true, now_us, recv_node.synced, recv_node.sync_time_us);
                         }
                         if (now_us >= metrics_start_us) {
@@ -7787,7 +8190,19 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
                                 AddOwdError(dm, owd_err);
                                 UpdateDeadlineMetrics(dm, ev.true_delay_us, owd_est, deadline_us);
                             }
-                            if (recv_node.algo_offset_valid) {
+                            if (method.kind == MethodKind::TimeSyncPolicy &&
+                                method.policy_use_library_offset &&
+                                recv_node.timesync.IsSynchronized()) {
+                                // Use library's per-packet-updated estimate instead of algo_offset_us
+                                uint64_t est_remote = 0;
+                                if (recv_node.timesync.GetRemoteTimeUsec(local_recv, est_remote)) {
+                                    const double offset_est = (double)est_remote - (double)local_recv;
+                                    AddOffsetError(dm, offset_est - true_offset, now_us);
+                                }
+                                if (recv_node.cse_skew_valid) {
+                                    AddSkewError(dm, recv_node.cse_skew_ppm - true_skew_ppm);
+                                }
+                            } else if (recv_node.algo_offset_valid) {
                                 double offset_est = recv_node.algo_offset_us;
                                 if (method.kind == MethodKind::TimeSyncShadowSkew && recv_node.shadow_skew_valid) {
                                     const double dt_s = (double)((local_recv > recv_node.algo_offset_time_us)
@@ -8110,8 +8525,13 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
                         recv_node.peer_min_raw_valid = true;
                         recv_node.peer_min_us = peer_min_raw;
                         recv_node.peer_min_valid = true;
+                        // Also update the library's peer state so GetRemoteTimeUsec() works
+                        if (method.policy_use_library_offset) {
+                            recv_node.timesync.OnPeerMinDeltaTS24(ev.msg.min_delta);
+                        }
                         UpdateAlgoOffset(recv_node, now_us);
-                        if (recv_node.algo_offset_valid) {
+                        if (recv_node.algo_offset_valid ||
+                            (method.policy_use_library_offset && recv_node.timesync.IsSynchronized())) {
                             MaybeSetSyncTime(true, now_us, recv_node.synced, recv_node.sync_time_us);
                         }
                         continue;
@@ -8778,7 +9198,253 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
                     UpdateAlgoOffset(node_a, now_us);
                     UpdateAlgoOffset(node_b, now_us);
                 } else if (method.kind == MethodKind::TimeSyncPolicy) {
+                    // Initialize drift_window_us on first tick (library defaults to 10s)
+                    auto policy_init_window = [&](NodeState& node) {
+                        if (node.drift_window_us == 0) {
+                            const uint64_t window_us = (method.window_us > 0) ? method.window_us : 2000000ULL;
+                            node.drift_window_us = window_us;
+                            node.timesync.SetDriftWindowUsec(window_us);
+                        }
+                    };
+                    policy_init_window(node_a);
+                    policy_init_window(node_b);
+                    // Save restore timestamps to detect qshrink firing
+                    const uint64_t prev_restore_a = node_a.drift_window_restore_us;
+                    const uint64_t prev_restore_b = node_b.drift_window_restore_us;
                     UpdateTimeSyncPolicy(node_a, node_b, now_us, method, guard_ok, rtt_ready, rtt_delta);
+                    // Track mode distribution
+                    if (node_a.policy_mode >= 0 && node_a.policy_mode < 8) node_a.policy_mode_ticks[node_a.policy_mode]++;
+                    if (node_b.policy_mode >= 0 && node_b.policy_mode < 8) node_b.policy_mode_ticks[node_b.policy_mode]++;
+                    // M1: Update jitter floor hysteresis
+                    UpdatePolicyJitterFloor(node_a, method);
+                    UpdatePolicyJitterFloor(node_b, method);
+                    // M4: Update sign coherence tracking
+                    UpdatePolicySignCoherence(node_a, method);
+                    UpdatePolicySignCoherence(node_b, method);
+                    // M5: Ramp correction - detect p10 slope and adjust effective_min
+                    if (method.policy_ramp_correction) {
+                        // Helper: record p10 and compute slope for a node
+                        auto compute_slope = [&](NodeState& node) -> double {
+                            if (!node.short_snapshot.valid || !node.tilted_min_valid) return 0.0;
+                            node.p10_ring[node.p10_ring_idx % 16] = node.short_snapshot.p10;
+                            node.p10_ring_idx = (node.p10_ring_idx + 1) % 16;
+                            if (node.p10_ring_count < 16) node.p10_ring_count++;
+                            const int win = std::min(method.policy_ramp_slope_window, node.p10_ring_count);
+                            if (win < 5) return 0.0;
+                            const int old_idx = ((node.p10_ring_idx - win) % 16 + 16) % 16;
+                            return (node.short_snapshot.p10 - node.p10_ring[old_idx]) / (double)win;
+                        };
+                        const double slope_a = compute_slope(node_a);
+                        const double slope_b = compute_slope(node_b);
+                        // Bilateral check: both directions must have positive slope above threshold
+                        const bool slope_a_ok = slope_a > method.policy_ramp_slope_threshold;
+                        const bool slope_b_ok = slope_b > method.policy_ramp_slope_threshold;
+                        const bool bilateral_ok = !method.policy_ramp_bilateral || (slope_a_ok && slope_b_ok);
+                        auto ramp_apply = [&](NodeState& node, double slope) {
+                            if (slope > method.policy_ramp_slope_threshold && bilateral_ok) {
+                                const double min_age_s = (double)(now_us - node.tilted_min_time_us) * 1e-6;
+                                if (min_age_s > 0.0) {
+                                    const double correction = slope * min_age_s * method.policy_ramp_correction_alpha;
+                                    node.effective_min_us += correction;
+                                    UpdateAlgoOffset(node, now_us);
+                                }
+                            }
+                        };
+                        ramp_apply(node_a, slope_a);
+                        ramp_apply(node_b, slope_b);
+                    }
+                    // Reset tilted_bins when qshrink fires (detected by restore timestamp advancing)
+                    if (method.policy_tilted_reset_on_qshrink && method.policy_use_tilted) {
+                        auto policy_tilted_reset = [&](NodeState& node, uint64_t prev_restore) {
+                            if (node.drift_window_restore_us > prev_restore && node.short_snapshot.valid) {
+                                const double skew_ppm = node.cse_skew_valid ? node.cse_skew_ppm : 0.0;
+                                ApplyTiltedStepReset(node, now_us, node.short_snapshot.p10, skew_ppm);
+                            }
+                        };
+                        policy_tilted_reset(node_a, prev_restore_a);
+                        policy_tilted_reset(node_b, prev_restore_b);
+                    }
+                    // M3: RTT-adaptive tilted window shrink
+                    if (method.policy_rtt_tilted_shrink && method.policy_use_tilted && rtt_ready) {
+                        auto rtt_shrink_check = [&](NodeState& node) {
+                            if (!node.tilted_min_valid || !node.short_snapshot.valid) return;
+                            // During active hold, check if expired and restore
+                            if (node.rtt_tilted_shrink_until_us > 0 && now_us < node.rtt_tilted_shrink_until_us) return;
+                            if (node.rtt_tilted_shrink_until_us > 0 && now_us >= node.rtt_tilted_shrink_until_us) {
+                                node.rtt_tilted_shrink_until_us = 0;
+                                if (node.rtt_tilted_shrink_orig_window_us > 0) {
+                                    node.tilted_bins.Reset(node.rtt_tilted_shrink_orig_window_us);
+                                    node.rtt_tilted_shrink_orig_window_us = 0;
+                                }
+                            }
+                            // Check RTT delta threshold
+                            if (std::fabs(rtt_delta) >= method.policy_rtt_tilted_shrink_delta_us) {
+                                const uint64_t cur_window = node.tilted_bins.window_us;
+                                const uint64_t target = method.policy_rtt_tilted_shrink_window_us;
+                                if (cur_window > target) {
+                                    node.rtt_tilted_shrink_orig_window_us = cur_window;
+                                    node.tilted_bins.Reset(target);
+                                    const double skew_ppm = node.cse_skew_valid ? node.cse_skew_ppm : 0.0;
+                                    const double r_dir = -skew_ppm;
+                                    const double t_s = (double)now_us * 1e-6;
+                                    node.tilted_bins.Update(now_us, node.short_snapshot.p10 - r_dir * t_s);
+                                    node.rtt_tilted_shrink_until_us = now_us + method.policy_rtt_tilted_shrink_hold_us;
+                                }
+                            }
+                        };
+                        rtt_shrink_check(node_a);
+                        rtt_shrink_check(node_b);
+                    }
+                    // Adaptive tilted window: shrink when gap persists (stale bias),
+                    // grow back when gap is small. Uses persistence timer to avoid
+                    // shrinking during transient step changes. Blocked during qshrink hold.
+                    if (method.policy_tilted_adaptive_window && method.policy_use_tilted) {
+                        const bool aw_qshrink_blocked = method.policy_aw_block_during_qshrink &&
+                            (node_a.drift_window_restore_us > 0 || node_b.drift_window_restore_us > 0);
+                        auto adapt_window = [&](NodeState& node) {
+                            if (!node.tilted_min_valid || !node.short_snapshot.valid) return;
+                            if (aw_qshrink_blocked) {
+                                node.aw_gap_persist_start_us = 0; // reset timer during qshrink
+                                return;
+                            }
+                            const double p10 = node.short_snapshot.p10;
+                            const double gap = p10 - node.effective_min_us;
+                            const double jitter = GuardJitter(node, method);
+                            const double shrink_thresh = std::max(method.policy_tilted_shrink_gap_min_us,
+                                method.policy_tilted_shrink_gap_k * jitter);
+                            const double grow_thresh = method.policy_tilted_grow_gap_k * jitter;
+                            uint64_t cur_window = node.tilted_bins.window_us;
+                            if (gap > shrink_thresh) {
+                                // Track how long the gap has persisted
+                                if (node.aw_gap_persist_start_us == 0) {
+                                    node.aw_gap_persist_start_us = now_us;
+                                }
+                                const uint64_t persist_dur = now_us - node.aw_gap_persist_start_us;
+                                // Ramp gate: only shrink when p10 is consistently rising
+                                const bool ramp_ok = method.policy_aw_require_ramp_streak <= 0 ||
+                                    node.ramp_rising_streak >= method.policy_aw_require_ramp_streak;
+                                // Only shrink after gap has persisted long enough
+                                if (ramp_ok && persist_dur >= method.policy_tilted_shrink_delay_us &&
+                                    cur_window > method.policy_tilted_min_window_us) {
+                                    uint64_t new_window = (cur_window > method.policy_tilted_shrink_step_us)
+                                        ? cur_window - method.policy_tilted_shrink_step_us
+                                        : method.policy_tilted_min_window_us;
+                                    new_window = std::max(new_window, method.policy_tilted_min_window_us);
+                                    node.tilted_bins.Reset(new_window);
+                                    // Re-seed with current p10 to avoid empty bins
+                                    const double skew_ppm = node.cse_skew_valid ? node.cse_skew_ppm : 0.0;
+                                    const double r_dir = -skew_ppm;
+                                    const double t_s = (double)now_us * 1e-6;
+                                    node.tilted_bins.Update(now_us, p10 - r_dir * t_s);
+                                }
+                            } else {
+                                // Gap below threshold - reset persistence timer
+                                node.aw_gap_persist_start_us = 0;
+                                if (gap < grow_thresh && cur_window < method.policy_tilted_max_window_us) {
+                                    uint64_t new_window = cur_window + method.policy_tilted_grow_step_us;
+                                    new_window = std::min(new_window, method.policy_tilted_max_window_us);
+                                    node.tilted_bins.Reset(new_window);
+                                }
+                            }
+                        };
+                        adapt_window(node_a);
+                        adapt_window(node_b);
+                    }
+
+                    // Policy tilted stale detection: compare p10 to tilted candidate,
+                    // reset tilted_bins when stale + stable + enough samples.
+                    // Simpler than UpdateShadowPromotion (avoids AllowPromotionRate / rtt_guard
+                    // issues that don't apply in the Policy context where effective_min_time_us
+                    // is always now_us).
+                    if (method.policy_tilted_use_gsp && method.policy_use_tilted) {
+                        // Block GSP when qshrink hold is active (qshrink already handles the step)
+                        const bool qshrink_active = method.policy_gsp_block_during_qshrink &&
+                            (node_a.drift_window_restore_us > 0 || node_b.drift_window_restore_us > 0);
+                        auto policy_gsp_check = [&](NodeState& node) -> bool {
+                            if (qshrink_active) { node.gsp_stale_streak = 0; return false; }
+                            if (!node.tilted_min_valid || !node.short_snapshot.valid) return false;
+                            const double p10 = node.short_snapshot.p10;
+                            const double iqr = node.short_snapshot.iqr;
+                            const size_t count = node.short_snapshot.count;
+                            const double jitter = GuardJitter(node, method);
+                            const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                            const double iqr_max = std::max(method.gsp_iqr_min_us, method.gsp_iqr_k * jitter);
+                            const double gap = p10 - node.effective_min_us;
+                            const bool stale = (gap > gb);
+                            const bool big_enough_gap = (method.policy_gsp_min_gap_us <= 0.0 ||
+                                gap >= method.policy_gsp_min_gap_us);
+                            const bool stable = method.policy_gsp_skip_stable || (iqr <= iqr_max);
+                            const bool enough = (count >= method.gsp_npkt_min);
+                            // min_age: tilted minimum hasn't been refreshed recently
+                            // After a step change, no new packets reach the old minimum,
+                            // so tilted_min_time_us becomes old. During normal operation,
+                            // packets regularly reach the minimum, keeping it fresh.
+                            const bool min_old = (method.gsp_age_ok_us == 0) ||
+                                (now_us > node.tilted_min_time_us &&
+                                 (now_us - node.tilted_min_time_us) >= method.gsp_age_ok_us);
+                            if (stale && big_enough_gap && stable && enough && min_old) {
+                                node.gsp_stale_streak++;
+                            } else {
+                                node.gsp_stale_streak = 0;
+                            }
+                            if (node.gsp_stale_streak >= std::max(1, method.gsp_n_consec)) {
+                                node.gsp_stale_streak = 0;
+                                node.gsp_promotions++;
+                                return true;
+                            }
+                            return false;
+                        };
+                        bool gsp_reset_any = false;
+                        if (policy_gsp_check(node_a)) {
+                            const double skew_ppm = node_a.cse_skew_valid ? node_a.cse_skew_ppm : 0.0;
+                            ApplyTiltedStepReset(node_a, now_us, node_a.short_snapshot.p10, skew_ppm);
+                            gsp_reset_any = true;
+                        }
+                        if (policy_gsp_check(node_b)) {
+                            const double skew_ppm = node_b.cse_skew_valid ? node_b.cse_skew_ppm : 0.0;
+                            ApplyTiltedStepReset(node_b, now_us, node_b.short_snapshot.p10, skew_ppm);
+                            gsp_reset_any = true;
+                        }
+                        if (gsp_reset_any) {
+                            UpdateAlgoOffset(node_a, now_us);
+                            UpdateAlgoOffset(node_b, now_us);
+                        }
+                    }
+                    // M2: Tilted-mode near-stale reset (detect stale tilted via near_hits=0)
+                    if (method.policy_tilted_near_stale_reset && method.policy_use_tilted) {
+                        const bool qshrink_active =
+                            (node_a.drift_window_restore_us > 0 || node_b.drift_window_restore_us > 0);
+                        if (!qshrink_active) {
+                            bool tnsr_reset_any = false;
+                            if (DetectTiltedNearStale(node_a, method, now_us)) {
+                                const double skew_ppm = node_a.cse_skew_valid ? node_a.cse_skew_ppm : 0.0;
+                                ApplyTiltedStepReset(node_a, now_us, node_a.short_snapshot.p10, skew_ppm);
+                                node_a.tilted_near_stale_streak = 0;
+                                tnsr_reset_any = true;
+                            }
+                            if (DetectTiltedNearStale(node_b, method, now_us)) {
+                                const double skew_ppm = node_b.cse_skew_valid ? node_b.cse_skew_ppm : 0.0;
+                                ApplyTiltedStepReset(node_b, now_us, node_b.short_snapshot.p10, skew_ppm);
+                                node_b.tilted_near_stale_streak = 0;
+                                tnsr_reset_any = true;
+                            }
+                            if (tnsr_reset_any) {
+                                UpdateAlgoOffset(node_a, now_us);
+                                UpdateAlgoOffset(node_b, now_us);
+                            }
+                        }
+                    }
+                    // Restore window after qshrink hold expires
+                    auto policy_restore_window = [&](NodeState& node) {
+                        if (node.drift_window_restore_us > 0 && now_us >= node.drift_window_restore_us) {
+                            const uint64_t window_us = (method.window_us > 0) ? method.window_us : 2000000ULL;
+                            node.drift_window_us = window_us;
+                            node.timesync.SetDriftWindowUsec(window_us);
+                            node.drift_window_restore_us = 0;
+                        }
+                    };
+                    policy_restore_window(node_a);
+                    policy_restore_window(node_b);
                     UpdateAlgoOffset(node_a, now_us);
                     UpdateAlgoOffset(node_b, now_us);
                 } else if (method.kind == MethodKind::TimeSyncStateMachine) {
@@ -9227,6 +9893,36 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
         node_a.local_env.samples.size() + node_b.local_env.samples.size()) * sizeof(OffsetSample);
     metrics.cpu_ops = (double)(metrics.ab.sent + metrics.ba.sent + metrics.ab.received + metrics.ba.received);
 
+    // Debug: dump mode distribution for r14_ variants
+    if (method.kind == MethodKind::TimeSyncPolicy &&
+        (method.variant_name.find("r14_") == 0 || method.variant_name.find("robust") == 0)) {
+        static const char* mode_names[] = {"multi", "quantile", "tilted", "decay", "?4", "?5", "?6", "?7"};
+        auto dump_modes = [&](const char* label, const NodeState& node) {
+            uint64_t total = 0;
+            for (int i = 0; i < 8; i++) total += node.policy_mode_ticks[i];
+            if (total == 0) return;
+            fprintf(stderr, "  [%s] %s %s: ", scenario.name.c_str(), method.variant_name.c_str(), label);
+            for (int i = 0; i < 8; i++) {
+                if (node.policy_mode_ticks[i] > 0) {
+                    fprintf(stderr, "%s=%.1f%% ", mode_names[i],
+                        100.0 * node.policy_mode_ticks[i] / total);
+                }
+            }
+            double nr = (node.short_snapshot.valid && node.short_snapshot.count > 0)
+                ? (double)node.short_snapshot.near_hits / (double)node.short_snapshot.count : -1.0;
+            fprintf(stderr, "(sw=%lu dw=%lu qstreak=%d emin=%.1f near=%.3f nhits=%zu cnt=%zu)\n",
+                (unsigned long)node.policy_switches,
+                (unsigned long)node.timesync.GetDriftWindowUsec(),
+                node.quantile_near_stale_streak,
+                node.effective_min_us,
+                nr,
+                node.short_snapshot.near_hits,
+                node.short_snapshot.count);
+        };
+        dump_modes("A(recv_BA)", node_a);
+        dump_modes("B(recv_AB)", node_b);
+    }
+
     return metrics;
 }
 
@@ -9332,6 +10028,12 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
             : 200000;
         node_a.timesync_short.SetDriftWindowUsec(short_window_us);
         node_b.timesync_short.SetDriftWindowUsec(short_window_us);
+    }
+
+    // Set timesync drift window for Policy methods (default is 10s, but method.window_us may differ)
+    if (method.kind == MethodKind::TimeSyncPolicy && method.window_us > 0) {
+        node_a.timesync.SetDriftWindowUsec(method.window_us);
+        node_b.timesync.SetDriftWindowUsec(method.window_us);
     }
 
     if (UsesTimeSyncCore(method.kind)) {
@@ -9488,6 +10190,29 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
                 recv_node.effective_min_valid = prev_valid;
                 recv_node.peer_min_us = prev_peer;
                 recv_node.peer_min_valid = prev_peer_valid;
+                if ((method.policy_per_packet_min || method.policy_per_packet_fresh || method.policy_per_packet_up || method.policy_per_packet_fresh_quantile) && prev_valid) {
+                    PolicyCandidate fresh = PolicyQuantileCandidate(recv_node);
+                    if (fresh.valid) {
+                        bool accept = false;
+                        if (method.policy_per_packet_fresh) accept = true;
+                        else if (method.policy_per_packet_fresh_quantile && recv_node.policy_mode == kPolicyModeQuantile) accept = true;
+                        else if (method.policy_per_packet_up && fresh.min_us > prev_min) accept = true;
+                        else if (method.policy_per_packet_min && fresh.min_us < prev_min) accept = true;
+                        // M1: Jitter floor clamp - prevent extreme lows during heavy-tail
+                        if (accept && method.policy_jitter_floor && recv_node.policy_jitter_floor_active &&
+                            recv_node.short_snapshot.valid && fresh.min_us < recv_node.short_snapshot.p5) {
+                            fresh.min_us = recv_node.short_snapshot.p5;
+                        }
+                        if (accept) {
+                            recv_node.effective_min_us = fresh.min_us;
+                            recv_node.effective_min_time_us = now_us;
+                        }
+                        if (method.policy_per_packet_peer && fresh.peer_min_us > 0) {
+                            recv_node.peer_min_us = fresh.peer_min_us;
+                            recv_node.peer_min_valid = true;
+                        }
+                    }
+                }
             } else if (method.kind == MethodKind::TimeSyncDDAC) {
                 // DD-AC updates effective mins on the 1 Hz tick.
             } else if (EnsureEffectiveMin(recv_node) && delta_us < recv_node.effective_min_us) {
@@ -9496,7 +10221,8 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
                 recv_node.effective_min_valid = true;
             }
             UpdateAlgoOffset(recv_node, now_us);
-            if (recv_node.algo_offset_valid) {
+            if (recv_node.algo_offset_valid ||
+                (method.policy_use_library_offset && recv_node.timesync.IsSynchronized())) {
                 MaybeSetSyncTime(true, now_us, recv_node.synced, recv_node.sync_time_us);
             }
             return;
@@ -9669,9 +10395,11 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
             NodeState& recv_node = to_b ? node_b : node_a;
             NodeState& send_node = to_b ? node_a : node_b;
             DirectionMetrics& dm = to_b ? metrics.ab : metrics.ba;
+            DelayModel& dmodel_recv = to_b ? delay_ab : delay_ba;
             (void)send_node;
 
-            const uint64_t local_recv = ComputeLocalTimeUsec(now_us, recv_node.clock, rng, true);
+            const uint64_t local_recv = ComputeLocalTimeUsec(now_us, recv_node.clock, rng, true)
+                + dmodel_recv.SampleSchedJitter(rng);
             const uint64_t true_local_now = ComputeLocalTimeUsec(now_us, recv_node.clock, rng, false);
             const uint64_t true_remote_now = ComputeLocalTimeUsec(now_us, send_node.clock, rng, false);
             const double true_offset = (double)true_remote_now - (double)true_local_now;
@@ -9727,8 +10455,12 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
                         recv_node.peer_min_raw_valid = true;
                         recv_node.peer_min_us = peer_min_raw;
                         recv_node.peer_min_valid = true;
+                        if (method.policy_use_library_offset) {
+                            recv_node.timesync.OnPeerMinDeltaTS24(ev.msg.min_delta);
+                        }
                         UpdateAlgoOffset(recv_node, now_us);
-                        if (recv_node.algo_offset_valid) {
+                        if (recv_node.algo_offset_valid ||
+                            (method.policy_use_library_offset && recv_node.timesync.IsSynchronized())) {
                             MaybeSetSyncTime(true, now_us, recv_node.synced, recv_node.sync_time_us);
                         }
                         continue;
@@ -10401,7 +11133,253 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
                     UpdateAlgoOffset(node_a, now_us);
                     UpdateAlgoOffset(node_b, now_us);
                 } else if (method.kind == MethodKind::TimeSyncPolicy) {
+                    // Initialize drift_window_us on first tick (library defaults to 10s)
+                    auto policy_init_window = [&](NodeState& node) {
+                        if (node.drift_window_us == 0) {
+                            const uint64_t window_us = (method.window_us > 0) ? method.window_us : 2000000ULL;
+                            node.drift_window_us = window_us;
+                            node.timesync.SetDriftWindowUsec(window_us);
+                        }
+                    };
+                    policy_init_window(node_a);
+                    policy_init_window(node_b);
+                    // Save restore timestamps to detect qshrink firing
+                    const uint64_t prev_restore_a = node_a.drift_window_restore_us;
+                    const uint64_t prev_restore_b = node_b.drift_window_restore_us;
                     UpdateTimeSyncPolicy(node_a, node_b, now_us, method, guard_ok, rtt_ready, rtt_delta);
+                    // Track mode distribution
+                    if (node_a.policy_mode >= 0 && node_a.policy_mode < 8) node_a.policy_mode_ticks[node_a.policy_mode]++;
+                    if (node_b.policy_mode >= 0 && node_b.policy_mode < 8) node_b.policy_mode_ticks[node_b.policy_mode]++;
+                    // M1: Update jitter floor hysteresis
+                    UpdatePolicyJitterFloor(node_a, method);
+                    UpdatePolicyJitterFloor(node_b, method);
+                    // M4: Update sign coherence tracking
+                    UpdatePolicySignCoherence(node_a, method);
+                    UpdatePolicySignCoherence(node_b, method);
+                    // M5: Ramp correction - detect p10 slope and adjust effective_min
+                    if (method.policy_ramp_correction) {
+                        // Helper: record p10 and compute slope for a node
+                        auto compute_slope = [&](NodeState& node) -> double {
+                            if (!node.short_snapshot.valid || !node.tilted_min_valid) return 0.0;
+                            node.p10_ring[node.p10_ring_idx % 16] = node.short_snapshot.p10;
+                            node.p10_ring_idx = (node.p10_ring_idx + 1) % 16;
+                            if (node.p10_ring_count < 16) node.p10_ring_count++;
+                            const int win = std::min(method.policy_ramp_slope_window, node.p10_ring_count);
+                            if (win < 5) return 0.0;
+                            const int old_idx = ((node.p10_ring_idx - win) % 16 + 16) % 16;
+                            return (node.short_snapshot.p10 - node.p10_ring[old_idx]) / (double)win;
+                        };
+                        const double slope_a = compute_slope(node_a);
+                        const double slope_b = compute_slope(node_b);
+                        // Bilateral check: both directions must have positive slope above threshold
+                        const bool slope_a_ok = slope_a > method.policy_ramp_slope_threshold;
+                        const bool slope_b_ok = slope_b > method.policy_ramp_slope_threshold;
+                        const bool bilateral_ok = !method.policy_ramp_bilateral || (slope_a_ok && slope_b_ok);
+                        auto ramp_apply = [&](NodeState& node, double slope) {
+                            if (slope > method.policy_ramp_slope_threshold && bilateral_ok) {
+                                const double min_age_s = (double)(now_us - node.tilted_min_time_us) * 1e-6;
+                                if (min_age_s > 0.0) {
+                                    const double correction = slope * min_age_s * method.policy_ramp_correction_alpha;
+                                    node.effective_min_us += correction;
+                                    UpdateAlgoOffset(node, now_us);
+                                }
+                            }
+                        };
+                        ramp_apply(node_a, slope_a);
+                        ramp_apply(node_b, slope_b);
+                    }
+                    // Reset tilted_bins when qshrink fires (detected by restore timestamp advancing)
+                    if (method.policy_tilted_reset_on_qshrink && method.policy_use_tilted) {
+                        auto policy_tilted_reset = [&](NodeState& node, uint64_t prev_restore) {
+                            if (node.drift_window_restore_us > prev_restore && node.short_snapshot.valid) {
+                                const double skew_ppm = node.cse_skew_valid ? node.cse_skew_ppm : 0.0;
+                                ApplyTiltedStepReset(node, now_us, node.short_snapshot.p10, skew_ppm);
+                            }
+                        };
+                        policy_tilted_reset(node_a, prev_restore_a);
+                        policy_tilted_reset(node_b, prev_restore_b);
+                    }
+                    // M3: RTT-adaptive tilted window shrink
+                    if (method.policy_rtt_tilted_shrink && method.policy_use_tilted && rtt_ready) {
+                        auto rtt_shrink_check = [&](NodeState& node) {
+                            if (!node.tilted_min_valid || !node.short_snapshot.valid) return;
+                            // During active hold, check if expired and restore
+                            if (node.rtt_tilted_shrink_until_us > 0 && now_us < node.rtt_tilted_shrink_until_us) return;
+                            if (node.rtt_tilted_shrink_until_us > 0 && now_us >= node.rtt_tilted_shrink_until_us) {
+                                node.rtt_tilted_shrink_until_us = 0;
+                                if (node.rtt_tilted_shrink_orig_window_us > 0) {
+                                    node.tilted_bins.Reset(node.rtt_tilted_shrink_orig_window_us);
+                                    node.rtt_tilted_shrink_orig_window_us = 0;
+                                }
+                            }
+                            // Check RTT delta threshold
+                            if (std::fabs(rtt_delta) >= method.policy_rtt_tilted_shrink_delta_us) {
+                                const uint64_t cur_window = node.tilted_bins.window_us;
+                                const uint64_t target = method.policy_rtt_tilted_shrink_window_us;
+                                if (cur_window > target) {
+                                    node.rtt_tilted_shrink_orig_window_us = cur_window;
+                                    node.tilted_bins.Reset(target);
+                                    const double skew_ppm = node.cse_skew_valid ? node.cse_skew_ppm : 0.0;
+                                    const double r_dir = -skew_ppm;
+                                    const double t_s = (double)now_us * 1e-6;
+                                    node.tilted_bins.Update(now_us, node.short_snapshot.p10 - r_dir * t_s);
+                                    node.rtt_tilted_shrink_until_us = now_us + method.policy_rtt_tilted_shrink_hold_us;
+                                }
+                            }
+                        };
+                        rtt_shrink_check(node_a);
+                        rtt_shrink_check(node_b);
+                    }
+                    // Adaptive tilted window: shrink when gap persists (stale bias),
+                    // grow back when gap is small. Uses persistence timer to avoid
+                    // shrinking during transient step changes. Blocked during qshrink hold.
+                    if (method.policy_tilted_adaptive_window && method.policy_use_tilted) {
+                        const bool aw_qshrink_blocked = method.policy_aw_block_during_qshrink &&
+                            (node_a.drift_window_restore_us > 0 || node_b.drift_window_restore_us > 0);
+                        auto adapt_window = [&](NodeState& node) {
+                            if (!node.tilted_min_valid || !node.short_snapshot.valid) return;
+                            if (aw_qshrink_blocked) {
+                                node.aw_gap_persist_start_us = 0; // reset timer during qshrink
+                                return;
+                            }
+                            const double p10 = node.short_snapshot.p10;
+                            const double gap = p10 - node.effective_min_us;
+                            const double jitter = GuardJitter(node, method);
+                            const double shrink_thresh = std::max(method.policy_tilted_shrink_gap_min_us,
+                                method.policy_tilted_shrink_gap_k * jitter);
+                            const double grow_thresh = method.policy_tilted_grow_gap_k * jitter;
+                            uint64_t cur_window = node.tilted_bins.window_us;
+                            if (gap > shrink_thresh) {
+                                // Track how long the gap has persisted
+                                if (node.aw_gap_persist_start_us == 0) {
+                                    node.aw_gap_persist_start_us = now_us;
+                                }
+                                const uint64_t persist_dur = now_us - node.aw_gap_persist_start_us;
+                                // Ramp gate: only shrink when p10 is consistently rising
+                                const bool ramp_ok = method.policy_aw_require_ramp_streak <= 0 ||
+                                    node.ramp_rising_streak >= method.policy_aw_require_ramp_streak;
+                                // Only shrink after gap has persisted long enough
+                                if (ramp_ok && persist_dur >= method.policy_tilted_shrink_delay_us &&
+                                    cur_window > method.policy_tilted_min_window_us) {
+                                    uint64_t new_window = (cur_window > method.policy_tilted_shrink_step_us)
+                                        ? cur_window - method.policy_tilted_shrink_step_us
+                                        : method.policy_tilted_min_window_us;
+                                    new_window = std::max(new_window, method.policy_tilted_min_window_us);
+                                    node.tilted_bins.Reset(new_window);
+                                    // Re-seed with current p10 to avoid empty bins
+                                    const double skew_ppm = node.cse_skew_valid ? node.cse_skew_ppm : 0.0;
+                                    const double r_dir = -skew_ppm;
+                                    const double t_s = (double)now_us * 1e-6;
+                                    node.tilted_bins.Update(now_us, p10 - r_dir * t_s);
+                                }
+                            } else {
+                                // Gap below threshold - reset persistence timer
+                                node.aw_gap_persist_start_us = 0;
+                                if (gap < grow_thresh && cur_window < method.policy_tilted_max_window_us) {
+                                    uint64_t new_window = cur_window + method.policy_tilted_grow_step_us;
+                                    new_window = std::min(new_window, method.policy_tilted_max_window_us);
+                                    node.tilted_bins.Reset(new_window);
+                                }
+                            }
+                        };
+                        adapt_window(node_a);
+                        adapt_window(node_b);
+                    }
+
+                    // Policy tilted stale detection: compare p10 to tilted candidate,
+                    // reset tilted_bins when stale + stable + enough samples.
+                    // Simpler than UpdateShadowPromotion (avoids AllowPromotionRate / rtt_guard
+                    // issues that don't apply in the Policy context where effective_min_time_us
+                    // is always now_us).
+                    if (method.policy_tilted_use_gsp && method.policy_use_tilted) {
+                        // Block GSP when qshrink hold is active (qshrink already handles the step)
+                        const bool qshrink_active = method.policy_gsp_block_during_qshrink &&
+                            (node_a.drift_window_restore_us > 0 || node_b.drift_window_restore_us > 0);
+                        auto policy_gsp_check = [&](NodeState& node) -> bool {
+                            if (qshrink_active) { node.gsp_stale_streak = 0; return false; }
+                            if (!node.tilted_min_valid || !node.short_snapshot.valid) return false;
+                            const double p10 = node.short_snapshot.p10;
+                            const double iqr = node.short_snapshot.iqr;
+                            const size_t count = node.short_snapshot.count;
+                            const double jitter = GuardJitter(node, method);
+                            const double gb = std::max(method.gsp_guard_min_us, method.gsp_guard_k * jitter);
+                            const double iqr_max = std::max(method.gsp_iqr_min_us, method.gsp_iqr_k * jitter);
+                            const double gap = p10 - node.effective_min_us;
+                            const bool stale = (gap > gb);
+                            const bool big_enough_gap = (method.policy_gsp_min_gap_us <= 0.0 ||
+                                gap >= method.policy_gsp_min_gap_us);
+                            const bool stable = method.policy_gsp_skip_stable || (iqr <= iqr_max);
+                            const bool enough = (count >= method.gsp_npkt_min);
+                            // min_age: tilted minimum hasn't been refreshed recently
+                            // After a step change, no new packets reach the old minimum,
+                            // so tilted_min_time_us becomes old. During normal operation,
+                            // packets regularly reach the minimum, keeping it fresh.
+                            const bool min_old = (method.gsp_age_ok_us == 0) ||
+                                (now_us > node.tilted_min_time_us &&
+                                 (now_us - node.tilted_min_time_us) >= method.gsp_age_ok_us);
+                            if (stale && big_enough_gap && stable && enough && min_old) {
+                                node.gsp_stale_streak++;
+                            } else {
+                                node.gsp_stale_streak = 0;
+                            }
+                            if (node.gsp_stale_streak >= std::max(1, method.gsp_n_consec)) {
+                                node.gsp_stale_streak = 0;
+                                node.gsp_promotions++;
+                                return true;
+                            }
+                            return false;
+                        };
+                        bool gsp_reset_any = false;
+                        if (policy_gsp_check(node_a)) {
+                            const double skew_ppm = node_a.cse_skew_valid ? node_a.cse_skew_ppm : 0.0;
+                            ApplyTiltedStepReset(node_a, now_us, node_a.short_snapshot.p10, skew_ppm);
+                            gsp_reset_any = true;
+                        }
+                        if (policy_gsp_check(node_b)) {
+                            const double skew_ppm = node_b.cse_skew_valid ? node_b.cse_skew_ppm : 0.0;
+                            ApplyTiltedStepReset(node_b, now_us, node_b.short_snapshot.p10, skew_ppm);
+                            gsp_reset_any = true;
+                        }
+                        if (gsp_reset_any) {
+                            UpdateAlgoOffset(node_a, now_us);
+                            UpdateAlgoOffset(node_b, now_us);
+                        }
+                    }
+                    // M2: Tilted-mode near-stale reset (detect stale tilted via near_hits=0)
+                    if (method.policy_tilted_near_stale_reset && method.policy_use_tilted) {
+                        const bool qshrink_active =
+                            (node_a.drift_window_restore_us > 0 || node_b.drift_window_restore_us > 0);
+                        if (!qshrink_active) {
+                            bool tnsr_reset_any = false;
+                            if (DetectTiltedNearStale(node_a, method, now_us)) {
+                                const double skew_ppm = node_a.cse_skew_valid ? node_a.cse_skew_ppm : 0.0;
+                                ApplyTiltedStepReset(node_a, now_us, node_a.short_snapshot.p10, skew_ppm);
+                                node_a.tilted_near_stale_streak = 0;
+                                tnsr_reset_any = true;
+                            }
+                            if (DetectTiltedNearStale(node_b, method, now_us)) {
+                                const double skew_ppm = node_b.cse_skew_valid ? node_b.cse_skew_ppm : 0.0;
+                                ApplyTiltedStepReset(node_b, now_us, node_b.short_snapshot.p10, skew_ppm);
+                                node_b.tilted_near_stale_streak = 0;
+                                tnsr_reset_any = true;
+                            }
+                            if (tnsr_reset_any) {
+                                UpdateAlgoOffset(node_a, now_us);
+                                UpdateAlgoOffset(node_b, now_us);
+                            }
+                        }
+                    }
+                    // Restore window after qshrink hold expires
+                    auto policy_restore_window = [&](NodeState& node) {
+                        if (node.drift_window_restore_us > 0 && now_us >= node.drift_window_restore_us) {
+                            const uint64_t window_us = (method.window_us > 0) ? method.window_us : 2000000ULL;
+                            node.drift_window_us = window_us;
+                            node.timesync.SetDriftWindowUsec(window_us);
+                            node.drift_window_restore_us = 0;
+                        }
+                    };
+                    policy_restore_window(node_a);
+                    policy_restore_window(node_b);
                     UpdateAlgoOffset(node_a, now_us);
                     UpdateAlgoOffset(node_b, now_us);
                 } else if (method.kind == MethodKind::TimeSyncStateMachine) {
@@ -13486,6 +14464,71 @@ static std::vector<ScenarioConfig> BuildScenarios()
         cfg.delay_ab.markov_jitter_high_us = 6000;
         cfg.delay_ba.markov_jitter_low_us = 1500;
         cfg.delay_ba.markov_jitter_high_us = 6000;
+        sc.push_back(cfg);
+    }
+
+    // E155 Gaming: high-rate 120Hz, low latency, tight jitter
+    {
+        ScenarioConfig cfg = BaseScenario("E155_gaming_120hz");
+        cfg.send_rate_hz = 120.0;
+        cfg.delay_ab.base_delay_us = 5000;
+        cfg.delay_ba.base_delay_us = 5000;
+        cfg.delay_ab.jitter_us = 500;
+        cfg.delay_ba.jitter_us = 500;
+        cfg.recv_noise_us = 100;
+        sc.push_back(cfg);
+    }
+
+    // E156 VPN tunnel: extra encapsulation latency + jitter
+    {
+        ScenarioConfig cfg = BaseScenario("E156_vpn_tunnel");
+        cfg.delay_ab.base_delay_us = 40000;
+        cfg.delay_ba.base_delay_us = 40000;
+        cfg.delay_ab.jitter_us = 8000;
+        cfg.delay_ba.jitter_us = 8000;
+        cfg.delay_ab.spike_prob = 0.005;
+        cfg.delay_ba.spike_prob = 0.005;
+        cfg.delay_ab.spike_delay_us = 100000;
+        cfg.delay_ba.spike_delay_us = 100000;
+        cfg.recv_noise_us = 200;
+        sc.push_back(cfg);
+    }
+
+    // E157 Scheduling jitter + clock drift
+    {
+        ScenarioConfig cfg = BaseScenario("E157_sched_jitter_drift");
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 2000;
+        cfg.delay_ba.jitter_us = 2000;
+        cfg.delay_ab.sched_jitter_us = 1000;
+        cfg.delay_ba.sched_jitter_us = 1000;
+        cfg.drift_ppm_a = 50.0;
+        cfg.drift_ppm_b = -30.0;
+        sc.push_back(cfg);
+    }
+
+    // E153 OS scheduling jitter (moderate CPU load)
+    {
+        ScenarioConfig cfg = BaseScenario("E153_sched_jitter_moderate");
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 2000;
+        cfg.delay_ba.jitter_us = 2000;
+        cfg.delay_ab.sched_jitter_us = 500;
+        cfg.delay_ba.sched_jitter_us = 500;
+        sc.push_back(cfg);
+    }
+
+    // E154 OS scheduling jitter (heavy CPU load, asymmetric)
+    {
+        ScenarioConfig cfg = BaseScenario("E154_sched_jitter_heavy_asym");
+        cfg.delay_ab.base_delay_us = 20000;
+        cfg.delay_ba.base_delay_us = 20000;
+        cfg.delay_ab.jitter_us = 3000;
+        cfg.delay_ba.jitter_us = 3000;
+        cfg.delay_ab.sched_jitter_us = 2000;
+        cfg.delay_ba.sched_jitter_us = 200;
         sc.push_back(cfg);
     }
 
@@ -17319,7 +18362,1318 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
         qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08.policy_skew_max_ppm = 600.0;
         qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08.policy_skew_iqr_max_us = 100000.0;
         qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08.policy_skew_beta = 0.08;
+        // Policy GSP: detect stale tilted_bins via gap > 200K, reset immediately (no age/IQR gate)
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08.policy_tilted_use_gsp = true;
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08.policy_gsp_skip_stable = true;
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08.gsp_n_consec = 1;
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08.gsp_age_ok_us = 0;
+        qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08.policy_gsp_min_gap_us = 200000.0;
         add(qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08);
+
+        // ============================================================
+        // 32 creative variants exploring diverse parameter dimensions
+        // Base: qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08
+        // ============================================================
+        #define RV(NAME) \
+            { MethodConfig v = qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08; \
+              v.variant_name = "robust_" NAME;
+
+        // --- Round 2: Refining short500ms winner + combinations ---
+        // short500ms had 3.49x max ratio (vs base 4.89x), 13.8% better geomean
+        // Regressions on slow congestion (E51, E46, E57, E72, E80, E100)
+
+        // S1: Explore nearby short windows - 250ms
+        RV("s250ms")
+            v.stats_short_window_us = 250000;
+            add(v); }
+
+        // S2: 350ms
+        RV("s350ms")
+            v.stats_short_window_us = 350000;
+            add(v); }
+
+        // S3: 400ms
+        RV("s400ms")
+            v.stats_short_window_us = 400000;
+            add(v); }
+
+        // S4: 500ms (re-confirm baseline)
+        RV("s500ms")
+            v.stats_short_window_us = 500000;
+            add(v); }
+
+        // S5: 600ms
+        RV("s600ms")
+            v.stats_short_window_us = 600000;
+            add(v); }
+
+        // S6: 750ms
+        RV("s750ms")
+            v.stats_short_window_us = 750000;
+            add(v); }
+
+        // S7: 500ms + per-packet min (combine two winners)
+        RV("s500_pktmin")
+            v.stats_short_window_us = 500000;
+            v.policy_per_packet_min = true;
+            add(v); }
+
+        // S8: 500ms + vfast switch (combine two winners)
+        RV("s500_vfswitch")
+            v.stats_short_window_us = 500000;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            add(v); }
+
+        // S9: 500ms + quantile prefers low near
+        RV("s500_qpref")
+            v.stats_short_window_us = 500000;
+            v.policy_quantile_prefer_low_near = true;
+            add(v); }
+
+        // S10: 500ms + faster skew (help congestion tracking)
+        RV("s500_fskew")
+            v.stats_short_window_us = 500000;
+            v.policy_skew_beta = 0.15;
+            v.policy_skew_window_us = 15000000;
+            add(v); }
+
+        // S11: 500ms + wider skew tolerance (congestion may cause rapid skew)
+        RV("s500_wskew")
+            v.stats_short_window_us = 500000;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            add(v); }
+
+        // S12: 500ms + higher IQR threshold (8k -> 15k, less mode switching during congestion)
+        RV("s500_hiqr")
+            v.stats_short_window_us = 500000;
+            v.policy_iqr_high_us = 15000.0;
+            add(v); }
+
+        // S13: 500ms + lower GSP gap (100K, catch smaller stale tilted values)
+        RV("s500_gsp100k")
+            v.stats_short_window_us = 500000;
+            v.policy_gsp_min_gap_us = 100000.0;
+            add(v); }
+
+        // S14: 500ms + pkt_min + vfast_switch (triple combo)
+        RV("s500_pk_vf")
+            v.stats_short_window_us = 500000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            add(v); }
+
+        // S15: 500ms + shorter tilted (30s, helps E113 but may hurt E108)
+        RV("s500_t30s")
+            v.stats_short_window_us = 500000;
+            v.stats_long_window_us = 30000000;
+            add(v); }
+
+        // S16: 500ms + all safe improvements (pkt_min + vfswitch + q_prefer)
+        RV("s500_allsafe")
+            v.stats_short_window_us = 500000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            add(v); }
+
+        // --- Round 3: Fine-tune 400-500ms sweet spot, attack E124 bottleneck ---
+
+        // T1-T4: Fine-grain short window sweep
+        RV("s420ms")
+            v.stats_short_window_us = 420000;
+            add(v); }
+
+        RV("s450ms")
+            v.stats_short_window_us = 450000;
+            add(v); }
+
+        RV("s475ms")
+            v.stats_short_window_us = 475000;
+            add(v); }
+
+        RV("s525ms")
+            v.stats_short_window_us = 525000;
+            add(v); }
+
+        // T5-T8: s500_allsafe base + tweaks targeting E124 bottleneck
+        // T5: allsafe + more min_samples (short window = fewer packets, need more robust p10)
+        RV("s500as_minpkt30")
+            v.stats_short_window_us = 500000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.policy_min_samples = 30;
+            add(v); }
+
+        // T6: allsafe + wider skew tolerance (cellular has rapid skew changes)
+        RV("s500as_wskew")
+            v.stats_short_window_us = 500000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            add(v); }
+
+        // T7: allsafe + lower near_ratio (0.10 = easier quantile entry)
+        RV("s500as_near10")
+            v.stats_short_window_us = 500000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.policy_near_ratio_low = 0.10;
+            add(v); }
+
+        // T8: allsafe + lower IQR high threshold (4K, more sensitive mode switching)
+        RV("s500as_iqr4k")
+            v.stats_short_window_us = 500000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.policy_iqr_high_us = 4000.0;
+            add(v); }
+
+        // T9-T12: s400ms base + safe improvements (best raw geomean from round 2)
+        RV("s400_pktmin")
+            v.stats_short_window_us = 400000;
+            v.policy_per_packet_min = true;
+            add(v); }
+
+        RV("s400_allsafe")
+            v.stats_short_window_us = 400000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            add(v); }
+
+        RV("s400_wskew")
+            v.stats_short_window_us = 400000;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            add(v); }
+
+        RV("s400_gsp100k")
+            v.stats_short_window_us = 400000;
+            v.policy_gsp_min_gap_us = 100000.0;
+            add(v); }
+
+        // T13-T16: Creative combos
+        // T13: allsafe + faster skew to track congestion better
+        RV("s500as_fskew")
+            v.stats_short_window_us = 500000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.policy_skew_beta = 0.15;
+            v.policy_skew_window_us = 15000000;
+            add(v); }
+
+        // T14: allsafe + wider near_miss detection (gnear=50 instead of 25)
+        RV("s500as_gnear50")
+            v.stats_short_window_us = 500000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_gnear_us = 50.0;
+            add(v); }
+
+        // T15: 450ms + allsafe (blend best window with best features)
+        RV("s450_allsafe")
+            v.stats_short_window_us = 450000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            add(v); }
+
+        // T16: allsafe + looser RTT guard (cellular may have high RTT variance)
+        RV("s500as_rttg50k")
+            v.stats_short_window_us = 500000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.rtt_guard_delta_us = 50000.0;
+            v.rtt_guard_iqr_us = 50000.0;
+            add(v); }
+
+        // --- Round 4: Combine best features, close congestion gap ---
+        // Winners: s400_wskew (3.35x best robustness), s450_allsafe (1.293 best geomean)
+        // Key: wskew helps robustness, allsafe helps geomean, 400-450ms is sweet spot
+
+        // U1: The hybrid - s400 + allsafe + wskew (combine both winners)
+        RV("s400_as_wskew")
+            v.stats_short_window_us = 400000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            add(v); }
+
+        // U2: s450 + wskew (best geomean window + best robustness feature)
+        RV("s450_wskew")
+            v.stats_short_window_us = 450000;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            add(v); }
+
+        // U3: s450 + allsafe + wskew (full combo at 450ms)
+        RV("s450_as_wskew")
+            v.stats_short_window_us = 450000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            add(v); }
+
+        // U4: s425ms + allsafe + wskew (split the difference)
+        RV("s425_as_wskew")
+            v.stats_short_window_us = 425000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            add(v); }
+
+        // U5: s400_wskew + gsp100k (lower GSP gap, catch smaller stale values)
+        RV("s400_wskew_gsp100k")
+            v.stats_short_window_us = 400000;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            v.policy_gsp_min_gap_us = 100000.0;
+            add(v); }
+
+        // U6: s400_as_wskew + faster skew (help congestion tracking)
+        RV("s400_asw_fskew")
+            v.stats_short_window_us = 400000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            v.policy_skew_beta = 0.15;
+            v.policy_skew_window_us = 15000000;
+            add(v); }
+
+        // U7: s400_as_wskew + higher IQR threshold (15K, less mode switching in congestion)
+        RV("s400_asw_hiqr")
+            v.stats_short_window_us = 400000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            v.policy_iqr_high_us = 15000.0;
+            add(v); }
+
+        // U8: s400_as_wskew + looser RTT guard (50K)
+        RV("s400_asw_rttg50k")
+            v.stats_short_window_us = 400000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            v.rtt_guard_delta_us = 50000.0;
+            v.rtt_guard_iqr_us = 50000.0;
+            add(v); }
+
+        // U9: s400_wskew + per-packet min (add the one missing safe feature)
+        RV("s400_wskew_pk")
+            v.stats_short_window_us = 400000;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            v.policy_per_packet_min = true;
+            add(v); }
+
+        // U10: s400_wskew + gnear50 (wider near-miss detection)
+        RV("s400_wskew_gn50")
+            v.stats_short_window_us = 400000;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            v.stats_gnear_us = 50.0;
+            add(v); }
+
+        // U11: s400_wskew + even wider skew (max=2000ppm)
+        RV("s400_vwskew")
+            v.stats_short_window_us = 400000;
+            v.policy_skew_max_ppm = 2000.0;
+            v.policy_skew_iqr_max_us = 300000.0;
+            add(v); }
+
+        // U12: s380ms + wskew (push window even shorter)
+        RV("s380_wskew")
+            v.stats_short_window_us = 380000;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            add(v); }
+
+        // U13: s400_as_wskew + min_samples=5 (fewer samples needed with short window)
+        RV("s400_asw_mp5")
+            v.stats_short_window_us = 400000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            v.policy_min_samples = 5;
+            add(v); }
+
+        // U14: s400_as_wskew + skew_min_ppm=5 (lower skew activation threshold)
+        RV("s400_asw_skmin5")
+            v.stats_short_window_us = 400000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            v.policy_skew_min_ppm = 5.0;
+            add(v); }
+
+        // U15: s400_as_wskew + qshrink hold 10s (longer protection during steps)
+        RV("s400_asw_qh10s")
+            v.stats_short_window_us = 400000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            v.quantile_flip_hold_us = 10000000;
+            add(v); }
+
+        // U16: s400_as_wskew + near_ratio=0.10 (easier quantile entry for cellular)
+        RV("s400_asw_near10")
+            v.stats_short_window_us = 400000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.policy_skew_max_ppm = 1000.0;
+            v.policy_skew_iqr_max_us = 200000.0;
+            v.policy_near_ratio_low = 0.10;
+            add(v); }
+
+        // --- Round 10: Fine-tune around s380as_tilt25s (7.946x) ---
+        // R9 breakthrough: s380as_tilt25s = 7.946x! Nearly perfect balance:
+        //   E100=7.95, E152=7.94, E108=7.49, E140=6.21
+        // 390ms jumps to 9.75x (E140), 370ms TBD. s400as_t25_sw2 = 8.128x also good.
+        // Strategy: fine sweep 365-385ms with tilt25s, try combos, test tilt24/26 with 380ms.
+
+        // ZA1-ZA5: Fine sweep short window around 380ms with tilt25s
+        RV("s365as_tilt25s")
+            v.stats_short_window_us = 365000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 25000000;
+            add(v); }
+
+        RV("s370as_tilt25s")
+            v.stats_short_window_us = 370000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 25000000;
+            add(v); }
+
+        RV("s375as_tilt25s")
+            v.stats_short_window_us = 375000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 25000000;
+            add(v); }
+
+        RV("s380as_tilt25s")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 25000000;
+            add(v); }
+
+        RV("s385as_tilt25s")
+            v.stats_short_window_us = 385000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 25000000;
+            add(v); }
+
+        // ZA6-ZA8: s380as with different tilted windows
+        RV("s380as_tilt24s")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 24000000;
+            add(v); }
+
+        RV("s380as_tilt26s")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 26000000;
+            add(v); }
+
+        RV("s380as_tilt27s")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 27000000;
+            add(v); }
+
+        // ZA9-ZA12: s380as_tilt25s combos
+        RV("s380as_t25_sw2")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 2;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 25000000;
+            add(v); }
+
+        RV("s380as_t25_qw1s")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 25000000;
+            v.window_us = 1000000;
+            add(v); }
+
+        RV("s380as_t25_mp40")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 25000000;
+            v.policy_min_samples = 40;
+            add(v); }
+
+        RV("s380as_t25_qreset")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 25000000;
+            v.policy_tilted_reset_on_qshrink = true;
+            add(v); }
+
+        // ZA13-ZA14: s375 and s370 with tilt24s (explore 2D space)
+        RV("s375as_tilt24s")
+            v.stats_short_window_us = 375000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 24000000;
+            add(v); }
+
+        RV("s370as_tilt24s")
+            v.stats_short_window_us = 370000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 24000000;
+            add(v); }
+
+        // ZA15-ZA16: Without allsafe (just pkt_min + tilt25s, to see if allsafe helps or hurts)
+        RV("s380pk_tilt25s")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.stats_long_window_us = 25000000;
+            add(v); }
+
+        RV("s380_tilt25s")
+            v.stats_short_window_us = 380000;
+            v.stats_long_window_us = 25000000;
+            add(v); }
+
+        // --- Round 14b: Guard threshold tuning for E72 ramp ---
+        // Raising rtt_guard_delta_us allows E72 (rtt_delta≈50k) to pass guard
+        // and enter normal mode selection where quantile is properly chosen.
+        RV("s380as_t25_qw1s_g60k")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 25000000;
+            v.window_us = 1000000;
+            v.rtt_guard_delta_us = 60000.0;
+            v.rtt_guard_iqr_us = 60000.0;
+            v.policy_rtt_step_us = 60000.0;
+            add(v); }
+
+        RV("s380as_t25_qw1s_g55k")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 25000000;
+            v.window_us = 1000000;
+            v.rtt_guard_delta_us = 55000.0;
+            v.rtt_guard_iqr_us = 55000.0;
+            v.policy_rtt_step_us = 55000.0;
+            add(v); }
+
+        RV("s380as_t25_qw1s_g50k")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 25000000;
+            v.window_us = 1000000;
+            v.rtt_guard_delta_us = 50000.0;
+            v.rtt_guard_iqr_us = 50000.0;
+            v.policy_rtt_step_us = 50000.0;
+            add(v); }
+
+        #undef RV
+
+        // --- Round 11: Four new mechanisms targeting bottleneck scenarios ---
+        // Base: s380as_t25_qw1s + g50k (best known config after R14 guard fix)
+        // M1=jitter floor, M2=tilted near-stale reset, M3=RTT tilted shrink, M4=sign coherence
+        #define R11(NAME) { MethodConfig v = qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08; \
+            v.variant_name = "r11_" NAME; \
+            v.stats_short_window_us = 380000; \
+            v.policy_per_packet_min = true; \
+            v.policy_switch_n = 1; \
+            v.policy_hold_us = 1000000; \
+            v.policy_quantile_prefer_low_near = true; \
+            v.stats_long_window_us = 25000000; \
+            v.window_us = 1000000; \
+            v.rtt_guard_delta_us = 50000.0; \
+            v.rtt_guard_iqr_us = 50000.0; \
+            v.policy_rtt_step_us = 50000.0;
+
+        // Slot 1: M1 alone (jitter floor, enter=200)
+        R11("floor_p5_200")
+            v.policy_jitter_floor = true;
+            v.policy_jitter_floor_enter_us = 200.0;
+            v.policy_jitter_floor_exit_us = 100.0;
+            v.policy_jitter_floor_iqr_enter_us = 400.0;
+            v.policy_jitter_floor_iqr_exit_us = 200.0;
+            add(v); }
+
+        // Slot 2: M1 aggressive (enter=100)
+        R11("floor_p5_100")
+            v.policy_jitter_floor = true;
+            v.policy_jitter_floor_enter_us = 100.0;
+            v.policy_jitter_floor_exit_us = 50.0;
+            v.policy_jitter_floor_iqr_enter_us = 200.0;
+            v.policy_jitter_floor_iqr_exit_us = 100.0;
+            add(v); }
+
+        // Slot 3: M2 alone (tilted near-stale reset, n=3)
+        R11("tnsr3")
+            v.policy_tilted_near_stale_reset = true;
+            v.policy_tilted_near_stale_n = 3;
+            add(v); }
+
+        // Slot 4: M2 aggressive (n=1)
+        R11("tnsr1")
+            v.policy_tilted_near_stale_reset = true;
+            v.policy_tilted_near_stale_n = 1;
+            add(v); }
+
+        // Slot 5: M3 alone (RTT shrink, delta=300)
+        R11("rtt300")
+            v.policy_rtt_tilted_shrink = true;
+            v.policy_rtt_tilted_shrink_delta_us = 300.0;
+            v.policy_rtt_tilted_shrink_window_us = 5000000;
+            v.policy_rtt_tilted_shrink_hold_us = 3000000;
+            add(v); }
+
+        // Slot 6: M3 sensitive (delta=200)
+        R11("rtt200")
+            v.policy_rtt_tilted_shrink = true;
+            v.policy_rtt_tilted_shrink_delta_us = 200.0;
+            v.policy_rtt_tilted_shrink_window_us = 5000000;
+            v.policy_rtt_tilted_shrink_hold_us = 3000000;
+            add(v); }
+
+        // Slot 7: M4 alone (sign coherence, n=3)
+        R11("sc3")
+            v.policy_sign_coherence = true;
+            v.policy_sign_coherence_n = 3;
+            v.policy_sign_coherence_min_delta_us = 25.0;
+            add(v); }
+
+        // Slot 8: M4 relaxed (n=2)
+        R11("sc2")
+            v.policy_sign_coherence = true;
+            v.policy_sign_coherence_n = 2;
+            v.policy_sign_coherence_min_delta_us = 25.0;
+            add(v); }
+
+        // Slot 9: M1+M2 combo
+        R11("floor_tnsr")
+            v.policy_jitter_floor = true;
+            v.policy_jitter_floor_enter_us = 200.0;
+            v.policy_jitter_floor_exit_us = 100.0;
+            v.policy_jitter_floor_iqr_enter_us = 400.0;
+            v.policy_jitter_floor_iqr_exit_us = 200.0;
+            v.policy_tilted_near_stale_reset = true;
+            v.policy_tilted_near_stale_n = 3;
+            add(v); }
+
+        // Slot 10: M1+M4 combo
+        R11("floor_sc")
+            v.policy_jitter_floor = true;
+            v.policy_jitter_floor_enter_us = 200.0;
+            v.policy_jitter_floor_exit_us = 100.0;
+            v.policy_jitter_floor_iqr_enter_us = 400.0;
+            v.policy_jitter_floor_iqr_exit_us = 200.0;
+            v.policy_sign_coherence = true;
+            v.policy_sign_coherence_n = 3;
+            v.policy_sign_coherence_min_delta_us = 25.0;
+            add(v); }
+
+        // Slot 11: M2+M4 combo
+        R11("tnsr_sc")
+            v.policy_tilted_near_stale_reset = true;
+            v.policy_tilted_near_stale_n = 3;
+            v.policy_sign_coherence = true;
+            v.policy_sign_coherence_n = 3;
+            v.policy_sign_coherence_min_delta_us = 25.0;
+            add(v); }
+
+        // Slot 12: M1+M2+M4 (all safe mechanisms)
+        R11("floor_tnsr_sc")
+            v.policy_jitter_floor = true;
+            v.policy_jitter_floor_enter_us = 200.0;
+            v.policy_jitter_floor_exit_us = 100.0;
+            v.policy_jitter_floor_iqr_enter_us = 400.0;
+            v.policy_jitter_floor_iqr_exit_us = 200.0;
+            v.policy_tilted_near_stale_reset = true;
+            v.policy_tilted_near_stale_n = 3;
+            v.policy_sign_coherence = true;
+            v.policy_sign_coherence_n = 3;
+            v.policy_sign_coherence_min_delta_us = 25.0;
+            add(v); }
+
+        // Slot 13: M3+M2 combo
+        R11("rtt_tnsr")
+            v.policy_rtt_tilted_shrink = true;
+            v.policy_rtt_tilted_shrink_delta_us = 300.0;
+            v.policy_rtt_tilted_shrink_window_us = 5000000;
+            v.policy_rtt_tilted_shrink_hold_us = 3000000;
+            v.policy_tilted_near_stale_reset = true;
+            v.policy_tilted_near_stale_n = 3;
+            add(v); }
+
+        // Slot 14: M3+M4 combo
+        R11("rtt_sc")
+            v.policy_rtt_tilted_shrink = true;
+            v.policy_rtt_tilted_shrink_delta_us = 300.0;
+            v.policy_rtt_tilted_shrink_window_us = 5000000;
+            v.policy_rtt_tilted_shrink_hold_us = 3000000;
+            v.policy_sign_coherence = true;
+            v.policy_sign_coherence_n = 3;
+            v.policy_sign_coherence_min_delta_us = 25.0;
+            add(v); }
+
+        // Slot 15: All 4 mechanisms
+        R11("all4")
+            v.policy_jitter_floor = true;
+            v.policy_jitter_floor_enter_us = 200.0;
+            v.policy_jitter_floor_exit_us = 100.0;
+            v.policy_jitter_floor_iqr_enter_us = 400.0;
+            v.policy_jitter_floor_iqr_exit_us = 200.0;
+            v.policy_tilted_near_stale_reset = true;
+            v.policy_tilted_near_stale_n = 3;
+            v.policy_rtt_tilted_shrink = true;
+            v.policy_rtt_tilted_shrink_delta_us = 300.0;
+            v.policy_rtt_tilted_shrink_window_us = 5000000;
+            v.policy_rtt_tilted_shrink_hold_us = 3000000;
+            v.policy_sign_coherence = true;
+            v.policy_sign_coherence_n = 3;
+            v.policy_sign_coherence_min_delta_us = 25.0;
+            add(v); }
+
+        // Slot 16: M1 mid (enter=150)
+        R11("floor_p5_150")
+            v.policy_jitter_floor = true;
+            v.policy_jitter_floor_enter_us = 150.0;
+            v.policy_jitter_floor_exit_us = 75.0;
+            v.policy_jitter_floor_iqr_enter_us = 300.0;
+            v.policy_jitter_floor_iqr_exit_us = 150.0;
+            add(v); }
+
+        #undef R11
+
+        // --- Round 12e: Fix E72 via RAMP CORRECTION ---
+        // Detect p10 slope over 10s window, apply upward correction to effective_min
+        // E72: 1ms/s ramp → ~1000us/s slope over 10s (SNR ~3x vs jitter)
+        // E76: 5s sawtooth → slope averages to ~0 over 10s
+        #define R12(NAME) { MethodConfig v = qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08; \
+            v.variant_name = "r12_" NAME; \
+            v.stats_short_window_us = 380000; \
+            v.policy_per_packet_min = true; \
+            v.policy_switch_n = 1; \
+            v.policy_hold_us = 1000000; \
+            v.policy_quantile_prefer_low_near = true; \
+            v.stats_long_window_us = 27000000; \
+            v.window_us = 1000000; \
+            v.policy_ramp_correction = true;
+
+        // 1: Default (alpha=0.5, window=10, threshold=200)
+        R12("rc_default")
+            add(v); }
+
+        // 2: Full correction (alpha=1.0)
+        R12("rc_a1")
+            v.policy_ramp_correction_alpha = 1.0;
+            add(v); }
+
+        // 3: Light correction (alpha=0.25)
+        R12("rc_a025")
+            v.policy_ramp_correction_alpha = 0.25;
+            add(v); }
+
+        // 4: Strong correction (alpha=0.75)
+        R12("rc_a075")
+            v.policy_ramp_correction_alpha = 0.75;
+            add(v); }
+
+        // 5: Longer window (15 ticks)
+        R12("rc_w15")
+            v.policy_ramp_slope_window = 15;
+            add(v); }
+
+        // 6: Shorter window (8 ticks)
+        R12("rc_w8")
+            v.policy_ramp_slope_window = 8;
+            add(v); }
+
+        // 7: Low threshold (100 us/s)
+        R12("rc_t100")
+            v.policy_ramp_slope_threshold = 100.0;
+            add(v); }
+
+        // 8: High threshold (500 us/s)
+        R12("rc_t500")
+            v.policy_ramp_slope_threshold = 500.0;
+            add(v); }
+
+        // 9: Full correction + long window
+        R12("rc_a1_w15")
+            v.policy_ramp_correction_alpha = 1.0;
+            v.policy_ramp_slope_window = 15;
+            add(v); }
+
+        // 10: Strong + low threshold
+        R12("rc_a075_t100")
+            v.policy_ramp_correction_alpha = 0.75;
+            v.policy_ramp_slope_threshold = 100.0;
+            add(v); }
+
+        // 11: Long window + low threshold
+        R12("rc_w15_t100")
+            v.policy_ramp_slope_window = 15;
+            v.policy_ramp_slope_threshold = 100.0;
+            add(v); }
+
+        // 12: Full + short window + low threshold (aggressive)
+        R12("rc_a1_w8_t100")
+            v.policy_ramp_correction_alpha = 1.0;
+            v.policy_ramp_slope_window = 8;
+            v.policy_ramp_slope_threshold = 100.0;
+            add(v); }
+
+        // 13: Medium window (12 ticks)
+        R12("rc_w12")
+            v.policy_ramp_slope_window = 12;
+            add(v); }
+
+        // 14: Full + medium threshold
+        R12("rc_a1_t300")
+            v.policy_ramp_correction_alpha = 1.0;
+            v.policy_ramp_slope_threshold = 300.0;
+            add(v); }
+
+        // 15: Low threshold + default alpha
+        R12("rc_t100_a05")
+            v.policy_ramp_slope_threshold = 100.0;
+            add(v); }
+
+        // 16: Short window + medium threshold
+        R12("rc_w8_t300")
+            v.policy_ramp_slope_window = 8;
+            v.policy_ramp_slope_threshold = 300.0;
+            add(v); }
+
+        #undef R12
+
+        // --- Round 14: Quantile window sweep + tilted disable ---
+        // Key insight from R13: noguard_notilted achieves 1588us on E72 (3x better
+        // than our 4500us) using quantile-only mode with 500ms window.
+        // Hypothesis: window_us is THE key parameter for E72 ramp performance.
+        // Also test: tilted=false, stats_short sweep, tilted_requires_skew (adaptive).
+        #define R14(NAME) { MethodConfig v = qshrink_only_switch5_rttguard_promo100_skewmin3_max600_iqr100k_beta08; \
+            v.variant_name = "r14_" NAME; \
+            v.stats_short_window_us = 380000; \
+            v.policy_per_packet_min = true; \
+            v.policy_switch_n = 1; \
+            v.policy_hold_us = 1000000; \
+            v.policy_quantile_prefer_low_near = true; \
+            v.stats_long_window_us = 27000000; \
+            v.window_us = 1000000; \
+            v.policy_near_ratio_low = 0.10; \
+            v.policy_min_samples = 3;
+
+        // 1: 500ms quantile window (match noguard_notilted)
+        R14("qw500")
+            v.window_us = 500000;
+            add(v); }
+
+        // 2: 250ms quantile window (even tighter)
+        R14("qw250")
+            v.window_us = 250000;
+            add(v); }
+
+        // 3: 750ms quantile window (between 500ms and 1s)
+        R14("qw750")
+            v.window_us = 750000;
+            add(v); }
+
+        // 4: Disable tilted entirely (quantile-only like noguard_notilted)
+        R14("notilt")
+            v.policy_use_tilted = false;
+            add(v); }
+
+        // 5: Disable tilted + 500ms window
+        R14("notilt_qw500")
+            v.policy_use_tilted = false;
+            v.window_us = 500000;
+            add(v); }
+
+        // 6: Match noguard_notilted's short stats (2s)
+        R14("ss2s")
+            v.stats_short_window_us = 2000000;
+            add(v); }
+
+        // 7: Short stats 2s + 500ms window
+        R14("ss2s_qw500")
+            v.stats_short_window_us = 2000000;
+            v.window_us = 500000;
+            add(v); }
+
+        // 8: Short stats 1s (intermediate)
+        R14("ss1s")
+            v.stats_short_window_us = 1000000;
+            add(v); }
+
+        // 9: Closest to noguard_notilted: tilted=false + ss=2s + qw=500ms
+        R14("notilt_ss2s_qw500")
+            v.policy_use_tilted = false;
+            v.stats_short_window_us = 2000000;
+            v.window_us = 500000;
+            add(v); }
+
+        // 10: IRJ + bilateral staleness 5k + streak 15 (BEST from exploration)
+        R14("irj_bs5k_n15")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 5000.0;
+            v.policy_irj_stale_streak_n = 15;
+            add(v); }
+
+        // 11: IRJ + bilateral staleness 5k + streak 15 + long window 25s
+        R14("irj_bs5k_n15_t25")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 5000.0;
+            v.policy_irj_stale_streak_n = 15;
+            v.stats_long_window_us = 25000000;
+            add(v); }
+
+        // 12: IRJ + bilateral staleness 7k + streak 15
+        R14("irj_bs7k_n15")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 7000.0;
+            v.policy_irj_stale_streak_n = 15;
+            add(v); }
+
+        // 13: IRJ + bilateral staleness 5k + streak 12
+        R14("irj_bs5k_n12")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 5000.0;
+            v.policy_irj_stale_streak_n = 12;
+            add(v); }
+
+        // 14: IRJ + bilateral staleness 5k + streak 18
+        R14("irj_bs5k_n18")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 5000.0;
+            v.policy_irj_stale_streak_n = 18;
+            add(v); }
+
+        // 15: IRJ + bilateral staleness 8k + streak 12
+        R14("irj_bs8k_n12")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 8000.0;
+            v.policy_irj_stale_streak_n = 12;
+            add(v); }
+
+        // 16: IRJ + bilateral staleness 15k + streak 10 (latest best candidate)
+        R14("irj_bs15k_n10")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            add(v); }
+
+        // 17: Same as irj_bs15k_n10, but IRJ applies only in guard fallback path
+        // (protects handover-like cases where guard recovers but rtt_jump remains high)
+        R14("irj_bs15k_n10_go")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_only = true;
+            add(v); }
+
+        // 18: Guard-only IRJ with slightly lower stale threshold
+        R14("irj_bs12k_n10_go")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 12000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_only = true;
+            add(v); }
+
+        // 19: Guard-only IRJ with shorter streak
+        R14("irj_bs15k_n8_go")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 8;
+            v.policy_irj_guard_only = true;
+            add(v); }
+
+        // 20: irj_bs15k_n10 + min |rtt_delta| 45k (reject smaller handover spikes)
+        R14("irj_bs15k_n10_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 21: irj_bs15k_n10 + min |rtt_delta| 50k (strict ramp-only trigger)
+        R14("irj_bs15k_n10_d50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_min_rtt_delta_us = 50000.0;
+            add(v); }
+
+        // 22: irj_bs15k_n10 + 50k min delta + 10-tick rtt_jump streak
+        R14("irj_bs15k_n10_d50k_s10")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_min_rtt_delta_us = 50000.0;
+            v.policy_irj_min_streak = 10;
+            add(v); }
+
+        // 23: IRJ gated by EWMA(|rtt_delta|) >= 40k
+        R14("irj_bs15k_n10_dm40k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_mean_rtt_delta_us = 40000.0;
+            v.policy_irj_mean_rtt_delta_alpha = 0.2;
+            add(v); }
+
+        // 24: IRJ gated by EWMA(|rtt_delta|) >= 42k
+        R14("irj_bs15k_n10_dm42k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_mean_rtt_delta_us = 42000.0;
+            v.policy_irj_mean_rtt_delta_alpha = 0.2;
+            add(v); }
+
+        // 25: IRJ gated by EWMA(|rtt_delta|) >= 45k
+        R14("irj_bs15k_n10_dm45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_mean_rtt_delta_us = 45000.0;
+            v.policy_irj_mean_rtt_delta_alpha = 0.2;
+            add(v); }
+
+        // 26: IRJ gated by EWMA guard-fail ratio >= 0.50
+        R14("irj_bs15k_n10_gfr50")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_fail_ratio_min = 0.50;
+            v.policy_irj_guard_fail_ratio_alpha = 0.2;
+            add(v); }
+
+        // 27: IRJ gated by EWMA guard-fail ratio >= 0.60
+        R14("irj_bs15k_n10_gfr60")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_fail_ratio_min = 0.60;
+            v.policy_irj_guard_fail_ratio_alpha = 0.2;
+            add(v); }
+
+        // 28: irj_bs15k_n10 + stale-growth gate (ramp-like behavior required)
+        R14("irj_bs15k_n10_grow5k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_bilateral_growth_us = 5000.0;
+            add(v); }
+
+        // 29: Same as above with stronger growth requirement
+        R14("irj_bs15k_n10_grow8k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_bilateral_growth_us = 8000.0;
+            add(v); }
+
+        // 30: Combine strict rtt gate + growth gate
+        R14("irj_bs15k_n10_d50k_grow5k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_min_rtt_delta_us = 50000.0;
+            v.policy_irj_bilateral_growth_us = 5000.0;
+            add(v); }
+
+        // 31: Rising stale gate: require +500us/tick for 6 consecutive ticks
+        R14("irj_bs15k_n10_rise6_u500")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_bilateral_rise_n = 6;
+            v.policy_irj_bilateral_rise_us = 500.0;
+            add(v); }
+
+        // 32: Rising stale gate with longer rise streak
+        R14("irj_bs15k_n10_rise8_u500")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_bilateral_rise_n = 8;
+            v.policy_irj_bilateral_rise_us = 500.0;
+            add(v); }
+
+        // 33: Rising stale gate with lower per-tick threshold
+        R14("irj_bs15k_n10_rise6_u300")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_bilateral_rise_n = 6;
+            v.policy_irj_bilateral_rise_us = 300.0;
+            add(v); }
+
+        // 34: Lower stale threshold + rise gate (earlier trigger than 15k)
+        R14("irj_bs12k_n10_rise6_u500")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 12000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_bilateral_rise_n = 6;
+            v.policy_irj_bilateral_rise_us = 500.0;
+            add(v); }
+
+        // 35: More aggressive lower threshold + rise gate
+        R14("irj_bs10k_n10_rise6_u500")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 10000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_bilateral_rise_n = 6;
+            v.policy_irj_bilateral_rise_us = 500.0;
+            add(v); }
+
+        // 36: Lower threshold + shorter stale streak + rise gate
+        R14("irj_bs12k_n8_rise6_u500")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 12000.0;
+            v.policy_irj_stale_streak_n = 8;
+            v.policy_irj_bilateral_rise_n = 6;
+            v.policy_irj_bilateral_rise_us = 500.0;
+            add(v); }
+
+        // 37: Relaxed rise gate (15k, rise 4 ticks at +300)
+        R14("irj_bs15k_n10_rise4_u300")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_bilateral_rise_n = 4;
+            v.policy_irj_bilateral_rise_us = 300.0;
+            add(v); }
+
+        // 38: Relaxed rise gate with lower stale threshold
+        R14("irj_bs12k_n10_rise4_u300")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 12000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_bilateral_rise_n = 4;
+            v.policy_irj_bilateral_rise_us = 300.0;
+            add(v); }
+
+        // 39: Further relaxed rise increment
+        R14("irj_bs12k_n10_rise4_u200")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 12000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_bilateral_rise_n = 4;
+            v.policy_irj_bilateral_rise_us = 200.0;
+            add(v); }
+
+        // 40: Mid-strength rise gate
+        R14("irj_bs12k_n10_rise5_u300")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 12000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_bilateral_rise_n = 5;
+            v.policy_irj_bilateral_rise_us = 300.0;
+            add(v); }
+
+        // 41: Slope gate over 5 ticks (>= 200 us/tick) + bilateral stale gate
+        R14("irj_bs15k_n10_sl5_u200")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_bilateral_slope_window = 5;
+            v.policy_irj_bilateral_slope_us = 200.0;
+            add(v); }
+
+        // 42: Slope gate over 5 ticks (>= 300 us/tick)
+        R14("irj_bs15k_n10_sl5_u300")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_bilateral_slope_window = 5;
+            v.policy_irj_bilateral_slope_us = 300.0;
+            add(v); }
+
+        // 43: Longer slope gate over 8 ticks (>= 200 us/tick)
+        R14("irj_bs15k_n10_sl8_u200")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_bilateral_slope_window = 8;
+            v.policy_irj_bilateral_slope_us = 200.0;
+            add(v); }
+
+        // 44: Slope gate + stricter rtt delta floor
+        R14("irj_bs15k_n10_sl5_u200_d50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_bilateral_slope_window = 5;
+            v.policy_irj_bilateral_slope_us = 200.0;
+            v.policy_irj_min_rtt_delta_us = 50000.0;
+            add(v); }
+
+        // 45: Guard-fail streak gate (4 ticks) + bilateral stale gate
+        R14("irj_bs15k_n10_gf4")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_fail_streak_n = 4;
+            add(v); }
+
+        // 46: Guard-fail streak gate (6 ticks) + bilateral stale gate
+        R14("irj_bs15k_n10_gf6")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_fail_streak_n = 6;
+            add(v); }
+
+        // 47: Guard-fail streak gate (8 ticks) + bilateral stale gate
+        R14("irj_bs15k_n10_gf8")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_fail_streak_n = 8;
+            add(v); }
+
+        // 48: Stricter combo: 6 guard-fail ticks + 50k rtt delta floor
+        R14("irj_bs15k_n10_gf6_d50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_fail_streak_n = 6;
+            v.policy_irj_min_rtt_delta_us = 50000.0;
+            add(v); }
+
+        // 49: Bilateral ramp correction (conservative)
+        R14("rcb_a05_t200_w10")
+            v.policy_ramp_correction = true;
+            v.policy_ramp_bilateral = true;
+            v.policy_ramp_slope_window = 10;
+            v.policy_ramp_slope_threshold = 200.0;
+            v.policy_ramp_correction_alpha = 0.5;
+            add(v); }
+
+        // 50: Bilateral ramp correction (faster onset)
+        R14("rcb_a05_t150_w8")
+            v.policy_ramp_correction = true;
+            v.policy_ramp_bilateral = true;
+            v.policy_ramp_slope_window = 8;
+            v.policy_ramp_slope_threshold = 150.0;
+            v.policy_ramp_correction_alpha = 0.5;
+            add(v); }
+
+        // 51: Bilateral ramp correction (stronger gain)
+        R14("rcb_a075_t150_w8")
+            v.policy_ramp_correction = true;
+            v.policy_ramp_bilateral = true;
+            v.policy_ramp_slope_window = 8;
+            v.policy_ramp_slope_threshold = 150.0;
+            v.policy_ramp_correction_alpha = 0.75;
+            add(v); }
+
+        // 52: Control (standard robust config, 1s window)
+        R14("ctrl")
+            add(v); }
+
+        #undef R14
 
         MethodConfig qshrink_only_switch5_rttguard_promo100_skewmin2_max600_iqr100k_beta08_win20 =
             qshrink_only_switch5_rttguard_promo100;
@@ -19703,6 +22057,7 @@ static void WriteCsvHeader(std::ofstream& out)
         << "skew_p95_ab_ppm,skew_p95_ba_ppm,"
         << "owd_p50_ab_us,owd_p95_ab_us,owd_p99_ab_us,owd_mean_ab_us,owd_var_ab_us2,owd_max_ab_us,"
         << "owd_p50_ba_us,owd_p95_ba_us,owd_p99_ba_us,owd_mean_ba_us,owd_var_ba_us2,owd_max_ba_us,"
+        << "owd_bias_ab_us,owd_bias_ba_us,"
         << "converge_ab_s,converge_ba_s,"
         << "step_recover_ab_s,step_recover_ba_s,"
         << "step_recover_ab_us,step_recover_ba_us,"
@@ -20023,6 +22378,8 @@ static void WriteCsvRow(std::ofstream& out, const ScenarioConfig& scenario, cons
         << m.ba.owd_err_us.Mean() << ","
         << m.ba.owd_err_us.Variance() << ","
         << m.ba.owd_err_us.Max() << ","
+        << m.ab.owd_signed_err_us.Mean() << ","
+        << m.ba.owd_signed_err_us.Mean() << ","
         << (m.ab.converged ? (m.ab.converge_time_us / 1000000.0) : 0.0) << ","
         << (m.ba.converged ? (m.ba.converge_time_us / 1000000.0) : 0.0) << ","
         << step_recover_s(m.ab) << ","
@@ -21398,8 +23755,18 @@ int main(int argc, char** argv)
         threads = std::max(1u, std::thread::hardware_concurrency());
     }
 
-    std::vector<BenchmarkMetrics> results(items.size());
+    // Open CSV output up front so we can write rows incrementally
+    // (avoids storing all BenchmarkMetrics in memory at once).
+    std::ofstream out(opt.out_csv.c_str());
+    if (!out) {
+        std::cerr << "Unable to open output: " << opt.out_csv << std::endl;
+        return 1;
+    }
+    WriteCsvHeader(out);
+
+    std::mutex csv_mutex;
     std::atomic<size_t> next_idx(0);
+    std::atomic<size_t> rows_written(0);
 
     auto worker = [&]() {
         for (;;) {
@@ -21409,10 +23776,17 @@ int main(int argc, char** argv)
             }
             const RunItem& item = items[idx];
             const uint64_t seed = item.seed ^ Hash64(item.scenario.name);
+            BenchmarkMetrics metrics;
             if (item.scenario.kind == ScenarioKind::Teleop) {
-                results[idx] = RunTeleopScenario(item.scenario, item.method, seed);
+                metrics = RunTeleopScenario(item.scenario, item.method, seed);
             } else {
-                results[idx] = RunScenario(item.scenario, item.method, seed);
+                metrics = RunScenario(item.scenario, item.method, seed);
+            }
+            // Write row immediately and discard metrics to free memory
+            {
+                std::lock_guard<std::mutex> lock(csv_mutex);
+                WriteCsvRow(out, item.scenario, item.method, item.seed, metrics);
+                rows_written.fetch_add(1);
             }
         }
     };
@@ -21424,18 +23798,8 @@ int main(int argc, char** argv)
     for (size_t i = 0; i < pool.size(); ++i) {
         pool[i].join();
     }
-
-    std::ofstream out(opt.out_csv.c_str());
-    if (!out) {
-        std::cerr << "Unable to open output: " << opt.out_csv << std::endl;
-        return 1;
-    }
-    WriteCsvHeader(out);
-    for (size_t i = 0; i < items.size(); ++i) {
-        WriteCsvRow(out, items[i].scenario, items[i].method, items[i].seed, results[i]);
-    }
     out.close();
 
-    std::cout << "Wrote " << items.size() << " rows to " << opt.out_csv << std::endl;
+    std::cout << "Wrote " << rows_written.load() << " rows to " << opt.out_csv << std::endl;
     return 0;
 }
