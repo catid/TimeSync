@@ -1548,6 +1548,7 @@ struct MethodConfig
     double policy_rtt_jump_min_delta_us = 0.0; // minimum |rtt_delta| to force quantile (filters small jumps)
     bool policy_rtt_jump_quantile_guard_ok_only = false; // only force quantile while RTT guard is currently OK
     bool policy_rtt_jump_quantile_require_bilateral = false; // require bilateral stale gate before forcing quantile
+    bool policy_rtt_jump_quantile_require_phase = false; // require phase gate before forcing quantile
     bool policy_prioritize_decay = false;
     bool policy_per_packet_min = false; // update effective_min from TS24 on every packet (downward only)
     bool policy_per_packet_fresh = false; // update effective_min from TS24 on every packet (both directions)
@@ -1561,6 +1562,7 @@ struct MethodConfig
     double policy_gsp_min_gap_us = 0.0; // Minimum p10-effective_min gap to fire GSP (filters small steps)
     bool policy_gsp_skip_stable = false; // Skip IQR stability check (use gap+age as sole guards)
     double policy_gsp_min_iqr_us = 0.0; // require short-window IQR >= this before policy-GSP stale streak
+    double policy_gsp_max_iqr_us = 0.0; // require short-window IQR <= this absolute cap before policy-GSP
     int policy_gsp_require_ramp_streak = 0; // require ramp_rising_streak >= N before policy-GSP reset
     bool policy_gsp_require_guard_fail = false; // require RTT guard failure before policy-GSP stale streak
     double policy_gsp_min_guard_fail_ewma = 0.0; // require guard-fail EWMA >= this before policy-GSP stale streak
@@ -1568,6 +1570,13 @@ struct MethodConfig
     double policy_gsp_min_rtt_delta_us = 0.0; // require |rtt_delta| >= threshold before policy-GSP stale streak
     int policy_gsp_require_rtt_jump_streak = 0; // require rtt_jump streak >= N before policy-GSP stale streak
     int policy_gsp_require_rtt_jump_sign_streak = 0; // require same-sign rtt_jump streak >= N before policy-GSP
+    int policy_gsp_phase_window = 0; // if >1, require directional phase over this many ticks
+    double policy_gsp_phase_delta_floor_us = 0.0; // ignore p10 deltas below this in phase metrics
+    int policy_gsp_phase_min_active = 0; // require at least this many active (above-floor) deltas in phase window
+    double policy_gsp_phase_min_net_us = 0.0; // require p10 net rise over phase window
+    double policy_gsp_phase_min_trend_ratio = 0.0; // require net_rise/sum_abs_delta >= threshold
+    double policy_gsp_phase_max_flip_rate = 1.0; // require sign-flip ratio <= threshold (0..1)
+    double policy_gsp_phase_bypass_gap_us = 0.0; // if >0, bypass phase gate when stale gap >= this
     // Adaptive tilted window: shrink when gap > threshold, grow back when gap is small
     bool policy_tilted_adaptive_window = false;
     uint64_t policy_tilted_min_window_us = 5000000;   // minimum tilted window (5s)
@@ -2459,6 +2468,13 @@ struct NodeState
     double rtt_jump_streak_start_delta = 0.0; // |rtt_delta| at streak start
     int rtt_jump_sign = 0; // sign of current rtt_jump streak (+1/-1)
     int rtt_jump_sign_streak = 0; // consecutive rtt_jump ticks with same sign
+    double policy_phase_p10_ring[32] = {}; // rolling p10 history for GSP phase gate
+    int policy_phase_p10_ring_idx = 0;
+    int policy_phase_p10_ring_count = 0;
+    int policy_phase_active = 0; // active (above-floor) deltas in phase window
+    double policy_phase_net_us = 0.0; // p10 net rise across phase window
+    double policy_phase_trend_ratio = 0.0; // net rise / sum(abs(deltas))
+    double policy_phase_flip_rate = 1.0; // sign flip ratio of active deltas
     bool irj_rtt_delta_ema_valid = false;
     double irj_rtt_delta_ema_us = 0.0;
     bool irj_guard_fail_ewma_valid = false;
@@ -5593,6 +5609,66 @@ static double PolicySkewPpm(const NodeState& node, const MethodConfig& method, b
     return 0.0;
 }
 
+static void UpdatePolicyPhaseMetrics(NodeState& node, const MethodConfig& method)
+{
+    node.policy_phase_active = 0;
+    node.policy_phase_net_us = 0.0;
+    node.policy_phase_trend_ratio = 0.0;
+    node.policy_phase_flip_rate = 1.0;
+    if (!node.short_snapshot.valid) {
+        return;
+    }
+
+    static constexpr int kPhaseRing = 32;
+    node.policy_phase_p10_ring[node.policy_phase_p10_ring_idx % kPhaseRing] =
+        node.short_snapshot.p10;
+    node.policy_phase_p10_ring_idx = (node.policy_phase_p10_ring_idx + 1) % kPhaseRing;
+    if (node.policy_phase_p10_ring_count < kPhaseRing) {
+        node.policy_phase_p10_ring_count++;
+    }
+    if (method.policy_gsp_phase_window <= 1) {
+        return;
+    }
+
+    const int win = std::min(method.policy_gsp_phase_window, node.policy_phase_p10_ring_count);
+    if (win < 2) {
+        return;
+    }
+
+    const int latest_idx = ((node.policy_phase_p10_ring_idx - 1) % kPhaseRing + kPhaseRing) % kPhaseRing;
+    const int start_idx = ((latest_idx - (win - 1)) % kPhaseRing + kPhaseRing) % kPhaseRing;
+    const double net = node.policy_phase_p10_ring[latest_idx] - node.policy_phase_p10_ring[start_idx];
+    const double floor_us = std::max(0.0, method.policy_gsp_phase_delta_floor_us);
+    double abs_sum = 0.0;
+    int active = 0;
+    int flips = 0;
+    int prev_sign = 0;
+    for (int step = 1; step < win; ++step) {
+        const int prev_idx = (start_idx + step - 1) % kPhaseRing;
+        const int cur_idx = (start_idx + step) % kPhaseRing;
+        const double delta = node.policy_phase_p10_ring[cur_idx] - node.policy_phase_p10_ring[prev_idx];
+        if (std::fabs(delta) < floor_us) {
+            continue;
+        }
+        const int sign = (delta >= 0.0) ? 1 : -1;
+        if (prev_sign != 0 && sign != prev_sign) {
+            flips++;
+        }
+        prev_sign = sign;
+        abs_sum += std::fabs(delta);
+        active++;
+    }
+
+    node.policy_phase_active = active;
+    node.policy_phase_net_us = net;
+    if (abs_sum > 0.0) {
+        node.policy_phase_trend_ratio = net / abs_sum;
+    }
+    node.policy_phase_flip_rate = (active > 1)
+        ? (double)flips / (double)(active - 1)
+        : 0.0;
+}
+
 static int PolicySelectDesiredMode(
     NodeState& node,
     const MethodConfig& method,
@@ -5623,6 +5699,7 @@ static int PolicySelectDesiredMode(
     const double skew_ppm = PolicySkewPpm(node, method, skew_valid);
     const bool skew_ok = skew_valid &&
         (method.policy_skew_min_ppm <= 0.0 || std::fabs(skew_ppm) >= method.policy_skew_min_ppm);
+    UpdatePolicyPhaseMetrics(node, method);
 
     if (rtt_ready) {
         double alpha = method.policy_irj_mean_rtt_delta_alpha;
@@ -5695,7 +5772,34 @@ static int PolicySelectDesiredMode(
             !method.policy_rtt_jump_quantile_guard_ok_only || guard_ok;
         const bool bilateral_gate =
             !method.policy_rtt_jump_quantile_require_bilateral || bilateral_stale;
-        if (growth_ok && delta_ok && guard_ok_gate && bilateral_gate) {
+        bool phase_gate = true;
+        if (method.policy_rtt_jump_quantile_require_phase) {
+            phase_gate = false;
+            const bool phase_enabled = method.policy_gsp_phase_window > 1;
+            if (phase_enabled) {
+                const bool phase_samples_ok =
+                    node.policy_phase_p10_ring_count >= std::min(method.policy_gsp_phase_window, 32);
+                const bool phase_active_ok =
+                    method.policy_gsp_phase_min_active <= 0 ||
+                    node.policy_phase_active >= method.policy_gsp_phase_min_active;
+                const bool phase_net_ok =
+                    method.policy_gsp_phase_min_net_us <= 0.0 ||
+                    node.policy_phase_net_us >= method.policy_gsp_phase_min_net_us;
+                const bool phase_trend_ok =
+                    method.policy_gsp_phase_min_trend_ratio <= 0.0 ||
+                    node.policy_phase_trend_ratio >= method.policy_gsp_phase_min_trend_ratio;
+                const bool phase_flip_ok =
+                    method.policy_gsp_phase_max_flip_rate >= 1.0 ||
+                    node.policy_phase_flip_rate <= method.policy_gsp_phase_max_flip_rate;
+                phase_gate =
+                    phase_samples_ok &&
+                    phase_active_ok &&
+                    phase_net_ok &&
+                    phase_trend_ok &&
+                    phase_flip_ok;
+            }
+        }
+        if (growth_ok && delta_ok && guard_ok_gate && bilateral_gate && phase_gate) {
             node.rjq_forced_quantile_ticks++;
             return kPolicyModeQuantile;
         }
@@ -9808,6 +9912,8 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
                             const bool stable = method.policy_gsp_skip_stable || (iqr <= iqr_max);
                             const bool iqr_min_ok = (method.policy_gsp_min_iqr_us <= 0.0) ||
                                 (iqr >= method.policy_gsp_min_iqr_us);
+                            const bool iqr_cap_ok = (method.policy_gsp_max_iqr_us <= 0.0) ||
+                                (iqr <= method.policy_gsp_max_iqr_us);
                             const bool enough = (count >= method.gsp_npkt_min);
                             const bool ramp_ok = (method.policy_gsp_require_ramp_streak <= 0) ||
                                 (node.ramp_rising_streak >= method.policy_gsp_require_ramp_streak);
@@ -9828,6 +9934,31 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
                             const bool rtt_jump_sign_ok =
                                 (method.policy_gsp_require_rtt_jump_sign_streak <= 0) ||
                                 (node.rtt_jump_sign_streak >= method.policy_gsp_require_rtt_jump_sign_streak);
+                            const bool phase_enabled = method.policy_gsp_phase_window > 1;
+                            const bool phase_samples_ok = !phase_enabled ||
+                                node.policy_phase_p10_ring_count >=
+                                    std::min(method.policy_gsp_phase_window, 32);
+                            const bool phase_active_ok = !phase_enabled ||
+                                method.policy_gsp_phase_min_active <= 0 ||
+                                node.policy_phase_active >= method.policy_gsp_phase_min_active;
+                            const bool phase_net_ok = !phase_enabled ||
+                                method.policy_gsp_phase_min_net_us <= 0.0 ||
+                                node.policy_phase_net_us >= method.policy_gsp_phase_min_net_us;
+                            const bool phase_trend_ok = !phase_enabled ||
+                                method.policy_gsp_phase_min_trend_ratio <= 0.0 ||
+                                node.policy_phase_trend_ratio >= method.policy_gsp_phase_min_trend_ratio;
+                            const bool phase_flip_ok = !phase_enabled ||
+                                method.policy_gsp_phase_max_flip_rate >= 1.0 ||
+                                node.policy_phase_flip_rate <= method.policy_gsp_phase_max_flip_rate;
+                            const bool phase_bypass = phase_enabled &&
+                                method.policy_gsp_phase_bypass_gap_us > 0.0 &&
+                                gap >= method.policy_gsp_phase_bypass_gap_us;
+                            const bool phase_ok = phase_bypass ||
+                                (phase_samples_ok &&
+                                    phase_active_ok &&
+                                    phase_net_ok &&
+                                    phase_trend_ok &&
+                                    phase_flip_ok);
                             // min_age: tilted minimum hasn't been refreshed recently
                             // After a step change, no new packets reach the old minimum,
                             // so tilted_min_time_us becomes old. During normal operation,
@@ -9839,6 +9970,7 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
                                 big_enough_gap &&
                                 stable &&
                                 iqr_min_ok &&
+                                iqr_cap_ok &&
                                 enough &&
                                 ramp_ok &&
                                 guard_fail_ok &&
@@ -9847,6 +9979,7 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
                                 rtt_delta_ok &&
                                 rtt_jump_ok &&
                                 rtt_jump_sign_ok &&
+                                phase_ok &&
                                 min_old) {
                                 node.gsp_stale_streak++;
                             } else {
@@ -11833,6 +11966,8 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
                             const bool stable = method.policy_gsp_skip_stable || (iqr <= iqr_max);
                             const bool iqr_min_ok = (method.policy_gsp_min_iqr_us <= 0.0) ||
                                 (iqr >= method.policy_gsp_min_iqr_us);
+                            const bool iqr_cap_ok = (method.policy_gsp_max_iqr_us <= 0.0) ||
+                                (iqr <= method.policy_gsp_max_iqr_us);
                             const bool enough = (count >= method.gsp_npkt_min);
                             const bool ramp_ok = (method.policy_gsp_require_ramp_streak <= 0) ||
                                 (node.ramp_rising_streak >= method.policy_gsp_require_ramp_streak);
@@ -11853,6 +11988,31 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
                             const bool rtt_jump_sign_ok =
                                 (method.policy_gsp_require_rtt_jump_sign_streak <= 0) ||
                                 (node.rtt_jump_sign_streak >= method.policy_gsp_require_rtt_jump_sign_streak);
+                            const bool phase_enabled = method.policy_gsp_phase_window > 1;
+                            const bool phase_samples_ok = !phase_enabled ||
+                                node.policy_phase_p10_ring_count >=
+                                    std::min(method.policy_gsp_phase_window, 32);
+                            const bool phase_active_ok = !phase_enabled ||
+                                method.policy_gsp_phase_min_active <= 0 ||
+                                node.policy_phase_active >= method.policy_gsp_phase_min_active;
+                            const bool phase_net_ok = !phase_enabled ||
+                                method.policy_gsp_phase_min_net_us <= 0.0 ||
+                                node.policy_phase_net_us >= method.policy_gsp_phase_min_net_us;
+                            const bool phase_trend_ok = !phase_enabled ||
+                                method.policy_gsp_phase_min_trend_ratio <= 0.0 ||
+                                node.policy_phase_trend_ratio >= method.policy_gsp_phase_min_trend_ratio;
+                            const bool phase_flip_ok = !phase_enabled ||
+                                method.policy_gsp_phase_max_flip_rate >= 1.0 ||
+                                node.policy_phase_flip_rate <= method.policy_gsp_phase_max_flip_rate;
+                            const bool phase_bypass = phase_enabled &&
+                                method.policy_gsp_phase_bypass_gap_us > 0.0 &&
+                                gap >= method.policy_gsp_phase_bypass_gap_us;
+                            const bool phase_ok = phase_bypass ||
+                                (phase_samples_ok &&
+                                    phase_active_ok &&
+                                    phase_net_ok &&
+                                    phase_trend_ok &&
+                                    phase_flip_ok);
                             // min_age: tilted minimum hasn't been refreshed recently
                             // After a step change, no new packets reach the old minimum,
                             // so tilted_min_time_us becomes old. During normal operation,
@@ -11864,6 +12024,7 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
                                 big_enough_gap &&
                                 stable &&
                                 iqr_min_ok &&
+                                iqr_cap_ok &&
                                 enough &&
                                 ramp_ok &&
                                 guard_fail_ok &&
@@ -11872,6 +12033,7 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
                                 rtt_delta_ok &&
                                 rtt_jump_ok &&
                                 rtt_jump_sign_ok &&
+                                phase_ok &&
                                 min_old) {
                                 node.gsp_stale_streak++;
                             } else {
@@ -21288,6 +21450,79 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_rtt_jump_quantile_require_bilateral = true;
             add(v); }
 
+        // RQJ + phase gate: keep bilateral/guard-ok RQJ, but require directional
+        // phase signal to suppress flap-like alternation before forcing quantile.
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_rjq3_d45k_go_bs_phl10_d200_f45")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_rtt_jump_quantile_n = 3;
+            v.policy_rtt_jump_min_delta_us = 45000.0;
+            v.policy_rtt_jump_quantile_guard_ok_only = true;
+            v.policy_rtt_jump_quantile_require_bilateral = true;
+            v.policy_rtt_jump_quantile_require_phase = true;
+            v.policy_gsp_phase_window = 10;
+            v.policy_gsp_phase_delta_floor_us = 200.0;
+            v.policy_gsp_phase_max_flip_rate = 0.45;
+            add(v); }
+
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_rjq3_d45k_go_bs_phl10_d200_f35")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_rtt_jump_quantile_n = 3;
+            v.policy_rtt_jump_min_delta_us = 45000.0;
+            v.policy_rtt_jump_quantile_guard_ok_only = true;
+            v.policy_rtt_jump_quantile_require_bilateral = true;
+            v.policy_rtt_jump_quantile_require_phase = true;
+            v.policy_gsp_phase_window = 10;
+            v.policy_gsp_phase_delta_floor_us = 200.0;
+            v.policy_gsp_phase_max_flip_rate = 0.35;
+            add(v); }
+
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_rjq3_d45k_go_bs_phl10_d200_n2k_t15_f35")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_rtt_jump_quantile_n = 3;
+            v.policy_rtt_jump_min_delta_us = 45000.0;
+            v.policy_rtt_jump_quantile_guard_ok_only = true;
+            v.policy_rtt_jump_quantile_require_bilateral = true;
+            v.policy_rtt_jump_quantile_require_phase = true;
+            v.policy_gsp_phase_window = 10;
+            v.policy_gsp_phase_delta_floor_us = 200.0;
+            v.policy_gsp_phase_min_net_us = 2000.0;
+            v.policy_gsp_phase_min_trend_ratio = 0.15;
+            v.policy_gsp_phase_max_flip_rate = 0.35;
+            add(v); }
+
         R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_rjq12_d50k_g5k_go")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -21889,6 +22124,365 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_gsp_min_gap_us = 20000.0;
             v.gsp_n_consec = 12;
             v.gsp_age_ok_us = 20000000ULL;
+            add(v); }
+
+        // GSP absolute IQR cap: suppress high-variance regimes where stale-gap
+        // resets overfire (e.g. heavy-tail reorder/path-bloat families).
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_gsp22k_n12_a20s_iqmax3k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_gsp_min_gap_us = 22000.0;
+            v.gsp_n_consec = 12;
+            v.gsp_age_ok_us = 20000000ULL;
+            v.policy_gsp_max_iqr_us = 3000.0;
+            add(v); }
+
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_gsp22k_n12_a20s_iqmax2p8k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_gsp_min_gap_us = 22000.0;
+            v.gsp_n_consec = 12;
+            v.gsp_age_ok_us = 20000000ULL;
+            v.policy_gsp_max_iqr_us = 2800.0;
+            add(v); }
+
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_gsp22k_n12_a20s_iqmax2p6k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_gsp_min_gap_us = 22000.0;
+            v.gsp_n_consec = 12;
+            v.gsp_age_ok_us = 20000000ULL;
+            v.policy_gsp_max_iqr_us = 2600.0;
+            add(v); }
+
+        // GSP phase detector: require directional p10 trend over a short window
+        // (high trend ratio + low sign flips) to suppress flap-driven resets.
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_gsp22k_n12_a20s_ph10_d400_a6_n8k_t55_f20")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_gsp_min_gap_us = 22000.0;
+            v.gsp_n_consec = 12;
+            v.gsp_age_ok_us = 20000000ULL;
+            v.policy_gsp_phase_window = 10;
+            v.policy_gsp_phase_delta_floor_us = 400.0;
+            v.policy_gsp_phase_min_active = 6;
+            v.policy_gsp_phase_min_net_us = 8000.0;
+            v.policy_gsp_phase_min_trend_ratio = 0.55;
+            v.policy_gsp_phase_max_flip_rate = 0.20;
+            add(v); }
+
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_gsp22k_n12_a20s_ph12_d500_a7_n10k_t60_f25")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_gsp_min_gap_us = 22000.0;
+            v.gsp_n_consec = 12;
+            v.gsp_age_ok_us = 20000000ULL;
+            v.policy_gsp_phase_window = 12;
+            v.policy_gsp_phase_delta_floor_us = 500.0;
+            v.policy_gsp_phase_min_active = 7;
+            v.policy_gsp_phase_min_net_us = 10000.0;
+            v.policy_gsp_phase_min_trend_ratio = 0.60;
+            v.policy_gsp_phase_max_flip_rate = 0.25;
+            add(v); }
+
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_gsp22k_n12_a20s_ph12_d300_a7_n8k_t50_f30")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_gsp_min_gap_us = 22000.0;
+            v.gsp_n_consec = 12;
+            v.gsp_age_ok_us = 20000000ULL;
+            v.policy_gsp_phase_window = 12;
+            v.policy_gsp_phase_delta_floor_us = 300.0;
+            v.policy_gsp_phase_min_active = 7;
+            v.policy_gsp_phase_min_net_us = 8000.0;
+            v.policy_gsp_phase_min_trend_ratio = 0.50;
+            v.policy_gsp_phase_max_flip_rate = 0.30;
+            add(v); }
+
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_gsp22k_n16_a20s_ph10_d400_a6_n8k_t55_f20")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_gsp_min_gap_us = 22000.0;
+            v.gsp_n_consec = 16;
+            v.gsp_age_ok_us = 20000000ULL;
+            v.policy_gsp_phase_window = 10;
+            v.policy_gsp_phase_delta_floor_us = 400.0;
+            v.policy_gsp_phase_min_active = 6;
+            v.policy_gsp_phase_min_net_us = 8000.0;
+            v.policy_gsp_phase_min_trend_ratio = 0.55;
+            v.policy_gsp_phase_max_flip_rate = 0.20;
+            add(v); }
+
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_gsp22k_n12_a20s_gf8_ph10_d400_a6_n8k_t55_f20")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_gsp_min_gap_us = 22000.0;
+            v.gsp_n_consec = 12;
+            v.gsp_age_ok_us = 20000000ULL;
+            v.policy_gsp_require_guard_fail = true;
+            v.policy_gsp_require_guard_fail_streak_n = 8;
+            v.policy_gsp_phase_window = 10;
+            v.policy_gsp_phase_delta_floor_us = 400.0;
+            v.policy_gsp_phase_min_active = 6;
+            v.policy_gsp_phase_min_net_us = 8000.0;
+            v.policy_gsp_phase_min_trend_ratio = 0.55;
+            v.policy_gsp_phase_max_flip_rate = 0.20;
+            add(v); }
+
+        // Looser phase-gate sweep: start with flap-energy suppression (flip rate)
+        // and incrementally add low trend/net floors to recover E72.
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_gsp22k_n12_a20s_phl10_d200_f35")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_gsp_min_gap_us = 22000.0;
+            v.gsp_n_consec = 12;
+            v.gsp_age_ok_us = 20000000ULL;
+            v.policy_gsp_phase_window = 10;
+            v.policy_gsp_phase_delta_floor_us = 200.0;
+            v.policy_gsp_phase_max_flip_rate = 0.35;
+            add(v); }
+
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_gsp22k_n12_a20s_phl10_d200_f45")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_gsp_min_gap_us = 22000.0;
+            v.gsp_n_consec = 12;
+            v.gsp_age_ok_us = 20000000ULL;
+            v.policy_gsp_phase_window = 10;
+            v.policy_gsp_phase_delta_floor_us = 200.0;
+            v.policy_gsp_phase_max_flip_rate = 0.45;
+            add(v); }
+
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_gsp22k_n12_a20s_phl10_d200_f45_bg40k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_gsp_min_gap_us = 22000.0;
+            v.gsp_n_consec = 12;
+            v.gsp_age_ok_us = 20000000ULL;
+            v.policy_gsp_phase_window = 10;
+            v.policy_gsp_phase_delta_floor_us = 200.0;
+            v.policy_gsp_phase_max_flip_rate = 0.45;
+            v.policy_gsp_phase_bypass_gap_us = 40000.0;
+            add(v); }
+
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_gsp22k_n12_a20s_phl10_d200_f45_bg50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_gsp_min_gap_us = 22000.0;
+            v.gsp_n_consec = 12;
+            v.gsp_age_ok_us = 20000000ULL;
+            v.policy_gsp_phase_window = 10;
+            v.policy_gsp_phase_delta_floor_us = 200.0;
+            v.policy_gsp_phase_max_flip_rate = 0.45;
+            v.policy_gsp_phase_bypass_gap_us = 50000.0;
+            add(v); }
+
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_gsp22k_n12_a20s_phl10_d200_f45_bg60k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_gsp_min_gap_us = 22000.0;
+            v.gsp_n_consec = 12;
+            v.gsp_age_ok_us = 20000000ULL;
+            v.policy_gsp_phase_window = 10;
+            v.policy_gsp_phase_delta_floor_us = 200.0;
+            v.policy_gsp_phase_max_flip_rate = 0.45;
+            v.policy_gsp_phase_bypass_gap_us = 60000.0;
+            add(v); }
+
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_gsp22k_n12_a20s_phl10_d200_t20_f35")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_gsp_min_gap_us = 22000.0;
+            v.gsp_n_consec = 12;
+            v.gsp_age_ok_us = 20000000ULL;
+            v.policy_gsp_phase_window = 10;
+            v.policy_gsp_phase_delta_floor_us = 200.0;
+            v.policy_gsp_phase_min_trend_ratio = 0.20;
+            v.policy_gsp_phase_max_flip_rate = 0.35;
+            add(v); }
+
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_gsp22k_n12_a20s_phl10_d200_n2k_t15_f35")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_gsp_min_gap_us = 22000.0;
+            v.gsp_n_consec = 12;
+            v.gsp_age_ok_us = 20000000ULL;
+            v.policy_gsp_phase_window = 10;
+            v.policy_gsp_phase_delta_floor_us = 200.0;
+            v.policy_gsp_phase_min_net_us = 2000.0;
+            v.policy_gsp_phase_min_trend_ratio = 0.15;
+            v.policy_gsp_phase_max_flip_rate = 0.35;
+            add(v); }
+
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_gsp22k_n16_a20s_phl10_d200_f35")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_gsp_min_gap_us = 22000.0;
+            v.gsp_n_consec = 16;
+            v.gsp_age_ok_us = 20000000ULL;
+            v.policy_gsp_phase_window = 10;
+            v.policy_gsp_phase_delta_floor_us = 200.0;
+            v.policy_gsp_phase_max_flip_rate = 0.35;
             add(v); }
 
         R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k_gsp22k_n12_a20s_rs6")
