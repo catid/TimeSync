@@ -20435,6 +20435,88 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_min_age_us = 20000000ULL;
             add(v); }
 
+        // 33j15-33j22: micro-retune around bs19k_n12 promoted candidate
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs19k_n12_b50_c14k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 14000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c14k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 14000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs20k_n12_b50_c15k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 20000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs19k_n13_b50_c15k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 13;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs20k_n13_b50_c15k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 20000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 13;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs19k_n12_b50_c15k_age22s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 22000000ULL;
+            add(v); }
+
+        R14("irj_bs19k_n12_b50_c15k_age20s_sm50k_gf70")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_guard_fail_streak_n = 70;
+            add(v); }
+
         // 33j6-33j10: softer cap/blend around bs17k to trim E13/E78 regressions
         R14("irj_bs17k_n11_b45_c15k_age20s_sm50k")
             v.policy_quantile_ignore_rtt_jump = true;
