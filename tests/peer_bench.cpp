@@ -1525,6 +1525,9 @@ struct MethodConfig
     double policy_irj_bilateral_iqr_max_us = 0.0; // if >0, require both short-window IQRs to be <= this
     double policy_irj_bilateral_near_max = -1.0; // if >=0, require both near-hit rates <= this for IRJ bilateral stale
     int policy_irj_stale_streak_n = 0; // if >0, bilateral staleness must hold for N consecutive 1Hz ticks
+    int policy_irj_stale_fast_streak_n = 0; // optional alternate streak length used when bilateral stale pair exceeds fast threshold
+    double policy_irj_bilateral_stale_fast_us = 0.0; // activate stale_fast_streak_n when stale_pair >= this amount
+    double policy_irj_fast_min_rtt_delta_us = 0.0; // optional |rtt_delta| floor to activate stale_fast_streak_n
     double policy_irj_bilateral_growth_us = 0.0; // if >0, bilateral stale amount must grow by this much over the streak
     int policy_irj_bilateral_rise_n = 0; // if >0, require this many consecutive rising stale ticks
     double policy_irj_bilateral_rise_us = 0.0; // minimum per-tick stale rise to count toward rise_n
@@ -6179,8 +6182,17 @@ static void UpdateTimeSyncPolicy(
             node_a.irj_bilateral_stale_ring_idx = 0;
             node_a.irj_bilateral_stale_ring_count = 0;
         }
-        const bool streak_ok = (method.policy_irj_stale_streak_n <= 0 ||
-            node_a.irj_bilateral_stale_streak >= method.policy_irj_stale_streak_n);
+        int streak_n = method.policy_irj_stale_streak_n;
+        if (streak_n > 0 &&
+            method.policy_irj_stale_fast_streak_n > 0 &&
+            method.policy_irj_bilateral_stale_fast_us > 0.0 &&
+            (method.policy_irj_fast_min_rtt_delta_us <= 0.0 ||
+                std::fabs(rtt_delta) >= method.policy_irj_fast_min_rtt_delta_us) &&
+            stale_pair >= method.policy_irj_bilateral_stale_fast_us) {
+            streak_n = std::min(streak_n, method.policy_irj_stale_fast_streak_n);
+        }
+        const bool streak_ok = (streak_n <= 0 ||
+            node_a.irj_bilateral_stale_streak >= streak_n);
         const bool growth_ok = (method.policy_irj_bilateral_growth_us <= 0.0 ||
             (stale_pair - node_a.irj_bilateral_stale_start_us) >= method.policy_irj_bilateral_growth_us);
         const bool rise_ok = (method.policy_irj_bilateral_rise_n <= 0 ||
@@ -20857,7 +20869,24 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_min_rtt_delta_us = 45000.0;
             add(v); }
 
-        // 109c-sm50k-n16: promoted candidate; improves E36/E72/E78 on broad50 with no E108/E82 penalty.
+        // 109c-sm50k-n17-fs16-t40k-d50k: promoted compromise.
+        // Keeps n17 E13/E72 behavior while improving E36 and E78 on broad50.
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_sm50k_fs16_t40k_d50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_stale_fast_streak_n = 16;
+            v.policy_irj_bilateral_stale_fast_us = 40000.0;
+            v.policy_irj_fast_min_rtt_delta_us = 50000.0;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 109c-sm50k-n16: reference candidate from prior sweep.
         R14("irj_bs15k_n16_b40_c12p5k_age20s_i6k_d45k_sm50k")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
