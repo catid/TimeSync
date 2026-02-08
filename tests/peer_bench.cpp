@@ -1544,6 +1544,9 @@ struct MethodConfig
     double policy_irj_bilateral_stale_rtt_iqr_ref_us = 0.0; // if >0, raise bilateral stale threshold when pair RTT-IQR is below this reference
     double policy_irj_bilateral_stale_rtt_iqr_span_us = 0.0; // low-IQR deficit span for full stale-threshold boost (<=0 => full boost on any deficit)
     double policy_irj_bilateral_stale_rtt_iqr_boost_us = 0.0; // max additional stale threshold under low-IQR conditions
+    double policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 0.0; // if >0, increase required stale streak when pair RTT-IQR is below this reference
+    double policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 0.0; // low-IQR deficit span for full streak add (<=0 => full add on any deficit)
+    int policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 0; // max extra stale streak ticks added under low-IQR conditions
     double policy_irj_bilateral_near_max = -1.0; // if >=0, require both near-hit rates <= this for IRJ bilateral stale
     int policy_irj_stale_streak_n = 0; // if >0, bilateral staleness must hold for N consecutive 1Hz ticks
     int policy_irj_stale_fast_streak_n = 0; // optional alternate streak length used when bilateral stale pair exceeds fast threshold
@@ -6658,6 +6661,32 @@ static void UpdateTimeSyncPolicy(
                 std::fabs(rtt_delta) >= method.policy_irj_fast_min_rtt_delta_us) &&
             stale_pair >= method.policy_irj_bilateral_stale_fast_us) {
             streak_n = std::min(streak_n, method.policy_irj_stale_fast_streak_n);
+        }
+        if (streak_n > 0 &&
+            method.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us > 0.0 &&
+            method.policy_irj_bilateral_stale_rtt_iqr_streak_add_n > 0 &&
+            node_a.rtt_iqr_valid &&
+            node_b.rtt_iqr_valid) {
+            // Require longer stale persistence when BOTH directions remain low-RTT-IQR.
+            const double pair_rtt_iqr =
+                std::max(node_a.rtt_iqr_last_us, node_b.rtt_iqr_last_us);
+            const double deficit =
+                method.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us - pair_rtt_iqr;
+            if (deficit > 0.0) {
+                double add_scale = 1.0;
+                if (method.policy_irj_bilateral_stale_rtt_iqr_streak_span_us > 0.0) {
+                    add_scale =
+                        deficit / method.policy_irj_bilateral_stale_rtt_iqr_streak_span_us;
+                    if (add_scale < 0.0) add_scale = 0.0;
+                    if (add_scale > 1.0) add_scale = 1.0;
+                }
+                int add_n = (int)std::lround(
+                    (double)method.policy_irj_bilateral_stale_rtt_iqr_streak_add_n *
+                    add_scale);
+                if (add_n > 0) {
+                    streak_n += add_n;
+                }
+            }
         }
         const bool streak_ok = (streak_n <= 0 ||
             node_a.irj_bilateral_stale_streak >= streak_n);
@@ -20794,6 +20823,99 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_stale_rtt_iqr_ref_us = 8000.0;
             v.policy_irj_bilateral_stale_rtt_iqr_span_us = 4000.0;
             v.policy_irj_bilateral_stale_rtt_iqr_boost_us = 2000.0;
+            add(v); }
+
+        // 33k5-33k8: low-RTT-IQR adaptive stale streak extension around bs19k_n12.
+        // Keep stale threshold fixed; require longer persistence in low-IQR regimes.
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_iqrsg6k_s3k_n2")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 6000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 3000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 2;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_iqrsg6k_s3k_n3")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 6000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 3000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 3;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_iqrsg6p5k_s3k_n2")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 6500.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 3000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 2;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_iqrsg5k_s2k_n2")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 5000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 2000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 2;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_iqrsg6k_s4k_n2")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 6000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 4000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 2;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_iqrsg6k_s5k_n3")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 6000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 5000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 3;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_iqrsg6k_s6k_n3")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 6000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 6000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 3;
             add(v); }
 
         // 33j94-33j96: keep IRJ only on guard-fail fallback path.
