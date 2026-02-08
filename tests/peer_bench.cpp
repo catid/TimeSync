@@ -1502,6 +1502,7 @@ struct MethodConfig
     double policy_irj_guard_raise_cap_us = 0.0; // if >0, cap IRJ raise above tilted by this amount
     double policy_irj_guard_raise_extra_us = 0.0; // optional extra raise cap once sustained guard-fail condition is met
     int policy_irj_guard_raise_extra_fail_streak_n = 0; // min guard-fail streak to enable extra raise cap
+    double policy_irj_guard_raise_extra_stale_margin_us = 0.0; // optional stale margin above threshold to enable extra raise cap
     double policy_irj_guard_raise_stale_k = 0.0; // if >0, cap IRJ raise by k * (bilateral_stale - threshold)
     int policy_irj_min_streak = 0; // minimum rtt_jump streak for irj guard override (0=any)
     double policy_irj_bilateral_stale_us = 0.0; // if >0, irj requires both nodes' p10 - tilted_min > this threshold
@@ -1511,6 +1512,8 @@ struct MethodConfig
     double policy_irj_bilateral_growth_us = 0.0; // if >0, bilateral stale amount must grow by this much over the streak
     int policy_irj_bilateral_rise_n = 0; // if >0, require this many consecutive rising stale ticks
     double policy_irj_bilateral_rise_us = 0.0; // minimum per-tick stale rise to count toward rise_n
+    int policy_irj_bilateral_rise_both_n = 0; // if >0, require this many consecutive ticks where BOTH directions rise
+    double policy_irj_bilateral_rise_both_us = 0.0; // minimum per-tick stale rise for BOTH directions
     int policy_irj_bilateral_slope_window = 0; // if >0, require stale slope over this many ticks
     double policy_irj_bilateral_slope_us = 0.0; // minimum stale slope in us/tick over slope_window
     int policy_irj_guard_fail_streak_n = 0; // if >0, require N consecutive guard-fail ticks before IRJ override
@@ -2397,7 +2400,10 @@ struct NodeState
     int irj_bilateral_stale_streak = 0; // consecutive ticks where bilateral staleness holds (pair-level, use node_a's)
     double irj_bilateral_stale_start_us = 0.0; // bilateral stale amount at streak start (for ramp-like growth gate)
     int irj_bilateral_rise_streak = 0; // consecutive ticks where bilateral stale keeps rising
+    int irj_bilateral_rise_both_streak = 0; // consecutive ticks where BOTH stale_a and stale_b keep rising
     double irj_bilateral_prev_stale_us = 0.0; // previous bilateral stale amount
+    double irj_bilateral_prev_stale_a_us = 0.0; // previous stale_a for bilateral rise-both gate
+    double irj_bilateral_prev_stale_b_us = 0.0; // previous stale_b for bilateral rise-both gate
     double irj_bilateral_stale_ring[16] = {}; // rolling stale samples for slope gating
     int irj_bilateral_stale_ring_idx = 0;
     int irj_bilateral_stale_ring_count = 0;
@@ -5899,9 +5905,21 @@ static void UpdatePolicyNode(
             raised = base;
         }
         double raise_cap_us = method.policy_irj_guard_raise_cap_us;
+        bool extra_fail_ok = true;
+        if (method.policy_irj_guard_raise_extra_fail_streak_n > 0) {
+            extra_fail_ok =
+                node.irj_guard_fail_streak >= method.policy_irj_guard_raise_extra_fail_streak_n;
+        }
+        bool extra_stale_ok = true;
+        if (method.policy_irj_guard_raise_extra_stale_margin_us > 0.0 &&
+            method.policy_irj_bilateral_stale_us > 0.0) {
+            extra_stale_ok = bilateral_stale_pair_us >=
+                method.policy_irj_bilateral_stale_us +
+                method.policy_irj_guard_raise_extra_stale_margin_us;
+        }
         if (method.policy_irj_guard_raise_extra_us > 0.0 &&
-            method.policy_irj_guard_raise_extra_fail_streak_n > 0 &&
-            node.irj_guard_fail_streak >= method.policy_irj_guard_raise_extra_fail_streak_n) {
+            extra_fail_ok &&
+            extra_stale_ok) {
             raise_cap_us += method.policy_irj_guard_raise_extra_us;
         }
         if (method.policy_irj_guard_raise_stale_k > 0.0 &&
@@ -6011,6 +6029,7 @@ static void UpdateTimeSyncPolicy(
             if (node_a.irj_bilateral_stale_streak == 0) {
                 node_a.irj_bilateral_stale_start_us = stale_pair;
                 node_a.irj_bilateral_rise_streak = 0;
+                node_a.irj_bilateral_rise_both_streak = 0;
             } else {
                 const double rise_min = method.policy_irj_bilateral_rise_us;
                 if (rise_min <= 0.0 || stale_pair >= node_a.irj_bilateral_prev_stale_us + rise_min) {
@@ -6018,9 +6037,21 @@ static void UpdateTimeSyncPolicy(
                 } else {
                     node_a.irj_bilateral_rise_streak = 0;
                 }
+                const double rise_both_min = method.policy_irj_bilateral_rise_both_us;
+                if (rise_both_min > 0.0) {
+                    const bool rise_a = stale_a >= node_a.irj_bilateral_prev_stale_a_us + rise_both_min;
+                    const bool rise_b = stale_b >= node_a.irj_bilateral_prev_stale_b_us + rise_both_min;
+                    if (rise_a && rise_b) {
+                        node_a.irj_bilateral_rise_both_streak++;
+                    } else {
+                        node_a.irj_bilateral_rise_both_streak = 0;
+                    }
+                }
             }
             node_a.irj_bilateral_stale_streak++;
             node_a.irj_bilateral_prev_stale_us = stale_pair;
+            node_a.irj_bilateral_prev_stale_a_us = stale_a;
+            node_a.irj_bilateral_prev_stale_b_us = stale_b;
             node_a.irj_bilateral_stale_ring[node_a.irj_bilateral_stale_ring_idx % 16] = stale_pair;
             node_a.irj_bilateral_stale_ring_idx = (node_a.irj_bilateral_stale_ring_idx + 1) % 16;
             if (node_a.irj_bilateral_stale_ring_count < 16) {
@@ -6030,7 +6061,10 @@ static void UpdateTimeSyncPolicy(
             node_a.irj_bilateral_stale_streak = 0;
             node_a.irj_bilateral_stale_start_us = 0.0;
             node_a.irj_bilateral_rise_streak = 0;
+            node_a.irj_bilateral_rise_both_streak = 0;
             node_a.irj_bilateral_prev_stale_us = 0.0;
+            node_a.irj_bilateral_prev_stale_a_us = 0.0;
+            node_a.irj_bilateral_prev_stale_b_us = 0.0;
             node_a.irj_bilateral_stale_ring_idx = 0;
             node_a.irj_bilateral_stale_ring_count = 0;
         }
@@ -6040,6 +6074,14 @@ static void UpdateTimeSyncPolicy(
             (stale_pair - node_a.irj_bilateral_stale_start_us) >= method.policy_irj_bilateral_growth_us);
         const bool rise_ok = (method.policy_irj_bilateral_rise_n <= 0 ||
             node_a.irj_bilateral_rise_streak >= method.policy_irj_bilateral_rise_n);
+        bool rise_both_ok = true;
+        if (method.policy_irj_bilateral_rise_both_us > 0.0) {
+            int rise_both_n = method.policy_irj_bilateral_rise_both_n;
+            if (rise_both_n <= 0) {
+                rise_both_n = (method.policy_irj_bilateral_rise_n > 0) ? method.policy_irj_bilateral_rise_n : 1;
+            }
+            rise_both_ok = node_a.irj_bilateral_rise_both_streak >= rise_both_n;
+        }
         bool slope_ok = true;
         if (method.policy_irj_bilateral_slope_window > 0) {
             slope_ok = false;
@@ -6053,7 +6095,7 @@ static void UpdateTimeSyncPolicy(
                 slope_ok = stale_slope >= method.policy_irj_bilateral_slope_us;
             }
         }
-        bilateral_stale = stale_now && streak_ok && growth_ok && rise_ok && slope_ok;
+        bilateral_stale = stale_now && streak_ok && growth_ok && rise_ok && rise_both_ok && slope_ok;
         if (bilateral_stale) {
             bilateral_stale_pair_us = stale_pair;
         }
@@ -20644,7 +20686,341 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_min_rtt_delta_us = 45000.0;
             add(v); }
 
-        // 110: Control (standard robust config, 1s window)
+        // 109b: c12.5 profile with softer blend (b=0.45)
+        R14("irj_bs15k_n17_b45_c12p5k_age20s_i6k_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 109c: c12.5 profile with softer blend (b=0.40)
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 109d: c12.5 profile with softer blend (b=0.35)
+        R14("irj_bs15k_n17_b35_c12p5k_age20s_i6k_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.35;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 109e: c12.5 profile with softer blend (b=0.30)
+        R14("irj_bs15k_n17_b30_c12p5k_age20s_i6k_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.30;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 109f: c12.5 profile (b=0.50) + BOTH-directions rise gate (>=2 ticks, >=50us)
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_rb2_u50")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_rise_both_n = 2;
+            v.policy_irj_bilateral_rise_both_us = 50.0;
+            add(v); }
+
+        // 109g: c12.5 profile (b=0.45) + BOTH-directions rise gate (>=2 ticks, >=50us)
+        R14("irj_bs15k_n17_b45_c12p5k_age20s_i6k_d45k_rb2_u50")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_rise_both_n = 2;
+            v.policy_irj_bilateral_rise_both_us = 50.0;
+            add(v); }
+
+        // 109h: c12.5 profile (b=0.40) + BOTH-directions rise gate (>=2 ticks, >=50us)
+        R14("irj_bs15k_n17_b40_c12p5k_age20s_i6k_d45k_rb2_u50")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.40;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_rise_both_n = 2;
+            v.policy_irj_bilateral_rise_both_us = 50.0;
+            add(v); }
+
+        // 110: n17 c12.5 profile + RTT-delta growth gate (+3ms over jump streak)
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_g3k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_rtt_delta_growth_us = 3000.0;
+            add(v); }
+
+        // 111: n17 c12.5 profile + RTT-delta growth gate (+5ms over jump streak)
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_g5k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_rtt_delta_growth_us = 5000.0;
+            add(v); }
+
+        // 112: n17 c12.5 profile + RTT-delta growth gate (+8ms over jump streak)
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_g8k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_rtt_delta_growth_us = 8000.0;
+            add(v); }
+
+        // 113: n17 c12.5 + growth gate (+5ms) + mild bilateral rise gate
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_g5k_r2_u100")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_rtt_delta_growth_us = 5000.0;
+            v.policy_irj_bilateral_rise_n = 2;
+            v.policy_irj_bilateral_rise_us = 100.0;
+            add(v); }
+
+        // 114: n17 c12.5 + high guard-fail EWMA gate (>=0.85)
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_gfewa85")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_guard_fail_ratio_min = 0.85;
+            v.policy_irj_guard_fail_ratio_alpha = 0.2;
+            add(v); }
+
+        // 115: n17 c12.5 + very high guard-fail EWMA gate (>=0.90)
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_gfewa90")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_guard_fail_ratio_min = 0.90;
+            v.policy_irj_guard_fail_ratio_alpha = 0.2;
+            add(v); }
+
+        // 116: n17 c12.5 + long guard-fail streak gate (>=20 ticks)
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_gf20")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_guard_fail_streak_n = 20;
+            add(v); }
+
+        // 117: n17 c12.5 + very long guard-fail streak gate (>=30 ticks)
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_gf30")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_guard_fail_streak_n = 30;
+            add(v); }
+
+        // 118: n17 c12.5 + combined EWMA(>=0.85) and streak(>=20) guard-fail gates
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_gf20_ewa85")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_guard_fail_streak_n = 20;
+            v.policy_irj_guard_fail_ratio_min = 0.85;
+            v.policy_irj_guard_fail_ratio_alpha = 0.2;
+            add(v); }
+
+        // 119: n17 c12.5 + bilateral stale growth gate (+3ms across streak)
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_bg3k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_growth_us = 3000.0;
+            add(v); }
+
+        // 120: n17 c12.5 + bilateral stale growth gate (+6ms across streak)
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_bg6k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_growth_us = 6000.0;
+            add(v); }
+
+        // 121: n17 c12.5 + bilateral stale growth gate (+0.5ms across streak)
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_bg0p5k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_growth_us = 500.0;
+            add(v); }
+
+        // 122: n17 c12.5 + bilateral stale growth gate (+1ms across streak)
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_bg1k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_growth_us = 1000.0;
+            add(v); }
+
+        // 123: n17 c12.5 + bilateral stale growth gate (+2ms across streak)
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_bg2k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_growth_us = 2000.0;
+            add(v); }
+
+        // 124: n17 c12.5 + very mild bilateral rise gate (>=1 rising tick by >=50us)
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_r1_u50")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_rise_n = 1;
+            v.policy_irj_bilateral_rise_us = 50.0;
+            add(v); }
+
+        // 125: n17 c12.5 + mild bilateral rise gate (>=2 rising ticks by >=50us)
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_r2_u50")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_rise_n = 2;
+            v.policy_irj_bilateral_rise_us = 50.0;
+            add(v); }
+
+        // 126: n17 c12.5 + stale-slope gate (5-tick window, >=30us/tick)
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_sl5_u30")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_slope_window = 5;
+            v.policy_irj_bilateral_slope_us = 30.0;
+            add(v); }
+
+        // 127: n17 c12.5 + stale-slope gate (3-tick window, >=50us/tick)
+        R14("irj_bs15k_n17_b50_c12p5k_age20s_i6k_d45k_sl3_u50")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 17;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 12500.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            v.policy_irj_bilateral_slope_window = 3;
+            v.policy_irj_bilateral_slope_us = 50.0;
+            add(v); }
+
+        // 128: Control (standard robust config, 1s window)
         R14("ctrl")
             add(v); }
 
