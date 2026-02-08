@@ -20387,7 +20387,79 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_min_rtt_delta_us = 45000.0;
             add(v); }
 
-        // 90: Control (standard robust config, 1s window)
+        // 90: n15 strict ramp-only with intermediate cap (+14ms)
+        R14("irj_bs15k_n15_b50_c14k_age20s_i6k_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 15;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 14000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 91: n15 strict ramp-only with slight cap increase (+13ms)
+        R14("irj_bs15k_n15_b50_c13k_age20s_i6k_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 15;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 13000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 92: n15 strict ramp-only with slightly higher blend (0.55) +13ms cap
+        R14("irj_bs15k_n15_b55_c13k_age20s_i6k_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 15;
+            v.policy_irj_guard_quantile_blend = 0.55;
+            v.policy_irj_guard_raise_cap_us = 13000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 93: n15 strict ramp-only with intermediate cap (+16ms)
+        R14("irj_bs15k_n15_b50_c16k_age20s_i6k_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 15;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 16000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 94: n15 strict ramp-only with slightly higher blend (0.60) +14ms cap
+        R14("irj_bs15k_n15_b60_c14k_age20s_i6k_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 15;
+            v.policy_irj_guard_quantile_blend = 0.60;
+            v.policy_irj_guard_raise_cap_us = 14000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 95: n15 strict ramp-only with slightly higher blend (0.60) +16ms cap
+        R14("irj_bs15k_n15_b60_c16k_age20s_i6k_d45k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 15;
+            v.policy_irj_guard_quantile_blend = 0.60;
+            v.policy_irj_guard_raise_cap_us = 16000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_iqr_max_us = 6000.0;
+            v.policy_irj_min_rtt_delta_us = 45000.0;
+            add(v); }
+
+        // 96: Control (standard robust config, 1s window)
         R14("ctrl")
             add(v); }
 
