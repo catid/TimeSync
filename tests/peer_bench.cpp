@@ -1541,6 +1541,9 @@ struct MethodConfig
     double policy_irj_bilateral_rtt_iqr_max_us = 0.0; // if >0, require both latest RTT-IQR values <= this
     double policy_irj_bilateral_rtt_iqr_block_min_us = 0.0; // if >0, block IRJ when BOTH RTT-IQR values fall within [min,max]
     double policy_irj_bilateral_rtt_iqr_block_max_us = 0.0;
+    double policy_irj_bilateral_stale_rtt_iqr_ref_us = 0.0; // if >0, raise bilateral stale threshold when pair RTT-IQR is below this reference
+    double policy_irj_bilateral_stale_rtt_iqr_span_us = 0.0; // low-IQR deficit span for full stale-threshold boost (<=0 => full boost on any deficit)
+    double policy_irj_bilateral_stale_rtt_iqr_boost_us = 0.0; // max additional stale threshold under low-IQR conditions
     double policy_irj_bilateral_near_max = -1.0; // if >=0, require both near-hit rates <= this for IRJ bilateral stale
     int policy_irj_stale_streak_n = 0; // if >0, bilateral staleness must hold for N consecutive 1Hz ticks
     int policy_irj_stale_fast_streak_n = 0; // optional alternate streak length used when bilateral stale pair exceeds fast threshold
@@ -6198,7 +6201,8 @@ static void UpdatePolicyNode(
     bool bilateral_stale = false,
     double bilateral_stale_pair_us = 0.0,
     double bilateral_stale_growth_us = 0.0,
-    double bilateral_stale_slope_us = 0.0)
+    double bilateral_stale_slope_us = 0.0,
+    double bilateral_stale_threshold_us = 0.0)
 {
     const bool saw_active = method.saw_use && node.saw_hold_until_us > now_us;
     const int desired = PolicySelectDesiredMode(node, method, guard_ok, rtt_ready, rtt_delta, saw_active, bilateral_stale);
@@ -6231,6 +6235,10 @@ static void UpdatePolicyNode(
             pick = &cand_quant;
         }
     }
+    const double stale_threshold_us =
+        (bilateral_stale_threshold_us > 0.0)
+            ? bilateral_stale_threshold_us
+            : method.policy_irj_bilateral_stale_us;
 
     // Guard-fallback IRJ: bound guard override by blending/capping relative to tilted.
     // Target can be quantile (legacy) or stale-follower (non-IRJ-style ramp follower).
@@ -6322,11 +6330,11 @@ static void UpdatePolicyNode(
         const double base = cand_tilted.min_us;
         double target = cand_quant.valid ? cand_quant.min_us : base;
         if (method.policy_irj_guard_stale_follow &&
-            method.policy_irj_bilateral_stale_us > 0.0) {
+            stale_threshold_us > 0.0) {
             double follow_alpha = method.policy_irj_guard_stale_follow_alpha;
             if (follow_alpha < 0.0) follow_alpha = 0.0;
             const double stale_excess =
-                std::max(0.0, bilateral_stale_pair_us - method.policy_irj_bilateral_stale_us);
+                std::max(0.0, bilateral_stale_pair_us - stale_threshold_us);
             target = base + follow_alpha * stale_excess;
         }
         double raised = base + alpha * (target - base);
@@ -6341,9 +6349,9 @@ static void UpdatePolicyNode(
         }
         bool extra_stale_ok = true;
         if (method.policy_irj_guard_raise_extra_stale_margin_us > 0.0 &&
-            method.policy_irj_bilateral_stale_us > 0.0) {
+            stale_threshold_us > 0.0) {
             extra_stale_ok = bilateral_stale_pair_us >=
-                method.policy_irj_bilateral_stale_us +
+                stale_threshold_us +
                 method.policy_irj_guard_raise_extra_stale_margin_us;
         }
         if (method.policy_irj_guard_raise_extra_us > 0.0 &&
@@ -6352,11 +6360,11 @@ static void UpdatePolicyNode(
             raise_cap_us += method.policy_irj_guard_raise_extra_us;
         }
         if (method.policy_irj_guard_raise_stale_k > 0.0 &&
-            method.policy_irj_bilateral_stale_us > 0.0 &&
-            bilateral_stale_pair_us > method.policy_irj_bilateral_stale_us) {
+            stale_threshold_us > 0.0 &&
+            bilateral_stale_pair_us > stale_threshold_us) {
             const double stale_cap_us =
                 method.policy_irj_guard_raise_stale_k *
-                (bilateral_stale_pair_us - method.policy_irj_bilateral_stale_us);
+                (bilateral_stale_pair_us - stale_threshold_us);
             if (raise_cap_us > 0.0) {
                 raise_cap_us = std::min(raise_cap_us, stale_cap_us);
             } else {
@@ -6404,14 +6412,14 @@ static void UpdatePolicyNode(
     // bilateral staleness, lift tilted by a bounded stale-excess follower.
     const bool stale_lift_gate = bilateral_stale ||
         (method.policy_tilted_stale_lift_use_stale_now &&
-            method.policy_irj_bilateral_stale_us > 0.0 &&
-            bilateral_stale_pair_us >= method.policy_irj_bilateral_stale_us);
+            stale_threshold_us > 0.0 &&
+            bilateral_stale_pair_us >= stale_threshold_us);
     if (!has_picked_override &&
         pick == &cand_tilted &&
         cand_tilted.valid &&
         stale_lift_gate &&
         method.policy_tilted_stale_lift &&
-        method.policy_irj_bilateral_stale_us > 0.0) {
+        stale_threshold_us > 0.0) {
         bool lift_ok = true;
         if (method.policy_tilted_stale_lift_require_guard_fail && guard_ok) {
             lift_ok = false;
@@ -6430,7 +6438,7 @@ static void UpdatePolicyNode(
             double gain = method.policy_tilted_stale_lift_gain;
             if (gain < 0.0) gain = 0.0;
             const double stale_excess =
-                std::max(0.0, bilateral_stale_pair_us - method.policy_irj_bilateral_stale_us);
+                std::max(0.0, bilateral_stale_pair_us - stale_threshold_us);
             double lift_us = gain * stale_excess;
             if (method.policy_tilted_stale_lift_cap_us > 0.0) {
                 lift_us = std::min(lift_us, method.policy_tilted_stale_lift_cap_us);
@@ -6510,6 +6518,7 @@ static void UpdateTimeSyncPolicy(
     double bilateral_stale_pair_us = 0.0;
     double bilateral_stale_growth_us = 0.0;
     double bilateral_stale_slope_us = 0.0;
+    double bilateral_stale_threshold_us = method.policy_irj_bilateral_stale_us;
     if (method.policy_irj_bilateral_stale_us > 0.0 &&
         node_a.short_snapshot.valid && node_a.tilted_min_valid &&
         node_b.short_snapshot.valid && node_b.tilted_min_valid) {
@@ -6566,12 +6575,35 @@ static void UpdateTimeSyncPolicy(
                 near_b <= method.policy_irj_bilateral_near_max);
         const bool stale_max_ok = (method.policy_irj_bilateral_stale_max_us <= 0.0) ||
             (stale_pair <= method.policy_irj_bilateral_stale_max_us);
+        double stale_threshold_us = method.policy_irj_bilateral_stale_us;
+        if (stale_threshold_us > 0.0 &&
+            method.policy_irj_bilateral_stale_rtt_iqr_ref_us > 0.0 &&
+            method.policy_irj_bilateral_stale_rtt_iqr_boost_us > 0.0 &&
+            node_a.rtt_iqr_valid &&
+            node_b.rtt_iqr_valid) {
+            const double pair_rtt_iqr =
+                std::min(node_a.rtt_iqr_last_us, node_b.rtt_iqr_last_us);
+            const double deficit =
+                method.policy_irj_bilateral_stale_rtt_iqr_ref_us - pair_rtt_iqr;
+            if (deficit > 0.0) {
+                double boost_scale = 1.0;
+                if (method.policy_irj_bilateral_stale_rtt_iqr_span_us > 0.0) {
+                    boost_scale =
+                        deficit / method.policy_irj_bilateral_stale_rtt_iqr_span_us;
+                    if (boost_scale < 0.0) boost_scale = 0.0;
+                    if (boost_scale > 1.0) boost_scale = 1.0;
+                }
+                stale_threshold_us +=
+                    method.policy_irj_bilateral_stale_rtt_iqr_boost_us * boost_scale;
+            }
+        }
+        bilateral_stale_threshold_us = stale_threshold_us;
         const bool stale_now = age_ok &&
             iqr_max_ok &&
             near_ok &&
             stale_max_ok &&
-            (stale_a >= method.policy_irj_bilateral_stale_us &&
-                stale_b >= method.policy_irj_bilateral_stale_us);
+            (stale_a >= stale_threshold_us &&
+                stale_b >= stale_threshold_us);
         if (stale_now) {
             bilateral_stale_pair_us = stale_pair;
         }
@@ -6683,11 +6715,13 @@ static void UpdateTimeSyncPolicy(
     UpdatePolicyNode(node_a, now_us, method, guard_ok, rtt_ready, rtt_delta,
         multi_a, quant_a, tilted_a, decay_a,
         bilateral_stale, bilateral_stale_pair_us,
-        bilateral_stale_growth_us, bilateral_stale_slope_us);
+        bilateral_stale_growth_us, bilateral_stale_slope_us,
+        bilateral_stale_threshold_us);
     UpdatePolicyNode(node_b, now_us, method, guard_ok, rtt_ready, rtt_delta,
         multi_b, quant_b, tilted_b, decay_b,
         bilateral_stale, bilateral_stale_pair_us,
-        bilateral_stale_growth_us, bilateral_stale_slope_us);
+        bilateral_stale_growth_us, bilateral_stale_slope_us,
+        bilateral_stale_threshold_us);
 }
 
 static void UpdateMoE(
@@ -20680,6 +20714,86 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_guard_quantile_blend = 0.45;
             v.policy_irj_guard_raise_cap_us = 15000.0;
             v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        // 33k1-33k4: low-RTT-IQR adaptive stale threshold around bs19k_n12 baseline.
+        // Raise bilateral stale threshold only when pair RTT-IQR is low.
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_iqradj9k_s4k_b1p5k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_stale_rtt_iqr_ref_us = 9000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_span_us = 4000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_boost_us = 1500.0;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_iqradj9k_s4k_b2k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_stale_rtt_iqr_ref_us = 9000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_span_us = 4000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_boost_us = 2000.0;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_iqradj10k_s4k_b2k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_stale_rtt_iqr_ref_us = 10000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_span_us = 4000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_boost_us = 2000.0;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_iqradj9k_s3k_b2k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_stale_rtt_iqr_ref_us = 9000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_span_us = 3000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_boost_us = 2000.0;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_iqradj8k_s3k_b2k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_stale_rtt_iqr_ref_us = 8000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_span_us = 3000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_boost_us = 2000.0;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_iqradj8k_s4k_b2k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_stale_rtt_iqr_ref_us = 8000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_span_us = 4000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_boost_us = 2000.0;
             add(v); }
 
         // 33j94-33j96: keep IRJ only on guard-fail fallback path.
