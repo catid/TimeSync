@@ -21568,6 +21568,63 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_stale_rtt_iqr_streak_skip_no_bilateral_relax_min_rtt_iqr_us = 3400.0;
             add(v); }
 
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_iqrsg6k_s5k_n2_sp44k_snb2_r1_msp30k_riqr3p4k_gfmax50")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 6000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 5000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 2;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_max_stale_pair_us = 44000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_skip_no_bilateral_relax_n = 2;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_skip_no_bilateral_relax_sub_n = 1;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_skip_no_bilateral_relax_min_stale_pair_us = 30000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_skip_no_bilateral_relax_min_rtt_iqr_us = 3400.0;
+            v.policy_irj_guard_fail_streak_max = 50;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_iqrsg6k_s5k_n2_sp44k_snb2_r1_msp30k_riqr3p4k_gfmax55")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 6000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 5000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 2;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_max_stale_pair_us = 44000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_skip_no_bilateral_relax_n = 2;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_skip_no_bilateral_relax_sub_n = 1;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_skip_no_bilateral_relax_min_stale_pair_us = 30000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_skip_no_bilateral_relax_min_rtt_iqr_us = 3400.0;
+            v.policy_irj_guard_fail_streak_max = 55;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_iqrsg6k_s5k_n2_sp44k_snb2_r1_msp30k_riqr3p4k_gfmax60")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 6000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 5000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 2;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_max_stale_pair_us = 44000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_skip_no_bilateral_relax_n = 2;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_skip_no_bilateral_relax_sub_n = 1;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_skip_no_bilateral_relax_min_stale_pair_us = 30000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_skip_no_bilateral_relax_min_rtt_iqr_us = 3400.0;
+            v.policy_irj_guard_fail_streak_max = 60;
+            add(v); }
+
         R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_iqrsg6k_s5k_n2_sp44k_snb3_r1_msp30k_riqr3p2k_rmax6k")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 19000.0;
