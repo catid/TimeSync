@@ -1536,6 +1536,8 @@ struct MethodConfig
     double policy_irj_bilateral_stale_max_us = 0.0; // if >0, irj also requires bilateral stale pair <= this maximum
     uint64_t policy_irj_bilateral_min_age_us = 0; // if >0, require both tilted minima to be at least this old
     double policy_irj_bilateral_iqr_max_us = 0.0; // if >0, require both short-window IQRs to be <= this
+    double policy_irj_bilateral_rtt_iqr_min_us = 0.0; // if >0, require both latest RTT-IQR values >= this
+    double policy_irj_bilateral_rtt_iqr_max_us = 0.0; // if >0, require both latest RTT-IQR values <= this
     double policy_irj_bilateral_near_max = -1.0; // if >=0, require both near-hit rates <= this for IRJ bilateral stale
     int policy_irj_stale_streak_n = 0; // if >0, bilateral staleness must hold for N consecutive 1Hz ticks
     int policy_irj_stale_fast_streak_n = 0; // optional alternate streak length used when bilateral stale pair exceeds fast threshold
@@ -6495,6 +6497,19 @@ static void UpdateTimeSyncPolicy(
         const bool iqr_max_ok = (method.policy_irj_bilateral_iqr_max_us <= 0.0) ||
             (node_a.short_snapshot.iqr <= method.policy_irj_bilateral_iqr_max_us &&
                 node_b.short_snapshot.iqr <= method.policy_irj_bilateral_iqr_max_us);
+        bool rtt_iqr_ok = true;
+        if (method.policy_irj_bilateral_rtt_iqr_min_us > 0.0 ||
+            method.policy_irj_bilateral_rtt_iqr_max_us > 0.0) {
+            rtt_iqr_ok = node_a.rtt_iqr_valid && node_b.rtt_iqr_valid;
+            if (rtt_iqr_ok && method.policy_irj_bilateral_rtt_iqr_min_us > 0.0) {
+                rtt_iqr_ok = node_a.rtt_iqr_last_us >= method.policy_irj_bilateral_rtt_iqr_min_us &&
+                    node_b.rtt_iqr_last_us >= method.policy_irj_bilateral_rtt_iqr_min_us;
+            }
+            if (rtt_iqr_ok && method.policy_irj_bilateral_rtt_iqr_max_us > 0.0) {
+                rtt_iqr_ok = node_a.rtt_iqr_last_us <= method.policy_irj_bilateral_rtt_iqr_max_us &&
+                    node_b.rtt_iqr_last_us <= method.policy_irj_bilateral_rtt_iqr_max_us;
+            }
+        }
         const double near_a = (node_a.short_snapshot.count > 0)
             ? (double)node_a.short_snapshot.near_hits / (double)node_a.short_snapshot.count
             : 1.0;
@@ -6610,7 +6625,8 @@ static void UpdateTimeSyncPolicy(
             !stale_slope_valid) {
             compute_stale_slope(method.policy_irj_guard_blend_slope_window);
         }
-        bilateral_stale = stale_now && streak_ok && growth_ok && rise_ok && rise_both_ok && slope_ok;
+        bilateral_stale = stale_now && streak_ok && growth_ok && rise_ok && rise_both_ok && slope_ok &&
+            rtt_iqr_ok;
         if (bilateral_stale) {
             bilateral_stale_pair_us = stale_pair;
             bilateral_stale_growth_us =
@@ -9419,11 +9435,11 @@ static BenchmarkMetrics RunScenario(const ScenarioConfig& scenario_in, const Met
                 }
                 node_a.rtt_short_valid = rtt_ready;
                 node_b.rtt_short_valid = rtt_ready;
-                node_a.rtt_iqr_valid = rtt_ready;
-                node_b.rtt_iqr_valid = rtt_ready;
                 if (rtt_ready) {
                     node_a.rtt_short_last_us = rtt_short;
                     node_b.rtt_short_last_us = rtt_short;
+                    node_a.rtt_iqr_valid = true;
+                    node_b.rtt_iqr_valid = true;
                     node_a.rtt_iqr_last_us = rtt_iqr;
                     node_b.rtt_iqr_last_us = rtt_iqr;
                 }
@@ -11477,11 +11493,11 @@ static BenchmarkMetrics RunTeleopScenario(const ScenarioConfig& scenario_in, con
                 }
                 node_a.rtt_short_valid = rtt_ready;
                 node_b.rtt_short_valid = rtt_ready;
-                node_a.rtt_iqr_valid = rtt_ready;
-                node_b.rtt_iqr_valid = rtt_ready;
                 if (rtt_ready) {
                     node_a.rtt_short_last_us = rtt_short;
                     node_b.rtt_short_last_us = rtt_short;
+                    node_a.rtt_iqr_valid = true;
+                    node_b.rtt_iqr_valid = true;
                     node_a.rtt_iqr_last_us = rtt_iqr;
                     node_b.rtt_iqr_last_us = rtt_iqr;
                 }
@@ -20878,6 +20894,166 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_decay_near_ratio_max = 0.15;
             v.policy_decay_rtt_jump_streak_min = 10;
             v.policy_decay_rtt_jump_streak_max = 24;
+            add(v); }
+
+        // 33j61-33j65: bilateral RTT-IQR gates to isolate sustained ramp IRJ activation.
+        // Target: keep E72 (higher RTT-IQR) while suppressing E108/E82 over-activation.
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_riq8k_16k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_rtt_iqr_min_us = 8000.0;
+            v.policy_irj_bilateral_rtt_iqr_max_us = 16000.0;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_riq8p5k_16k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_rtt_iqr_min_us = 8500.0;
+            v.policy_irj_bilateral_rtt_iqr_max_us = 16000.0;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_riq9k_16k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_rtt_iqr_min_us = 9000.0;
+            v.policy_irj_bilateral_rtt_iqr_max_us = 16000.0;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_riq9k_15k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_rtt_iqr_min_us = 9000.0;
+            v.policy_irj_bilateral_rtt_iqr_max_us = 15000.0;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_riq9k_14k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_rtt_iqr_min_us = 9000.0;
+            v.policy_irj_bilateral_rtt_iqr_max_us = 14000.0;
+            add(v); }
+
+        // 33j66-33j69: min-only RTT-IQR gates (no upper clamp).
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_riqmin6k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_rtt_iqr_min_us = 6000.0;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_riqmin7k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_rtt_iqr_min_us = 7000.0;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_riqmin7p5k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_rtt_iqr_min_us = 7500.0;
+            add(v); }
+
+        R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_riqmin8k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_rtt_iqr_min_us = 8000.0;
+            add(v); }
+
+        // 33j70-33j73: non-IRJ tilted stale-lift variants on bs19k_n12 profile.
+        R14("tsl_bs19k_n12_g35_c8k_age20s_sm50k_gf8_d45k")
+            v.policy_quantile_ignore_rtt_jump = false;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_tilted_stale_lift = true;
+            v.policy_tilted_stale_lift_guard_fail_streak_n = 8;
+            v.policy_tilted_stale_lift_min_rtt_delta_us = 45000.0;
+            v.policy_tilted_stale_lift_gain = 0.35;
+            v.policy_tilted_stale_lift_cap_us = 8000.0;
+            add(v); }
+
+        R14("tsl_bs19k_n12_g40_c10k_age20s_sm50k_gf10_d45k")
+            v.policy_quantile_ignore_rtt_jump = false;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_tilted_stale_lift = true;
+            v.policy_tilted_stale_lift_guard_fail_streak_n = 10;
+            v.policy_tilted_stale_lift_min_rtt_delta_us = 45000.0;
+            v.policy_tilted_stale_lift_gain = 0.40;
+            v.policy_tilted_stale_lift_cap_us = 10000.0;
+            add(v); }
+
+        R14("tsl_bs19k_n12_g50_c12k_age20s_sm50k_gf10_d45k")
+            v.policy_quantile_ignore_rtt_jump = false;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_tilted_stale_lift = true;
+            v.policy_tilted_stale_lift_guard_fail_streak_n = 10;
+            v.policy_tilted_stale_lift_min_rtt_delta_us = 45000.0;
+            v.policy_tilted_stale_lift_gain = 0.50;
+            v.policy_tilted_stale_lift_cap_us = 12000.0;
+            add(v); }
+
+        R14("tsl_bs19k_n12_g40_c10k_age20s_sm50k_ok_d45k")
+            v.policy_quantile_ignore_rtt_jump = false;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_tilted_stale_lift = true;
+            v.policy_tilted_stale_lift_require_guard_fail = false;
+            v.policy_tilted_stale_lift_min_rtt_delta_us = 45000.0;
+            v.policy_tilted_stale_lift_gain = 0.40;
+            v.policy_tilted_stale_lift_cap_us = 10000.0;
             add(v); }
 
         // 33j53-33j54: force quantile under high-IQR to avoid stale tilted in heavy-tail regimes
