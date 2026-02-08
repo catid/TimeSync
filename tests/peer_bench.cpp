@@ -20373,6 +20373,47 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_min_age_us = 20000000ULL;
             add(v); }
 
+        // 33j2-33j5: raise stale threshold on n11 to reduce E78 overfire
+        R14("irj_bs17k_n11_b50_c15k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 17000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 11;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs18k_n11_b50_c15k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 18000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 11;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs17k_n11_b50_c16k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 17000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 11;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 16000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs18k_n11_b50_c16k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 18000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 11;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 16000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
         R14("irj_bs15k_n10_b50_c15k_age22s_sm50k")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 15000.0;
@@ -20410,6 +20451,27 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_stale_streak_n = 11;
             v.policy_irj_guard_quantile_blend = 0.50;
             v.policy_irj_guard_raise_cap_us = 16000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        // 33q2-33q3: mild blend reduction near n11 baseline
+        R14("irj_bs15k_n11_b48_c15k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 11;
+            v.policy_irj_guard_quantile_blend = 0.48;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs17k_n11_b48_c15k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 17000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 11;
+            v.policy_irj_guard_quantile_blend = 0.48;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
             v.policy_irj_bilateral_min_age_us = 20000000ULL;
             add(v); }
 
