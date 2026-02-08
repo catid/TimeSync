@@ -20812,8 +20812,9 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             add(v); }
 
         // Canonical bs19k_n12 profile.
-        // 2026-02-08 promotion: use the iqrsg6k_s4k_n2 setting as the default
-        // for this family (small broad improvements vs prior promoted profile).
+        // 2026-02-08 promotion: use the iqrsg6k_s4k_n2_sp46k setting as the
+        // default for this family (eliminates E72 tail regression vs legacy
+        // while keeping E108/E78 impact contained in full include-disabled runs).
         R14("irj_bs19k_n12_b45_c15k_age20s_sm50k")
             v.policy_quantile_ignore_rtt_jump = true;
             v.policy_irj_bilateral_stale_us = 19000.0;
@@ -20825,6 +20826,7 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 6000.0;
             v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 4000.0;
             v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 2;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_max_stale_pair_us = 46000.0;
             add(v); }
 
         R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_legacy")
