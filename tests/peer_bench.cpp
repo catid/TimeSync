@@ -20251,6 +20251,211 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_bilateral_min_age_us = 25000000ULL;
             add(v); }
 
+        // 33b: Age20 with stale-pair ceiling (50 ms) to bound heavy-tail/path-bloat tails
+        R14("irj_bs15k_n10_b50_c18k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        // 33c: tighter stale-pair ceiling (40 ms)
+        R14("irj_bs15k_n10_b50_c18k_age20s_sm40k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 40000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 18000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        // 33d/33e: lower IRJ raise cap while keeping age20 gate.
+        R14("irj_bs15k_n10_b50_c16k_age20s")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 16000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs15k_n10_b50_c15k_age20s")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        // 33f/33g: soften blend and cap together.
+        R14("irj_bs15k_n10_b45_c16k_age20s")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 16000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs15k_n10_b45_c15k_age20s")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        // 33h/33i: combine stale-max ceiling with lower cap profiles.
+        R14("irj_bs15k_n10_b50_c16k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 16000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs15k_n10_b45_c15k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        // 33j-33q: micro-retune around c15k/c16k age20 sweet spot
+        R14("irj_bs15k_n10_b50_c15k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs16k_n10_b50_c15k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 16000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs15k_n11_b50_c15k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 11;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs16k_n11_b50_c15k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 16000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 11;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs15k_n10_b50_c15k_age22s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 22000000ULL;
+            add(v); }
+
+        R14("irj_bs16k_n10_b50_c16k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 16000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 10;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 16000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs15k_n11_b50_c16k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 11;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 16000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs16k_n11_b50_c16k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 16000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 11;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 16000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        // 33r-33u: n11 c15k tail-control probes for E36/E13 p95 regressions
+        R14("irj_bs15k_n11_b50_c15k_age20s_sm40k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 40000.0;
+            v.policy_irj_stale_streak_n = 11;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs15k_n11_b45_c15k_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 11;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs15k_n11_b45_c15k_age20s_sm40k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 40000.0;
+            v.policy_irj_stale_streak_n = 11;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("irj_bs15k_n11_b50_c15k_age20s_sm50k_r4_u200")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 15000.0;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_stale_streak_n = 11;
+            v.policy_irj_guard_quantile_blend = 0.50;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_bilateral_rise_n = 4;
+            v.policy_irj_bilateral_rise_us = 200.0;
+            add(v); }
+
         // 34: Age-gated bounded IRJ with lower cap (20s age, +12ms cap)
         R14("irj_bs15k_n10_b50_c12k_age20s")
             v.policy_quantile_ignore_rtt_jump = true;
