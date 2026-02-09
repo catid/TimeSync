@@ -23099,6 +23099,73 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_guard_fail_streak_max = 25;
             add(v); }
 
+        // Component ablation ladder: progressively build from the R14 base
+        // toward promoted IRJ behavior using small, isolated increments.
+        R14("comp00_base")
+            add(v); }
+
+        R14("comp01_irj_enable")
+            v.policy_quantile_ignore_rtt_jump = true;
+            add(v); }
+
+        R14("comp02_irj_enable_bs19k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            add(v); }
+
+        R14("comp03_irj_enable_bs19k_n12")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_stale_streak_n = 12;
+            add(v); }
+
+        R14("comp04_irj_enable_bs19k_n12_age20s_sm50k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14("comp05_irj_enable_bs19k_n12_age20s_sm50k_b45_c15k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            add(v); }
+
+        R14("comp06_irj_enable_bs19k_n12_age20s_sm50k_b45_c15k_iqrstreak")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 6000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 4000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 2;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_max_stale_pair_us = 46000.0;
+            add(v); }
+
+        R14("comp07_irj_enable_bs19k_n12_age20s_sm50k_b45_c15k_iqrstreak_gfmx35")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 6000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 4000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 2;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_max_stale_pair_us = 46000.0;
+            v.policy_irj_guard_fail_streak_max = 35;
+            add(v); }
+
         // 33j53-33j54: force quantile under high-IQR to avoid stale tilted in heavy-tail regimes
         R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_hiq6k_fq")
             v.policy_quantile_ignore_rtt_jump = true;
