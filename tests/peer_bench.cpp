@@ -23166,6 +23166,275 @@ static std::vector<MethodConfig> BuildMethodVariants(bool grid)
             v.policy_irj_guard_fail_streak_max = 35;
             add(v); }
 
+        // Baseline-first feature ablation: start from qshrink_only_switch5_rttguard_promo100
+        // and add promoted IRJ knobs one at a time.
+        #define R14B(NAME) { MethodConfig v = qshrink_only_switch5_rttguard_promo100; \
+            v.variant_name = "r14b_" NAME;
+
+        R14B("base")
+            add(v); }
+
+        // Single-feature toggles
+        R14B("f01_irj_enable")
+            v.policy_quantile_ignore_rtt_jump = true;
+            add(v); }
+
+        R14B("f02_bs19k")
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            add(v); }
+
+        R14B("f03_streak12")
+            v.policy_irj_stale_streak_n = 12;
+            add(v); }
+
+        R14B("f04_sm50k")
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            add(v); }
+
+        R14B("f05_age20s")
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14B("f06_b45_c15k")
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            add(v); }
+
+        R14B("f07_iqrstreak")
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 6000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 4000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 2;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_max_stale_pair_us = 46000.0;
+            add(v); }
+
+        R14B("f08_gfmx35")
+            v.policy_irj_guard_fail_streak_max = 35;
+            add(v); }
+
+        // Minimal combo checkpoints
+        R14B("c01_irj_bs19k_n12")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_stale_streak_n = 12;
+            add(v); }
+
+        R14B("c02_c01_sm50k_age20s")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14B("c03_c02_b45_c15k")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            add(v); }
+
+        R14B("c04_c03_iqrstreak")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 6000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 4000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 2;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_max_stale_pair_us = 46000.0;
+            add(v); }
+
+        R14B("c05_full_best")
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 6000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 4000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 2;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_max_stale_pair_us = 46000.0;
+            v.policy_irj_guard_fail_streak_max = 35;
+            add(v); }
+
+        #undef R14B
+
+        // Baseline-first decomposition including prerequisite policy knobs from R14.
+        #define R14C(NAME) { MethodConfig v = qshrink_only_switch5_rttguard_promo100; \
+            v.variant_name = "r14c_" NAME;
+
+        // Prerequisite knobs (individually)
+        R14C("p01_short380ms")
+            v.stats_short_window_us = 380000;
+            add(v); }
+
+        R14C("p02_per_packet_min")
+            v.policy_per_packet_min = true;
+            add(v); }
+
+        R14C("p03_switch1")
+            v.policy_switch_n = 1;
+            add(v); }
+
+        R14C("p04_hold1s")
+            v.policy_hold_us = 1000000;
+            add(v); }
+
+        R14C("p05_qprefer")
+            v.policy_quantile_prefer_low_near = true;
+            add(v); }
+
+        R14C("p06_long27s")
+            v.stats_long_window_us = 27000000;
+            add(v); }
+
+        R14C("p07_window1s")
+            v.window_us = 1000000;
+            add(v); }
+
+        R14C("p08_near0p10")
+            v.policy_near_ratio_low = 0.10;
+            add(v); }
+
+        R14C("p09_min3")
+            v.policy_min_samples = 3;
+            add(v); }
+
+        // Prerequisites bundled (equivalent to R14 base before IRJ additions)
+        R14C("s00_preconditions")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 27000000;
+            v.window_us = 1000000;
+            v.policy_near_ratio_low = 0.10;
+            v.policy_min_samples = 3;
+            add(v); }
+
+        // Add IRJ components on top of prerequisites
+        R14C("s01_precond_irj")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 27000000;
+            v.window_us = 1000000;
+            v.policy_near_ratio_low = 0.10;
+            v.policy_min_samples = 3;
+            v.policy_quantile_ignore_rtt_jump = true;
+            add(v); }
+
+        R14C("s02_precond_irj_bs19k_n12")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 27000000;
+            v.window_us = 1000000;
+            v.policy_near_ratio_low = 0.10;
+            v.policy_min_samples = 3;
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_stale_streak_n = 12;
+            add(v); }
+
+        R14C("s03_add_sm50k_age20s")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 27000000;
+            v.window_us = 1000000;
+            v.policy_near_ratio_low = 0.10;
+            v.policy_min_samples = 3;
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            add(v); }
+
+        R14C("s04_add_b45_c15k")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 27000000;
+            v.window_us = 1000000;
+            v.policy_near_ratio_low = 0.10;
+            v.policy_min_samples = 3;
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            add(v); }
+
+        R14C("s05_add_iqrstreak")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 27000000;
+            v.window_us = 1000000;
+            v.policy_near_ratio_low = 0.10;
+            v.policy_min_samples = 3;
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 6000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 4000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 2;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_max_stale_pair_us = 46000.0;
+            add(v); }
+
+        R14C("s06_add_gfmx35")
+            v.stats_short_window_us = 380000;
+            v.policy_per_packet_min = true;
+            v.policy_switch_n = 1;
+            v.policy_hold_us = 1000000;
+            v.policy_quantile_prefer_low_near = true;
+            v.stats_long_window_us = 27000000;
+            v.window_us = 1000000;
+            v.policy_near_ratio_low = 0.10;
+            v.policy_min_samples = 3;
+            v.policy_quantile_ignore_rtt_jump = true;
+            v.policy_irj_bilateral_stale_us = 19000.0;
+            v.policy_irj_stale_streak_n = 12;
+            v.policy_irj_bilateral_stale_max_us = 50000.0;
+            v.policy_irj_bilateral_min_age_us = 20000000ULL;
+            v.policy_irj_guard_quantile_blend = 0.45;
+            v.policy_irj_guard_raise_cap_us = 15000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_ref_us = 6000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_span_us = 4000.0;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_add_n = 2;
+            v.policy_irj_bilateral_stale_rtt_iqr_streak_max_stale_pair_us = 46000.0;
+            v.policy_irj_guard_fail_streak_max = 35;
+            add(v); }
+
+        #undef R14C
+
         // 33j53-33j54: force quantile under high-IQR to avoid stale tilted in heavy-tail regimes
         R14("irj_bs19k_n12_b45_c15k_age20s_sm50k_hiq6k_fq")
             v.policy_quantile_ignore_rtt_jump = true;
