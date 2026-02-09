@@ -1,3 +1,5 @@
+// DEPRECATED: This file is superseded by peer_bench.cpp which has all scenarios,
+// methods, and fixes.  Kept for reference only; removed from build.
 #include <TimeSync/TimeSync.h>
 
 #include <algorithm>

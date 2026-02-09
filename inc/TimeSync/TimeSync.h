@@ -251,6 +251,12 @@ public:
         return Samples[0].Value;
     }
 
+    /// Get timestamp of smallest sample
+    inline uint64_t GetBestTimestamp() const
+    {
+        return Samples[0].Timestamp;
+    }
+
     /// Reset samples
     inline void Reset(const Sample sample = Sample())
     {
@@ -326,6 +332,22 @@ public:
         minDeltaTS24: Provide the low 24 bits of the peer's delta value.
     */
     void OnPeerMinDeltaTS24(Counter24 minDeltaTS24);
+
+    /**
+        OnPeerSlopeEstimate()
+
+        Optional: Call this when the peer provides its slope estimate (from
+        GetLocalSlopeForPeer()).  Together with the local slope, this enables
+        Coupled Skew Estimation (CSE) which extracts the pure clock skew by
+        computing (peer_slope - local_slope) / 2.
+
+        peerSlopePpm: The peer's slope estimate in ppm (us/s).
+    */
+    void OnPeerSlopeEstimate(double peerSlopePpm);
+
+    /// Get the local slope estimate to send to the peer for CSE.
+    /// Returns 0 if skew correction is disabled or not yet converged.
+    double GetLocalSlopeForPeer() const;
 
     /// Convert local time in microseconds to a 24-bit datagram timestamp
     static inline uint32_t LocalTimeToDatagramTS24(uint64_t localUsec)
@@ -474,6 +496,44 @@ public:
             kTime23Bias).ToUnsigned() << kTime23LostBits;
     }
 
+    /// Enable or disable Theil-Sen skew correction.
+    /// When enabled, the estimator tracks clock frequency offset (skew) and
+    /// applies a linear correction to the offset estimate, reducing sawtooth
+    /// error under drift.  Disabled by default for backward compatibility.
+    inline void SetSkewCorrectionEnabled(bool enabled)
+    {
+        std::lock_guard<std::mutex> lock(Mutex);
+        SkewCorrectionEnabled_ = enabled;
+    }
+
+    inline bool GetSkewCorrectionEnabled() const
+    {
+        return SkewCorrectionEnabled_;
+    }
+
+    /// Get the current skew estimate in ppm (microseconds per second).
+    /// Returns 0 if skew correction is disabled or not yet converged.
+    inline double GetSkewEstimatePpm() const
+    {
+        std::lock_guard<std::mutex> lock(Mutex);
+        return SkewEstPpm_;
+    }
+
+    /// Set the step-change detection threshold in microseconds.
+    /// When the raw offset deviates from the regression prediction by more
+    /// than this threshold, the skew estimator buffer is flushed.
+    /// Default: 2000 us (2 ms).
+    inline void SetStepThresholdUsec(double threshold)
+    {
+        std::lock_guard<std::mutex> lock(Mutex);
+        StepThresholdUsec_ = threshold;
+    }
+
+    inline double GetStepThresholdUsec() const
+    {
+        return StepThresholdUsec_;
+    }
+
 protected:
     /// Mutex protecting non-atomic members from concurrent access.
     /// OnPeerMinDeltaTS24() and OnAuthenticatedDatagramTimestamp() may be
@@ -519,5 +579,53 @@ protected:
     }
 
     /// Recalculate MinimumOneWayDelayUsec and RemoteTimeDeltaUsec (caller must hold Mutex)
-    void RecalculateLocked();
+    void RecalculateLocked(uint64_t localRecvUsec = 0);
+
+    // -- Skew correction state --
+
+    /// Ring buffer sample for Theil-Sen regression
+    struct SkewSample {
+        double time_s;      ///< Timestamp in seconds relative to SkewBaseTimestamp_
+        double offset_us;   ///< Unwrapped raw offset in microseconds
+    };
+
+    static const unsigned kSkewBufferSize = 32;
+    static const unsigned kSkewMinSamples = 4;
+
+    SkewSample SkewBuffer_[kSkewBufferSize] = {};
+    unsigned SkewBufferCount_ = 0;
+    unsigned SkewBufferHead_ = 0;  ///< Next write position
+
+    uint64_t SkewBaseTimestamp_ = 0;
+    uint64_t SkewLastSampleTimestamp_ = 0; ///< Last time we added a regression sample
+    double SkewEstPpm_ = 0.0;       ///< Estimated skew in us/s (= ppm)
+    double SkewIntercept_ = 0.0;    ///< Regression intercept at SkewBaseTimestamp_
+    double LastRawOffsetUsec_ = 0.0; ///< Last raw offset for unwrapping
+    double SkewUnwrapOffset_ = 0.0;  ///< Cumulative unwrap adjustment
+    bool SkewHasLastRaw_ = false;
+
+    bool SkewCorrectionEnabled_ = false;
+    double StepThresholdUsec_ = 2000.0;
+
+    /// Minimum interval between regression samples in microseconds.
+    /// Spacing samples prevents the buffer from filling with near-identical
+    /// values when packets arrive at high rate.
+    static const uint64_t kSkewSampleIntervalUsec = 250000; ///< 250 ms
+
+    // -- Coupled Skew Estimation (CSE) state --
+    // CSE extracts pure clock skew from both peers' slope estimates:
+    //   skew = (peer_slope - local_slope) / 2
+    // The local slope includes both clock skew and network path changes;
+    // by comparing with the peer's slope, the network component cancels out.
+
+    double PeerSlopePpm_ = 0.0;       ///< Last received peer slope estimate
+    bool GotPeerSlope_ = false;        ///< Have we received a peer slope?
+    double CseSkewPpm_ = 0.0;          ///< Coupled skew estimate in ppm
+    static constexpr double kCseBeta = 0.05; ///< Low-pass filter coefficient
+
+    /// Compute Theil-Sen robust regression on the skew buffer (caller must hold Mutex)
+    void ComputeTheilSenSkewLocked();
+
+    /// Reset skew estimator state (caller must hold Mutex)
+    void ResetSkewEstimatorLocked();
 };

@@ -29,6 +29,10 @@
 
 #include <TimeSync/TimeSync.h>
 
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
 
 //------------------------------------------------------------------------------
 // WindowedMinTS24
@@ -124,6 +128,10 @@ Counter24 WindowedQuantileTS24::GetQuantile(double quantile) const
     if (values.size() > 1) {
         idx = (size_t)std::floor(q * (values.size() - 1));
     }
+    // Note: Counter24::operator< uses modular comparison.  This is correct
+    // for time-sync deltas which are small offsets near zero, but would
+    // mis-order values spanning more than half the 24-bit range (~67 seconds
+    // in timestamp units).  The windowed design ensures values stay close.
     std::nth_element(values.begin(), values.begin() + idx, values.end(),
         [](const Counter24& a, const Counter24& b) { return a < b; });
     return values[idx];
@@ -142,6 +150,32 @@ void TimeSynchronizer::OnPeerMinDeltaTS24(Counter24 minDeltaTS24)
     RecalculateLocked();
 }
 
+void TimeSynchronizer::OnPeerSlopeEstimate(double peerSlopePpm)
+{
+    std::lock_guard<std::mutex> lock(Mutex);
+    PeerSlopePpm_ = peerSlopePpm;
+    GotPeerSlope_ = true;
+
+    // CSE: skew = (peer_slope - local_slope) / 2
+    // Both slopes measure how the recv-send delta changes over time.
+    // The local slope = network_trend + skew, peer slope = network_trend - skew.
+    // Subtracting: peer - local = -2*skew, so skew = (local - peer) / 2.
+    if (SkewBufferCount_ >= kSkewMinSamples) {
+        const double cse_candidate = (SkewEstPpm_ - PeerSlopePpm_) * 0.5;
+        // Low-pass filter to smooth out noise
+        CseSkewPpm_ = (1.0 - kCseBeta) * CseSkewPpm_ + kCseBeta * cse_candidate;
+    }
+}
+
+double TimeSynchronizer::GetLocalSlopeForPeer() const
+{
+    std::lock_guard<std::mutex> lock(Mutex);
+    if (!SkewCorrectionEnabled_ || SkewBufferCount_ < kSkewMinSamples) {
+        return 0.0;
+    }
+    return SkewEstPpm_;
+}
+
 void TimeSynchronizer::Reset()
 {
     std::lock_guard<std::mutex> lock(Mutex);
@@ -152,6 +186,10 @@ void TimeSynchronizer::Reset()
     WindowedQuantileTS24Deltas.Reset();
     LastFC_MinDeltaTS24 = 0;
     GotPeerUpdate = false;
+    PeerSlopePpm_ = 0.0;
+    GotPeerSlope_ = false;
+    CseSkewPpm_ = 0.0;
+    ResetSkewEstimatorLocked();
 }
 
 unsigned TimeSynchronizer::OnAuthenticatedDatagramTimestamp(
@@ -168,7 +206,7 @@ unsigned TimeSynchronizer::OnAuthenticatedDatagramTimestamp(
     WindowedMinTS24Deltas.Update(deltaTS24, localRecvUsec, DriftWindowUsec.load());
     WindowedQuantileTS24Deltas.Update(deltaTS24, localRecvUsec, DriftWindowUsec.load());
 
-    RecalculateLocked();
+    RecalculateLocked(localRecvUsec);
 
     // Estimated one-way-delay (OWD) for this datagram in microseconds.
     // This does not include processing time only network delay and perhaps
@@ -200,7 +238,7 @@ unsigned TimeSynchronizer::OnAuthenticatedDatagramTimestamp(
     return networkTripUsec;
 }
 
-void TimeSynchronizer::RecalculateLocked()
+void TimeSynchronizer::RecalculateLocked(uint64_t localRecvUsec)
 {
     if ((MinQuantile > 0.0 ? !WindowedQuantileTS24Deltas.IsValid() : !WindowedMinTS24Deltas.IsValid()) ||
         !GotPeerUpdate)
@@ -224,13 +262,112 @@ void TimeSynchronizer::RecalculateLocked()
     // ClockDelta(R-L) ~= (ClockDelta(R-L)_j - ClockDelta(L-R)_i) / 2
     const Counter23 clockDelta_TS23 = (minSendDeltaTS24 - minRecvDeltaTS24).ToUnsigned() >> 1;
 
-    // Calculate the time delta in microseconds
-    RemoteTimeDeltaUsec = clockDelta_TS23.ToUnsigned() << kTime23LostBits;
+    // Calculate the raw time delta in microseconds
+    const uint32_t rawOffsetUsec = clockDelta_TS23.ToUnsigned() << kTime23LostBits;
+
+    // Apply skew correction if enabled and we have a valid timestamp
+    if (SkewCorrectionEnabled_ && localRecvUsec > 0)
+    {
+        // Initialize base timestamp on first sample
+        if (SkewBaseTimestamp_ == 0) {
+            SkewBaseTimestamp_ = localRecvUsec;
+            SkewLastSampleTimestamp_ = 0; // Force first sample
+        }
+
+        const double current_time_s = (double)(localRecvUsec - SkewBaseTimestamp_) * 1e-6;
+
+        // Unwrap the raw offset to get a continuous signal for regression
+        const double raw_us = (double)rawOffsetUsec;
+        double unwrapped_us = raw_us + SkewUnwrapOffset_;
+
+        if (SkewHasLastRaw_) {
+            const double diff = raw_us - LastRawOffsetUsec_;
+            static const double kRange = (double)(1u << 26); // Counter23 range in usec
+            static const double kHalfRange = kRange / 2.0;
+            if (diff > kHalfRange) {
+                SkewUnwrapOffset_ -= kRange;
+                unwrapped_us = raw_us + SkewUnwrapOffset_;
+            } else if (diff < -kHalfRange) {
+                SkewUnwrapOffset_ += kRange;
+                unwrapped_us = raw_us + SkewUnwrapOffset_;
+            }
+        }
+        LastRawOffsetUsec_ = raw_us;
+        SkewHasLastRaw_ = true;
+
+        // Step-change detection: if we have a regression and the residual is
+        // too large, reset the estimator (path change, NAT rebind, etc.)
+        if (SkewBufferCount_ >= kSkewMinSamples) {
+            const double predicted = SkewIntercept_ + SkewEstPpm_ * current_time_s;
+            if (std::abs(unwrapped_us - predicted) > StepThresholdUsec_) {
+                ResetSkewEstimatorLocked();
+                SkewBaseTimestamp_ = localRecvUsec;
+                SkewLastSampleTimestamp_ = 0;
+                unwrapped_us = raw_us;
+                SkewHasLastRaw_ = false;
+            }
+        }
+
+        // Add sample to ring buffer at spaced intervals.
+        // This prevents the buffer from filling with identical values
+        // when packets arrive faster than the minimum filter updates.
+        const bool shouldSample =
+            (SkewLastSampleTimestamp_ == 0) ||
+            (localRecvUsec - SkewLastSampleTimestamp_ >= kSkewSampleIntervalUsec);
+
+        if (shouldSample) {
+            const double time_s = (double)(localRecvUsec - SkewBaseTimestamp_) * 1e-6;
+            SkewBuffer_[SkewBufferHead_] = {time_s, unwrapped_us};
+            SkewBufferHead_ = (SkewBufferHead_ + 1) % kSkewBufferSize;
+            if (SkewBufferCount_ < kSkewBufferSize) {
+                ++SkewBufferCount_;
+            }
+            SkewLastSampleTimestamp_ = localRecvUsec;
+
+            // Refit regression when new sample is added
+            if (SkewBufferCount_ >= kSkewMinSamples) {
+                ComputeTheilSenSkewLocked();
+            }
+        }
+
+        // Apply slope-only forward projection.
+        // The raw offset from the minimum filter is accurate at the time the
+        // minimum was captured, but lags behind the true offset under drift.
+        // We correct by projecting forward using the estimated skew from the
+        // minimum's capture time to now.
+        if (SkewBufferCount_ >= kSkewMinSamples && WindowedMinTS24Deltas.IsValid()) {
+            const uint64_t minTimestamp = WindowedMinTS24Deltas.GetBestTimestamp();
+            const double dt_s = (double)(localRecvUsec - minTimestamp) * 1e-6;
+
+            // Use CSE skew if available (more accurate), otherwise local estimate
+            const double skew_for_correction = GotPeerSlope_ ? CseSkewPpm_ : SkewEstPpm_;
+
+            // Only project forward (dt_s >= 0) and only for reasonable durations
+            if (dt_s > 0.0 && dt_s < 30.0) {
+                const double correction_us = skew_for_correction * dt_s;
+                const double corrected_us = (double)rawOffsetUsec + correction_us;
+                RemoteTimeDeltaUsec = (uint32_t)((int64_t)std::round(corrected_us) & 0xFFFFFFFF);
+            } else {
+                RemoteTimeDeltaUsec = rawOffsetUsec;
+            }
+        } else {
+            RemoteTimeDeltaUsec = rawOffsetUsec;
+        }
+    }
+    else
+    {
+        RemoteTimeDeltaUsec = rawOffsetUsec;
+    }
 
     // Calculate the minimum OWD, which may go negative and blow up..
     uint32_t min_owd_usec = minOWD_TS23.ToUnsigned() << kTime23LostBits;
 
-    // If the implied subtraction went negative, correct to zero:
+    // If the implied subtraction went negative (wrapped around), correct to zero.
+    // The threshold is half the Counter23 range: (1<<22)<<3 = 33,554,432 usec (~33.5s).
+    // Any computed OWD above this is treated as a wrapped negative value.
+    // Note: This also means genuinely high OWD (>33.5s, e.g. extreme satellite
+    // bufferbloat) will be clamped to 0.  Such conditions are outside the
+    // design envelope of this library.
     static const uint32_t kSignRolloverThreshold = (1 << 22) << kTime23LostBits;
     if (min_owd_usec >= kSignRolloverThreshold) {
         min_owd_usec = 0;
@@ -238,4 +375,61 @@ void TimeSynchronizer::RecalculateLocked()
     MinimumOneWayDelayUsec = min_owd_usec;
 
     Synchronized = true;
+}
+
+void TimeSynchronizer::ComputeTheilSenSkewLocked()
+{
+    const unsigned n = std::min(SkewBufferCount_, kSkewBufferSize);
+    if (n < kSkewMinSamples) {
+        return;
+    }
+
+    // Collect all pairwise slopes
+    std::vector<double> slopes;
+    slopes.reserve(n * (n - 1) / 2);
+
+    for (unsigned i = 0; i < n; ++i) {
+        const unsigned idx_i = (SkewBufferHead_ + kSkewBufferSize - n + i) % kSkewBufferSize;
+        for (unsigned j = i + 1; j < n; ++j) {
+            const unsigned idx_j = (SkewBufferHead_ + kSkewBufferSize - n + j) % kSkewBufferSize;
+            const double dt = SkewBuffer_[idx_j].time_s - SkewBuffer_[idx_i].time_s;
+            if (dt > 0.001) { // Minimum 1ms separation to avoid noise
+                const double doff = SkewBuffer_[idx_j].offset_us - SkewBuffer_[idx_i].offset_us;
+                slopes.push_back(doff / dt); // us/s = ppm
+            }
+        }
+    }
+
+    if (slopes.size() < 3) {
+        return;
+    }
+
+    // Median of slopes (Theil-Sen estimator)
+    const size_t mid = slopes.size() / 2;
+    std::nth_element(slopes.begin(), slopes.begin() + mid, slopes.end());
+    SkewEstPpm_ = slopes[mid];
+
+    // Compute intercept: median of (offset_i - slope * time_i)
+    std::vector<double> intercepts;
+    intercepts.reserve(n);
+    for (unsigned i = 0; i < n; ++i) {
+        const unsigned idx = (SkewBufferHead_ + kSkewBufferSize - n + i) % kSkewBufferSize;
+        intercepts.push_back(SkewBuffer_[idx].offset_us - SkewEstPpm_ * SkewBuffer_[idx].time_s);
+    }
+    const size_t imid = intercepts.size() / 2;
+    std::nth_element(intercepts.begin(), intercepts.begin() + imid, intercepts.end());
+    SkewIntercept_ = intercepts[imid];
+}
+
+void TimeSynchronizer::ResetSkewEstimatorLocked()
+{
+    SkewBufferCount_ = 0;
+    SkewBufferHead_ = 0;
+    SkewBaseTimestamp_ = 0;
+    SkewLastSampleTimestamp_ = 0;
+    SkewEstPpm_ = 0.0;
+    SkewIntercept_ = 0.0;
+    LastRawOffsetUsec_ = 0.0;
+    SkewUnwrapOffset_ = 0.0;
+    SkewHasLastRaw_ = false;
 }

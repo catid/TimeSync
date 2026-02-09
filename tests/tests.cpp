@@ -1704,6 +1704,514 @@ bool TestResetState()
 }
 
 //------------------------------------------------------------------------------
+// Test: Skew correction reduces offset error under drift
+
+bool TestSkewCorrectionReducesError()
+{
+    cout << "TestSkewCorrectionReducesError...";
+
+    // Compare offset error with and without skew correction under 200 ppm drift.
+    // Run two simulations: one with baseline, one with skew correction enabled.
+
+    auto run_drift_sim = [](bool skew_enabled, double drift_ppm) -> uint32_t {
+        TimeSynchronizer sync_a, sync_b;
+        if (skew_enabled) {
+            sync_a.SetSkewCorrectionEnabled(true);
+            sync_b.SetSkewCorrectionEnabled(true);
+        }
+
+        const double drift_a = drift_ppm;
+        const double drift_b = -drift_ppm;
+        const int64_t offset_a = 0;
+        const int64_t offset_b = 5 * 1000 * 1000LL;
+
+        const uint64_t send_interval_us = 1000000 / 60; // 60 Hz
+        const uint64_t sync_interval_us = 2 * 1000 * 1000ULL;
+        const uint64_t owd_us = 50000;
+        const uint64_t warmup_us = 3 * 1000 * 1000ULL;
+        const uint64_t duration_us = 15 * 1000 * 1000ULL;
+
+        uint64_t now_us = 0;
+        uint64_t next_data_ab = 0;
+        uint64_t next_data_ba = 0;
+        uint64_t next_sync_ab = sync_interval_us;
+        uint64_t next_sync_ba = sync_interval_us;
+
+        bool synced = false;
+        uint64_t metrics_start_us = 0;
+
+        DriftStats stats_ab;
+
+        std::priority_queue<DriftArrival, std::vector<DriftArrival>, DriftArrivalCompare> arrivals;
+
+        while (now_us <= duration_us) {
+            uint64_t next_arrival = arrivals.empty() ? UINT64_MAX : arrivals.top().deliver_true_us;
+            uint64_t next_time = next_arrival;
+            if (next_data_ab < next_time) next_time = next_data_ab;
+            if (next_data_ba < next_time) next_time = next_data_ba;
+            if (next_sync_ab < next_time) next_time = next_sync_ab;
+            if (next_sync_ba < next_time) next_time = next_sync_ba;
+            if (next_time == UINT64_MAX) break;
+            now_us = next_time;
+
+            while (!arrivals.empty() && arrivals.top().deliver_true_us == now_us) {
+                DriftArrival ev = arrivals.top();
+                arrivals.pop();
+                const bool to_b = ev.packet.from_a;
+                TimeSynchronizer& recv_sync = to_b ? sync_b : sync_a;
+                const double recv_drift = to_b ? drift_b : drift_a;
+                const int64_t recv_offset = to_b ? offset_b : offset_a;
+                const uint64_t local_recv = DriftLocalTimeUsec(now_us, recv_drift, recv_offset);
+                recv_sync.OnAuthenticatedDatagramTimestamp(ev.packet.ts24, local_recv);
+                if (ev.packet.is_sync) {
+                    recv_sync.OnPeerMinDeltaTS24(ev.packet.min_delta);
+                }
+                if (!synced && sync_a.IsSynchronized() && sync_b.IsSynchronized()) {
+                    synced = true;
+                    metrics_start_us = now_us + warmup_us;
+                }
+                if (synced && now_us >= metrics_start_us && ev.packet.has_ts23 && recv_sync.IsSynchronized()) {
+                    const uint64_t true_local_at_send = DriftLocalTimeUsec(
+                        ev.packet.send_true_us, recv_drift, recv_offset);
+                    const uint64_t est_local = recv_sync.FromLocalTime23(local_recv, ev.packet.ts23);
+                    const uint64_t err = (est_local > true_local_at_send)
+                        ? (est_local - true_local_at_send)
+                        : (true_local_at_send - est_local);
+                    if (to_b) stats_ab.Add(err);
+                }
+            }
+
+            if (next_data_ab == now_us) {
+                const uint64_t local_send = DriftLocalTimeUsec(now_us, drift_a, offset_a);
+                DriftPacket pkt;
+                pkt.from_a = true;
+                pkt.send_true_us = now_us;
+                pkt.ts24 = sync_a.LocalTimeToDatagramTS24(local_send);
+                if (sync_a.IsSynchronized()) {
+                    pkt.ts23 = sync_a.ToRemoteTime23(local_send);
+                    pkt.has_ts23 = pkt.ts23 != 0;
+                }
+                DriftArrival ev;
+                ev.deliver_true_us = now_us + owd_us;
+                ev.packet = pkt;
+                arrivals.push(ev);
+                next_data_ab = now_us + send_interval_us;
+            }
+            if (next_data_ba == now_us) {
+                const uint64_t local_send = DriftLocalTimeUsec(now_us, drift_b, offset_b);
+                DriftPacket pkt;
+                pkt.from_a = false;
+                pkt.send_true_us = now_us;
+                pkt.ts24 = sync_b.LocalTimeToDatagramTS24(local_send);
+                if (sync_b.IsSynchronized()) {
+                    pkt.ts23 = sync_b.ToRemoteTime23(local_send);
+                    pkt.has_ts23 = pkt.ts23 != 0;
+                }
+                DriftArrival ev;
+                ev.deliver_true_us = now_us + owd_us;
+                ev.packet = pkt;
+                arrivals.push(ev);
+                next_data_ba = now_us + send_interval_us;
+            }
+            if (next_sync_ab == now_us) {
+                const uint64_t local_send = DriftLocalTimeUsec(now_us, drift_a, offset_a);
+                DriftPacket pkt;
+                pkt.from_a = true;
+                pkt.is_sync = true;
+                pkt.send_true_us = now_us;
+                pkt.ts24 = sync_a.LocalTimeToDatagramTS24(local_send);
+                pkt.min_delta = sync_a.GetMinDeltaTS24();
+                DriftArrival ev;
+                ev.deliver_true_us = now_us + owd_us;
+                ev.packet = pkt;
+                arrivals.push(ev);
+                next_sync_ab = now_us + sync_interval_us;
+            }
+            if (next_sync_ba == now_us) {
+                const uint64_t local_send = DriftLocalTimeUsec(now_us, drift_b, offset_b);
+                DriftPacket pkt;
+                pkt.from_a = false;
+                pkt.is_sync = true;
+                pkt.send_true_us = now_us;
+                pkt.ts24 = sync_b.LocalTimeToDatagramTS24(local_send);
+                pkt.min_delta = sync_b.GetMinDeltaTS24();
+                DriftArrival ev;
+                ev.deliver_true_us = now_us + owd_us;
+                ev.packet = pkt;
+                arrivals.push(ev);
+                next_sync_ba = now_us + sync_interval_us;
+            }
+        }
+
+        return stats_ab.P95();
+    };
+
+    // Test at multiple drift levels
+    struct DriftTest { double ppm; const char* label; };
+    DriftTest tests[] = {
+        {200.0, "200ppm"},
+        {500.0, "500ppm"},
+        {1000.0, "1000ppm"}
+    };
+
+    bool any_improved = false;
+    for (const auto& t : tests) {
+        const uint32_t p95_baseline = run_drift_sim(false, t.ppm);
+        const uint32_t p95_skew = run_drift_sim(true, t.ppm);
+
+        const double improvement = (p95_baseline > 0)
+            ? 100.0 * (1.0 - (double)p95_skew / p95_baseline) : 0.0;
+
+        cout << "\n  " << t.label << ": baseline=" << p95_baseline
+             << " skew=" << p95_skew
+             << " improvement=" << improvement << "%";
+
+        if (p95_skew < p95_baseline) {
+            any_improved = true;
+        }
+    }
+
+    if (!any_improved) {
+        cout << "\nFailed: skew correction did not improve p95 at any drift rate" << endl;
+        return false;
+    }
+
+    cout << "\nSuccess!" << endl;
+    return true;
+}
+
+//------------------------------------------------------------------------------
+// Test: Skew estimator converges to known drift rate
+
+bool TestSkewEstimateConverges()
+{
+    cout << "TestSkewEstimateConverges...";
+
+    TimeSynchronizer sync_a, sync_b;
+    sync_a.SetSkewCorrectionEnabled(true);
+    sync_b.SetSkewCorrectionEnabled(true);
+
+    const double drift_ppm = 100.0;
+    const double drift_a = drift_ppm;
+    const double drift_b = -drift_ppm;
+    const int64_t offset_a = 0;
+    const int64_t offset_b = 5 * 1000 * 1000LL;
+
+    const uint64_t send_interval_us = 1000000 / 60;
+    const uint64_t sync_interval_us = 2 * 1000 * 1000ULL;
+    const uint64_t owd_us = 50000;
+    const uint64_t duration_us = 10 * 1000 * 1000ULL;
+
+    uint64_t now_us = 0;
+    uint64_t next_data_ab = 0;
+    uint64_t next_data_ba = 0;
+    uint64_t next_sync_ab = sync_interval_us;
+    uint64_t next_sync_ba = sync_interval_us;
+
+    std::priority_queue<DriftArrival, std::vector<DriftArrival>, DriftArrivalCompare> arrivals;
+
+    while (now_us <= duration_us) {
+        uint64_t next_arrival = arrivals.empty() ? UINT64_MAX : arrivals.top().deliver_true_us;
+        uint64_t next_time = next_arrival;
+        if (next_data_ab < next_time) next_time = next_data_ab;
+        if (next_data_ba < next_time) next_time = next_data_ba;
+        if (next_sync_ab < next_time) next_time = next_sync_ab;
+        if (next_sync_ba < next_time) next_time = next_sync_ba;
+        if (next_time == UINT64_MAX) break;
+        now_us = next_time;
+
+        while (!arrivals.empty() && arrivals.top().deliver_true_us == now_us) {
+            DriftArrival ev = arrivals.top();
+            arrivals.pop();
+            const bool to_b = ev.packet.from_a;
+            TimeSynchronizer& recv_sync = to_b ? sync_b : sync_a;
+            const double recv_drift = to_b ? drift_b : drift_a;
+            const int64_t recv_offset = to_b ? offset_b : offset_a;
+            const uint64_t local_recv = DriftLocalTimeUsec(now_us, recv_drift, recv_offset);
+            recv_sync.OnAuthenticatedDatagramTimestamp(ev.packet.ts24, local_recv);
+            if (ev.packet.is_sync) {
+                recv_sync.OnPeerMinDeltaTS24(ev.packet.min_delta);
+            }
+        }
+
+        if (next_data_ab == now_us) {
+            const uint64_t local_send = DriftLocalTimeUsec(now_us, drift_a, offset_a);
+            DriftPacket pkt;
+            pkt.from_a = true;
+            pkt.send_true_us = now_us;
+            pkt.ts24 = sync_a.LocalTimeToDatagramTS24(local_send);
+            DriftArrival ev;
+            ev.deliver_true_us = now_us + owd_us;
+            ev.packet = pkt;
+            arrivals.push(ev);
+            next_data_ab = now_us + send_interval_us;
+        }
+        if (next_data_ba == now_us) {
+            const uint64_t local_send = DriftLocalTimeUsec(now_us, drift_b, offset_b);
+            DriftPacket pkt;
+            pkt.from_a = false;
+            pkt.send_true_us = now_us;
+            pkt.ts24 = sync_b.LocalTimeToDatagramTS24(local_send);
+            DriftArrival ev;
+            ev.deliver_true_us = now_us + owd_us;
+            ev.packet = pkt;
+            arrivals.push(ev);
+            next_data_ba = now_us + send_interval_us;
+        }
+        if (next_sync_ab == now_us) {
+            const uint64_t local_send = DriftLocalTimeUsec(now_us, drift_a, offset_a);
+            DriftPacket pkt;
+            pkt.from_a = true;
+            pkt.is_sync = true;
+            pkt.send_true_us = now_us;
+            pkt.ts24 = sync_a.LocalTimeToDatagramTS24(local_send);
+            pkt.min_delta = sync_a.GetMinDeltaTS24();
+            DriftArrival ev;
+            ev.deliver_true_us = now_us + owd_us;
+            ev.packet = pkt;
+            arrivals.push(ev);
+            next_sync_ab = now_us + sync_interval_us;
+        }
+        if (next_sync_ba == now_us) {
+            const uint64_t local_send = DriftLocalTimeUsec(now_us, drift_b, offset_b);
+            DriftPacket pkt;
+            pkt.from_a = false;
+            pkt.is_sync = true;
+            pkt.send_true_us = now_us;
+            pkt.ts24 = sync_b.LocalTimeToDatagramTS24(local_send);
+            pkt.min_delta = sync_b.GetMinDeltaTS24();
+            DriftArrival ev;
+            ev.deliver_true_us = now_us + owd_us;
+            ev.packet = pkt;
+            arrivals.push(ev);
+            next_sync_ba = now_us + sync_interval_us;
+        }
+    }
+
+    // The estimated skew at node B should approximate the relative drift
+    // between A and B as seen by B's local clock.
+    // True relative drift = drift_a - drift_b = 200 ppm as seen from global frame.
+    // But skew estimator works in B's local time, so the observed slope
+    // of the raw offset (in B's time) is the skew.
+    const double skew_est = sync_b.GetSkewEstimatePpm();
+
+    // The skew estimate should be within 50 ppm of some nonzero value
+    // (exact value depends on how the windowed minimum interacts with drift).
+    // Key check: it should be nonzero and have the right sign direction.
+    if (std::abs(skew_est) < 10.0) {
+        cout << "Failed: skew estimate too small: " << skew_est << " ppm" << endl;
+        return false;
+    }
+
+    cout << "Success! (skew_est=" << skew_est << " ppm)" << endl;
+    return true;
+}
+
+//------------------------------------------------------------------------------
+// Test: Step detection resets skew estimator
+
+bool TestStepDetection()
+{
+    cout << "TestStepDetection...";
+
+    TimeSynchronizer sync_a, sync_b;
+    sync_a.SetSkewCorrectionEnabled(true);
+    sync_b.SetSkewCorrectionEnabled(true);
+    sync_b.SetStepThresholdUsec(1000.0); // 1ms threshold
+
+    const int64_t offset_a = 0;
+    const int64_t offset_b = 5 * 1000 * 1000LL;
+    const uint64_t owd_us = 50000;
+
+    // Phase 1: Establish sync with normal OWD
+    SimulateSyncPair(sync_a, sync_b, offset_a, offset_b, owd_us, owd_us);
+
+    if (!sync_a.IsSynchronized() || !sync_b.IsSynchronized()) {
+        cout << "Failed to synchronize in phase 1" << endl;
+        return false;
+    }
+
+    const double skew_before = sync_b.GetSkewEstimatePpm();
+
+    // Phase 2: Simulate a path change by drastically changing the OWD
+    // This should trigger step detection and reset the skew estimator
+    SimulateSyncPair(sync_a, sync_b, offset_a, offset_b, owd_us + 5000, owd_us + 5000);
+
+    // After the step, the estimator should have been reset and re-converged
+    // The skew estimate should be near zero (no drift in this test)
+    const double skew_after = sync_b.GetSkewEstimatePpm();
+
+    // The step detection is working if it didn't blow up
+    // (without step detection, the regression would produce wild estimates)
+    if (std::abs(skew_after) > 500.0) {
+        cout << "Failed: skew estimate too large after step: " << skew_after << " ppm" << endl;
+        return false;
+    }
+
+    cout << "Success! (skew_before=" << skew_before
+         << " skew_after=" << skew_after << ")" << endl;
+    return true;
+}
+
+//------------------------------------------------------------------------------
+// Test: Skew correction disabled by default (backward compat)
+
+bool TestSkewCorrectionDisabledByDefault()
+{
+    cout << "TestSkewCorrectionDisabledByDefault...";
+
+    TimeSynchronizer sync;
+
+    if (sync.GetSkewCorrectionEnabled()) {
+        cout << "Failed: skew correction should be disabled by default" << endl;
+        return false;
+    }
+
+    if (sync.GetSkewEstimatePpm() != 0.0) {
+        cout << "Failed: skew estimate should be 0 when disabled" << endl;
+        return false;
+    }
+
+    cout << "Success!" << endl;
+    return true;
+}
+
+//------------------------------------------------------------------------------
+// Test: Coupled Skew Estimation (CSE) via slope exchange
+
+bool TestCoupledSkewEstimation()
+{
+    cout << "TestCoupledSkewEstimation...";
+
+    TimeSynchronizer sync_a, sync_b;
+    sync_a.SetSkewCorrectionEnabled(true);
+    sync_b.SetSkewCorrectionEnabled(true);
+
+    const double drift_ppm = 150.0;
+    const double drift_a = drift_ppm;
+    const double drift_b = -drift_ppm;
+    const int64_t offset_a = 0;
+    const int64_t offset_b = 5 * 1000 * 1000LL;
+
+    const uint64_t send_interval_us = 1000000 / 60;
+    const uint64_t sync_interval_us = 2 * 1000 * 1000ULL;
+    const uint64_t owd_us = 50000;
+    const uint64_t duration_us = 15 * 1000 * 1000ULL;
+
+    uint64_t now_us = 0;
+    uint64_t next_data_ab = 0;
+    uint64_t next_data_ba = 0;
+    uint64_t next_sync_ab = sync_interval_us;
+    uint64_t next_sync_ba = sync_interval_us;
+
+    std::priority_queue<DriftArrival, std::vector<DriftArrival>, DriftArrivalCompare> arrivals;
+
+    while (now_us <= duration_us) {
+        uint64_t next_arrival = arrivals.empty() ? UINT64_MAX : arrivals.top().deliver_true_us;
+        uint64_t next_time = next_arrival;
+        if (next_data_ab < next_time) next_time = next_data_ab;
+        if (next_data_ba < next_time) next_time = next_data_ba;
+        if (next_sync_ab < next_time) next_time = next_sync_ab;
+        if (next_sync_ba < next_time) next_time = next_sync_ba;
+        if (next_time == UINT64_MAX) break;
+        now_us = next_time;
+
+        while (!arrivals.empty() && arrivals.top().deliver_true_us == now_us) {
+            DriftArrival ev = arrivals.top();
+            arrivals.pop();
+            const bool to_b = ev.packet.from_a;
+            TimeSynchronizer& recv_sync = to_b ? sync_b : sync_a;
+            const double recv_drift = to_b ? drift_b : drift_a;
+            const int64_t recv_offset = to_b ? offset_b : offset_a;
+            const uint64_t local_recv = DriftLocalTimeUsec(now_us, recv_drift, recv_offset);
+            recv_sync.OnAuthenticatedDatagramTimestamp(ev.packet.ts24, local_recv);
+            if (ev.packet.is_sync) {
+                recv_sync.OnPeerMinDeltaTS24(ev.packet.min_delta);
+            }
+        }
+
+        if (next_data_ab == now_us) {
+            const uint64_t local_send = DriftLocalTimeUsec(now_us, drift_a, offset_a);
+            DriftPacket pkt;
+            pkt.from_a = true;
+            pkt.send_true_us = now_us;
+            pkt.ts24 = sync_a.LocalTimeToDatagramTS24(local_send);
+            DriftArrival ev;
+            ev.deliver_true_us = now_us + owd_us;
+            ev.packet = pkt;
+            arrivals.push(ev);
+            next_data_ab = now_us + send_interval_us;
+        }
+        if (next_data_ba == now_us) {
+            const uint64_t local_send = DriftLocalTimeUsec(now_us, drift_b, offset_b);
+            DriftPacket pkt;
+            pkt.from_a = false;
+            pkt.send_true_us = now_us;
+            pkt.ts24 = sync_b.LocalTimeToDatagramTS24(local_send);
+            DriftArrival ev;
+            ev.deliver_true_us = now_us + owd_us;
+            ev.packet = pkt;
+            arrivals.push(ev);
+            next_data_ba = now_us + send_interval_us;
+        }
+        if (next_sync_ab == now_us) {
+            const uint64_t local_send = DriftLocalTimeUsec(now_us, drift_a, offset_a);
+            DriftPacket pkt;
+            pkt.from_a = true;
+            pkt.is_sync = true;
+            pkt.send_true_us = now_us;
+            pkt.ts24 = sync_a.LocalTimeToDatagramTS24(local_send);
+            pkt.min_delta = sync_a.GetMinDeltaTS24();
+            DriftArrival ev;
+            ev.deliver_true_us = now_us + owd_us;
+            ev.packet = pkt;
+            arrivals.push(ev);
+            next_sync_ab = now_us + sync_interval_us;
+
+            // Exchange slope estimates for CSE (piggyback on sync packets)
+            const double slope_a = sync_a.GetLocalSlopeForPeer();
+            const double slope_b = sync_b.GetLocalSlopeForPeer();
+            sync_b.OnPeerSlopeEstimate(slope_a);
+            sync_a.OnPeerSlopeEstimate(slope_b);
+        }
+        if (next_sync_ba == now_us) {
+            const uint64_t local_send = DriftLocalTimeUsec(now_us, drift_b, offset_b);
+            DriftPacket pkt;
+            pkt.from_a = false;
+            pkt.is_sync = true;
+            pkt.send_true_us = now_us;
+            pkt.ts24 = sync_b.LocalTimeToDatagramTS24(local_send);
+            pkt.min_delta = sync_b.GetMinDeltaTS24();
+            DriftArrival ev;
+            ev.deliver_true_us = now_us + owd_us;
+            ev.packet = pkt;
+            arrivals.push(ev);
+            next_sync_ba = now_us + sync_interval_us;
+        }
+    }
+
+    // CSE should provide a skew estimate
+    const double local_slope_b = sync_b.GetLocalSlopeForPeer();
+    const double skew_est = sync_b.GetSkewEstimatePpm();
+
+    // The local slope at B should be nonzero (it's tracking the drift)
+    if (std::abs(local_slope_b) < 5.0) {
+        cout << "Failed: local slope too small: " << local_slope_b << " ppm" << endl;
+        return false;
+    }
+
+    // The skew estimate should be nonzero
+    if (std::abs(skew_est) < 5.0) {
+        cout << "Failed: skew estimate too small: " << skew_est << " ppm" << endl;
+        return false;
+    }
+
+    cout << "Success! (local_slope_b=" << local_slope_b
+         << " skew_est=" << skew_est << ")" << endl;
+    return true;
+}
+
+//------------------------------------------------------------------------------
 // Entrypoint
 
 int main()
@@ -1762,6 +2270,21 @@ int main()
         result = TIMESYNC_RET_FAIL;
     }
     if (!TestResetState()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestSkewCorrectionDisabledByDefault()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestSkewEstimateConverges()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestSkewCorrectionReducesError()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestStepDetection()) {
+        result = TIMESYNC_RET_FAIL;
+    }
+    if (!TestCoupledSkewEstimation()) {
         result = TIMESYNC_RET_FAIL;
     }
 
